@@ -62,9 +62,9 @@ func NewDevicesPerNUMA() DevicesPerNUMA {
 }
 
 // Devices is a function that returns all device ids for all NUMA nodes
-// and represent it as sets.String
-func (dev DevicesPerNUMA) Devices() sets.String {
-	result := sets.NewString()
+// and represent it as sets.Set[string]
+func (dev DevicesPerNUMA) Devices() sets.Set[string] {
+	result := sets.New[string]()
 
 	for _, devs := range dev {
 		result.Insert(devs...)
@@ -72,9 +72,12 @@ func (dev DevicesPerNUMA) Devices() sets.String {
 	return result
 }
 
-// New returns an instance of Checkpoint
-func New(devEntries []PodDevicesEntry,
-	devices map[string][]string) DeviceManagerCheckpoint {
+// New returns an instance of Checkpoint - must be an alias for the most recent version
+func New(devEntries []PodDevicesEntry, devices map[string][]string) DeviceManagerCheckpoint {
+	return newV2(devEntries, devices)
+}
+
+func newV2(devEntries []PodDevicesEntry, devices map[string][]string) DeviceManagerCheckpoint {
 	return &Data{
 		Data: checkpointData{
 			PodDeviceEntries:  devEntries,
@@ -99,7 +102,8 @@ func (cp *Data) VerifyChecksum() error {
 	return cp.Checksum.Verify(cp.Data)
 }
 
-// GetData returns device entries and registered devices
+// GetData returns device entries and registered devices in the *most recent*
+// checkpoint format, *not* in the original format stored on disk.
 func (cp *Data) GetData() ([]PodDevicesEntry, map[string][]string) {
 	return cp.Data.PodDeviceEntries, cp.Data.RegisteredDevices
 }

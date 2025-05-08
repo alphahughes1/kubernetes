@@ -18,25 +18,29 @@ package logs
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/kubernetes/pkg/kubelet/container"
 
-	"k8s.io/apimachinery/pkg/util/clock"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	critest "k8s.io/cri-api/pkg/apis/testing"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func TestGetAllLogs(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-get-all-logs")
+	dir, err := os.MkdirTemp("", "test-get-all-logs")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 	testLogs := []string{
@@ -75,7 +79,8 @@ func TestGetAllLogs(t *testing.T) {
 }
 
 func TestRotateLogs(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-rotate-logs")
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "test-rotate-logs")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
@@ -92,7 +97,14 @@ func TestRotateLogs(t *testing.T) {
 			MaxFiles: testMaxFiles,
 		},
 		osInterface: container.RealOS{},
-		clock:       clock.NewFakeClock(now),
+		clock:       testingclock.NewFakeClock(now),
+		mutex:       sync.Mutex{},
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet_log_rotate_manager"},
+		),
+		maxWorkers:       10,
+		monitoringPeriod: v1.Duration{Duration: 10 * time.Second},
 	}
 	testLogs := []string{
 		"test-log-1",
@@ -148,10 +160,28 @@ func TestRotateLogs(t *testing.T) {
 		},
 	}
 	f.SetFakeContainers(testContainers)
-	require.NoError(t, c.rotateLogs())
+
+	// Push the items into the queue for before starting the worker to avoid issue with the queue being empty.
+	require.NoError(t, c.rotateLogs(ctx))
+
+	// Start a routine that can monitor the queue and shutdown the queue to trigger the retrun from the processQueueItems
+	// Keeping the monitor duration smaller in order to keep the unwanted delay in the test to a minimal.
+	go func() {
+		pollTimeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		err = wait.PollUntilContextCancel(pollTimeoutCtx, 5*time.Millisecond, false, func(ctx context.Context) (done bool, err error) {
+			return c.queue.Len() == 0, nil
+		})
+		if err != nil {
+			t.Errorf("unexpected error %v", err)
+		}
+		c.queue.ShutDown()
+	}()
+	// This is a blocking call. But the above routine takes care of ensuring that this is terminated once the queue is shutdown
+	c.processQueueItems(ctx, 1)
 
 	timestamp := now.Format(timestampFormat)
-	logs, err := ioutil.ReadDir(dir)
+	logs, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	assert.Len(t, logs, 5)
 	assert.Equal(t, testLogs[0], logs[0].Name())
@@ -162,7 +192,8 @@ func TestRotateLogs(t *testing.T) {
 }
 
 func TestClean(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-clean")
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "test-clean")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
@@ -179,7 +210,14 @@ func TestClean(t *testing.T) {
 			MaxFiles: testMaxFiles,
 		},
 		osInterface: container.RealOS{},
-		clock:       clock.NewFakeClock(now),
+		clock:       testingclock.NewFakeClock(now),
+		mutex:       sync.Mutex{},
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet_log_rotate_manager"},
+		),
+		maxWorkers:       10,
+		monitoringPeriod: v1.Duration{Duration: 10 * time.Second},
 	}
 	testLogs := []string{
 		"test-log-1",
@@ -220,10 +258,10 @@ func TestClean(t *testing.T) {
 	}
 	f.SetFakeContainers(testContainers)
 
-	err = c.Clean("container-3")
+	err = c.Clean(ctx, "container-3")
 	require.NoError(t, err)
 
-	logs, err := ioutil.ReadDir(dir)
+	logs, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	assert.Len(t, logs, 4)
 	assert.Equal(t, testLogs[0], logs[0].Name())
@@ -233,7 +271,7 @@ func TestClean(t *testing.T) {
 }
 
 func TestCleanupUnusedLog(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-cleanup-unused-log")
+	dir, err := os.MkdirTemp("", "test-cleanup-unused-log")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
@@ -259,7 +297,7 @@ func TestCleanupUnusedLog(t *testing.T) {
 	assert.Len(t, got, 2)
 	assert.Equal(t, []string{testLogs[0], testLogs[3]}, got)
 
-	logs, err := ioutil.ReadDir(dir)
+	logs, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	assert.Len(t, logs, 2)
 	assert.Equal(t, testLogs[0], filepath.Join(dir, logs[0].Name()))
@@ -285,7 +323,7 @@ func TestRemoveExcessLog(t *testing.T) {
 		},
 	} {
 		t.Logf("TestCase %q", desc)
-		dir, err := ioutil.TempDir("", "test-remove-excess-log")
+		dir, err := os.MkdirTemp("", "test-remove-excess-log")
 		require.NoError(t, err)
 		defer os.RemoveAll(dir)
 
@@ -309,7 +347,7 @@ func TestRemoveExcessLog(t *testing.T) {
 			assert.Equal(t, name, filepath.Base(got[i]))
 		}
 
-		logs, err := ioutil.ReadDir(dir)
+		logs, err := os.ReadDir(dir)
 		require.NoError(t, err)
 		require.Len(t, logs, len(test.expect))
 		for i, name := range test.expect {
@@ -319,22 +357,31 @@ func TestRemoveExcessLog(t *testing.T) {
 }
 
 func TestCompressLog(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-compress-log")
+	dir, err := os.MkdirTemp("", "test-compress-log")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	testFile, err := ioutil.TempFile(dir, "test-rotate-latest-log")
+	testFile, err := os.CreateTemp(dir, "test-rotate-latest-log")
 	require.NoError(t, err)
 	defer testFile.Close()
 	testContent := "test log content"
 	_, err = testFile.Write([]byte(testContent))
 	require.NoError(t, err)
+	testFile.Close()
 
 	testLog := testFile.Name()
+	testLogInfo, err := os.Stat(testLog)
+	assert.NoError(t, err)
 	c := &containerLogManager{osInterface: container.RealOS{}}
 	require.NoError(t, c.compressLog(testLog))
-	_, err = os.Stat(testLog + compressSuffix)
+	testLogCompressInfo, err := os.Stat(testLog + compressSuffix)
 	assert.NoError(t, err, "log should be compressed")
+	if testLogInfo.Mode() != testLogCompressInfo.Mode() {
+		t.Errorf("compressed and uncompressed test log file modes do not match")
+	}
+	if err := c.compressLog("test-unknown-log"); err == nil {
+		t.Errorf("compressing unknown log should return error")
+	}
 	_, err = os.Stat(testLog + tmpSuffix)
 	assert.Error(t, err, "temporary log should be renamed")
 	_, err = os.Stat(testLog)
@@ -350,7 +397,8 @@ func TestCompressLog(t *testing.T) {
 }
 
 func TestRotateLatestLog(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-rotate-latest-log")
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "test-rotate-latest-log")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
@@ -382,17 +430,25 @@ func TestRotateLatestLog(t *testing.T) {
 			runtimeService: f,
 			policy:         LogRotatePolicy{MaxFiles: test.maxFiles},
 			osInterface:    container.RealOS{},
-			clock:          clock.NewFakeClock(now),
+			clock:          testingclock.NewFakeClock(now),
+			mutex:          sync.Mutex{},
+			queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+				workqueue.DefaultTypedControllerRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet_log_rotate_manager"},
+			),
+			maxWorkers:       10,
+			monitoringPeriod: v1.Duration{Duration: 10 * time.Second},
 		}
 		if test.runtimeError != nil {
 			f.InjectError("ReopenContainerLog", test.runtimeError)
 		}
-		testFile, err := ioutil.TempFile(dir, "test-rotate-latest-log")
+		testFile, err := os.CreateTemp(dir, "test-rotate-latest-log")
 		require.NoError(t, err)
+		testFile.Close()
 		defer testFile.Close()
 		testLog := testFile.Name()
 		rotatedLog := fmt.Sprintf("%s.%s", testLog, now.Format(timestampFormat))
-		err = c.rotateLatestLog("test-id", testLog)
+		err = c.rotateLatestLog(ctx, "test-id", testLog)
 		assert.Equal(t, test.expectError, err != nil)
 		_, err = os.Stat(testLog)
 		assert.Equal(t, test.expectOriginal, err == nil)

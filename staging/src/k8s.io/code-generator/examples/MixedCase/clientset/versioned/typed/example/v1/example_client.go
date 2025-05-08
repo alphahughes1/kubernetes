@@ -19,9 +19,11 @@ limitations under the License.
 package v1
 
 import (
+	http "net/http"
+
 	rest "k8s.io/client-go/rest"
-	v1 "k8s.io/code-generator/examples/MixedCase/apis/example/v1"
-	"k8s.io/code-generator/examples/MixedCase/clientset/versioned/scheme"
+	examplev1 "k8s.io/code-generator/examples/MixedCase/apis/example/v1"
+	scheme "k8s.io/code-generator/examples/MixedCase/clientset/versioned/scheme"
 )
 
 type ExampleV1Interface interface {
@@ -44,12 +46,24 @@ func (c *ExampleV1Client) TestTypes(namespace string) TestTypeInterface {
 }
 
 // NewForConfig creates a new ExampleV1Client for the given config.
+// NewForConfig is equivalent to NewForConfigAndClient(c, httpClient),
+// where httpClient was generated with rest.HTTPClientFor(c).
 func NewForConfig(c *rest.Config) (*ExampleV1Client, error) {
 	config := *c
-	if err := setConfigDefaults(&config); err != nil {
+	setConfigDefaults(&config)
+	httpClient, err := rest.HTTPClientFor(&config)
+	if err != nil {
 		return nil, err
 	}
-	client, err := rest.RESTClientFor(&config)
+	return NewForConfigAndClient(&config, httpClient)
+}
+
+// NewForConfigAndClient creates a new ExampleV1Client for the given config and http client.
+// Note the http client provided takes precedence over the configured transport values.
+func NewForConfigAndClient(c *rest.Config, h *http.Client) (*ExampleV1Client, error) {
+	config := *c
+	setConfigDefaults(&config)
+	client, err := rest.RESTClientForConfigAndClient(&config, h)
 	if err != nil {
 		return nil, err
 	}
@@ -71,17 +85,15 @@ func New(c rest.Interface) *ExampleV1Client {
 	return &ExampleV1Client{c}
 }
 
-func setConfigDefaults(config *rest.Config) error {
-	gv := v1.SchemeGroupVersion
+func setConfigDefaults(config *rest.Config) {
+	gv := examplev1.SchemeGroupVersion
 	config.GroupVersion = &gv
 	config.APIPath = "/apis"
-	config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+	config.NegotiatedSerializer = rest.CodecFactoryForGeneratedClient(scheme.Scheme, scheme.Codecs).WithoutConversion()
 
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-
-	return nil
 }
 
 // RESTClient returns a RESTClient that is used to communicate

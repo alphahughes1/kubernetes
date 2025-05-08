@@ -17,18 +17,21 @@ limitations under the License.
 package v1beta1
 
 import (
+	"fmt"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
-	componentbaseconfigv1alpha1 "k8s.io/component-base/config/v1alpha1"
 	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
 
 	// TODO: Cut references to k8s.io/kubernetes, eventually there should be none from this package
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	logsapi "k8s.io/component-base/logs/api/v1"
 	"k8s.io/kubernetes/pkg/cluster/ports"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/qos"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -36,12 +39,17 @@ const (
 	DefaultIPTablesMasqueradeBit = 14
 	DefaultIPTablesDropBit       = 15
 	DefaultVolumePluginDir       = "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/"
+	DefaultPodLogsDir            = "/var/log/pods"
+	// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/2570-memory-qos
+	DefaultMemoryThrottlingFactor = 0.9
+	// MaxContainerBackOff is the max backoff period for container restarts, exported for the e2e test
+	MaxContainerBackOff = 300 * time.Second
 )
 
 var (
 	zeroDuration = metav1.Duration{}
 	// TODO: Move these constants to k8s.io/kubelet/config/v1beta1 instead?
-	// Refer to [Node Allocatable](https://git.k8s.io/community/contributors/design-proposals/node/node-allocatable.md) doc for more information.
+	// Refer to [Node Allocatable](https://kubernetes.io/docs/tasks/administer-cluster/reserve-compute-resources/#node-allocatable) doc for more information.
 	DefaultNodeAllocatableEnforcement = []string{"pods"}
 )
 
@@ -50,8 +58,21 @@ func addDefaultingFuncs(scheme *kruntime.Scheme) error {
 }
 
 func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfiguration) {
+
+	// TODO(lauralorenz): Reasses conditional feature gating on defaults. Here
+	// we 1) copy the gates to a local var, unilaterally merge it with the gate
+	// config while being defaulted. Alternatively we could unilaterally set the
+	// default value, later check the gate and wipe it if needed, like API
+	// strategy does for gate-disabled fields. Meanwhile, KubeletConfiguration
+	// is increasingly dynamic and the configured gates may change depending on
+	// when this is called. See also validation.go.
+	localFeatureGate := utilfeature.DefaultMutableFeatureGate.DeepCopy()
+	if err := localFeatureGate.SetFromMap(obj.FeatureGates); err != nil {
+		panic(fmt.Sprintf("failed to merge global and in-flight KubeletConfiguration while setting defaults, error: %v", err))
+	}
+
 	if obj.EnableServer == nil {
-		obj.EnableServer = utilpointer.BoolPtr(true)
+		obj.EnableServer = ptr.To(true)
 	}
 	if obj.SyncFrequency == zeroDuration {
 		obj.SyncFrequency = metav1.Duration{Duration: 1 * time.Minute}
@@ -69,10 +90,10 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 		obj.Port = ports.KubeletPort
 	}
 	if obj.Authentication.Anonymous.Enabled == nil {
-		obj.Authentication.Anonymous.Enabled = utilpointer.BoolPtr(false)
+		obj.Authentication.Anonymous.Enabled = ptr.To(false)
 	}
 	if obj.Authentication.Webhook.Enabled == nil {
-		obj.Authentication.Webhook.Enabled = utilpointer.BoolPtr(true)
+		obj.Authentication.Webhook.Enabled = ptr.To(true)
 	}
 	if obj.Authentication.Webhook.CacheTTL == zeroDuration {
 		obj.Authentication.Webhook.CacheTTL = metav1.Duration{Duration: 2 * time.Minute}
@@ -87,28 +108,28 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 		obj.Authorization.Webhook.CacheUnauthorizedTTL = metav1.Duration{Duration: 30 * time.Second}
 	}
 	if obj.RegistryPullQPS == nil {
-		obj.RegistryPullQPS = utilpointer.Int32Ptr(5)
+		obj.RegistryPullQPS = ptr.To[int32](5)
 	}
 	if obj.RegistryBurst == 0 {
 		obj.RegistryBurst = 10
 	}
 	if obj.EventRecordQPS == nil {
-		obj.EventRecordQPS = utilpointer.Int32Ptr(5)
+		obj.EventRecordQPS = ptr.To[int32](50)
 	}
 	if obj.EventBurst == 0 {
-		obj.EventBurst = 10
+		obj.EventBurst = 100
 	}
 	if obj.EnableDebuggingHandlers == nil {
-		obj.EnableDebuggingHandlers = utilpointer.BoolPtr(true)
+		obj.EnableDebuggingHandlers = ptr.To(true)
 	}
 	if obj.HealthzPort == nil {
-		obj.HealthzPort = utilpointer.Int32Ptr(10248)
+		obj.HealthzPort = ptr.To[int32](10248)
 	}
 	if obj.HealthzBindAddress == "" {
 		obj.HealthzBindAddress = "127.0.0.1"
 	}
 	if obj.OOMScoreAdj == nil {
-		obj.OOMScoreAdj = utilpointer.Int32Ptr(int32(qos.KubeletOOMScoreAdj))
+		obj.OOMScoreAdj = ptr.To(int32(qos.KubeletOOMScoreAdj))
 	}
 	if obj.StreamingConnectionIdleTimeout == zeroDuration {
 		obj.StreamingConnectionIdleTimeout = metav1.Duration{Duration: 4 * time.Hour}
@@ -134,16 +155,16 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 	}
 	if obj.ImageGCHighThresholdPercent == nil {
 		// default is below docker's default dm.min_free_space of 90%
-		obj.ImageGCHighThresholdPercent = utilpointer.Int32Ptr(85)
+		obj.ImageGCHighThresholdPercent = ptr.To[int32](85)
 	}
 	if obj.ImageGCLowThresholdPercent == nil {
-		obj.ImageGCLowThresholdPercent = utilpointer.Int32Ptr(80)
+		obj.ImageGCLowThresholdPercent = ptr.To[int32](80)
 	}
 	if obj.VolumeStatsAggPeriod == zeroDuration {
 		obj.VolumeStatsAggPeriod = metav1.Duration{Duration: time.Minute}
 	}
 	if obj.CgroupsPerQOS == nil {
-		obj.CgroupsPerQOS = utilpointer.BoolPtr(true)
+		obj.CgroupsPerQOS = ptr.To(true)
 	}
 	if obj.CgroupDriver == "" {
 		obj.CgroupDriver = "cgroupfs"
@@ -175,20 +196,20 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 	}
 	// default nil or negative value to -1 (implies node allocatable pid limit)
 	if obj.PodPidsLimit == nil || *obj.PodPidsLimit < int64(0) {
-		temp := int64(-1)
-		obj.PodPidsLimit = &temp
+		obj.PodPidsLimit = ptr.To[int64](-1)
 	}
-	if obj.ResolverConfig == "" {
-		obj.ResolverConfig = kubetypes.ResolvConfDefault
+
+	if obj.ResolverConfig == nil {
+		obj.ResolverConfig = ptr.To(kubetypes.ResolvConfDefault)
 	}
 	if obj.CPUCFSQuota == nil {
-		obj.CPUCFSQuota = utilpointer.BoolPtr(true)
+		obj.CPUCFSQuota = ptr.To(true)
 	}
 	if obj.CPUCFSQuotaPeriod == nil {
 		obj.CPUCFSQuotaPeriod = &metav1.Duration{Duration: 100 * time.Millisecond}
 	}
 	if obj.NodeStatusMaxImages == nil {
-		obj.NodeStatusMaxImages = utilpointer.Int32Ptr(50)
+		obj.NodeStatusMaxImages = ptr.To[int32](50)
 	}
 	if obj.MaxOpenFiles == 0 {
 		obj.MaxOpenFiles = 1000000
@@ -197,40 +218,53 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 		obj.ContentType = "application/vnd.kubernetes.protobuf"
 	}
 	if obj.KubeAPIQPS == nil {
-		obj.KubeAPIQPS = utilpointer.Int32Ptr(5)
+		obj.KubeAPIQPS = ptr.To[int32](50)
 	}
 	if obj.KubeAPIBurst == 0 {
-		obj.KubeAPIBurst = 10
+		obj.KubeAPIBurst = 100
 	}
 	if obj.SerializeImagePulls == nil {
-		obj.SerializeImagePulls = utilpointer.BoolPtr(true)
-	}
-	if obj.EvictionHard == nil {
-		obj.EvictionHard = DefaultEvictionHard
+		// SerializeImagePulls is default to true when MaxParallelImagePulls
+		// is not set, and false when MaxParallelImagePulls is set.
+		// This is to save users from having to set both configs.
+		if obj.MaxParallelImagePulls == nil || *obj.MaxParallelImagePulls < 2 {
+			obj.SerializeImagePulls = ptr.To(true)
+		} else {
+			obj.SerializeImagePulls = ptr.To(false)
+		}
 	}
 	if obj.EvictionPressureTransitionPeriod == zeroDuration {
 		obj.EvictionPressureTransitionPeriod = metav1.Duration{Duration: 5 * time.Minute}
 	}
+	if obj.MergeDefaultEvictionSettings == nil {
+		obj.MergeDefaultEvictionSettings = ptr.To(false)
+	}
 	if obj.EnableControllerAttachDetach == nil {
-		obj.EnableControllerAttachDetach = utilpointer.BoolPtr(true)
+		obj.EnableControllerAttachDetach = ptr.To(true)
 	}
 	if obj.MakeIPTablesUtilChains == nil {
-		obj.MakeIPTablesUtilChains = utilpointer.BoolPtr(true)
+		obj.MakeIPTablesUtilChains = ptr.To(true)
 	}
 	if obj.IPTablesMasqueradeBit == nil {
-		obj.IPTablesMasqueradeBit = utilpointer.Int32Ptr(DefaultIPTablesMasqueradeBit)
+		obj.IPTablesMasqueradeBit = ptr.To[int32](DefaultIPTablesMasqueradeBit)
 	}
 	if obj.IPTablesDropBit == nil {
-		obj.IPTablesDropBit = utilpointer.Int32Ptr(DefaultIPTablesDropBit)
+		obj.IPTablesDropBit = ptr.To[int32](DefaultIPTablesDropBit)
 	}
 	if obj.FailSwapOn == nil {
-		obj.FailSwapOn = utilpointer.BoolPtr(true)
+		obj.FailSwapOn = ptr.To(true)
 	}
 	if obj.ContainerLogMaxSize == "" {
 		obj.ContainerLogMaxSize = "10Mi"
 	}
 	if obj.ContainerLogMaxFiles == nil {
-		obj.ContainerLogMaxFiles = utilpointer.Int32Ptr(5)
+		obj.ContainerLogMaxFiles = ptr.To[int32](5)
+	}
+	if obj.ContainerLogMaxWorkers == nil {
+		obj.ContainerLogMaxWorkers = ptr.To[int32](1)
+	}
+	if obj.ContainerLogMonitorInterval == nil {
+		obj.ContainerLogMonitorInterval = &metav1.Duration{Duration: 10 * time.Second}
 	}
 	if obj.ConfigMapAndSecretChangeDetectionStrategy == "" {
 		obj.ConfigMapAndSecretChangeDetectionStrategy = kubeletconfigv1beta1.WatchChangeDetectionStrategy
@@ -242,17 +276,47 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 		obj.VolumePluginDir = DefaultVolumePluginDir
 	}
 	// Use the Default LoggingConfiguration option
-	componentbaseconfigv1alpha1.RecommendedLoggingConfiguration(&obj.Logging)
+	logsapi.SetRecommendedLoggingConfiguration(&obj.Logging)
 	if obj.EnableSystemLogHandler == nil {
-		obj.EnableSystemLogHandler = utilpointer.BoolPtr(true)
+		obj.EnableSystemLogHandler = ptr.To(true)
 	}
 	if obj.EnableProfilingHandler == nil {
-		obj.EnableProfilingHandler = utilpointer.BoolPtr(true)
+		obj.EnableProfilingHandler = ptr.To(true)
 	}
 	if obj.EnableDebugFlagsHandler == nil {
-		obj.EnableDebugFlagsHandler = utilpointer.BoolPtr(true)
+		obj.EnableDebugFlagsHandler = ptr.To(true)
 	}
 	if obj.SeccompDefault == nil {
-		obj.SeccompDefault = utilpointer.BoolPtr(false)
+		obj.SeccompDefault = ptr.To(false)
+	}
+	if obj.FailCgroupV1 == nil {
+		obj.FailCgroupV1 = ptr.To(false)
+	}
+	if obj.MemoryThrottlingFactor == nil {
+		obj.MemoryThrottlingFactor = ptr.To(DefaultMemoryThrottlingFactor)
+	}
+	if obj.RegisterNode == nil {
+		obj.RegisterNode = ptr.To(true)
+	}
+	if obj.LocalStorageCapacityIsolation == nil {
+		obj.LocalStorageCapacityIsolation = ptr.To(true)
+	}
+	if obj.ContainerRuntimeEndpoint == "" {
+		obj.ContainerRuntimeEndpoint = "unix:///run/containerd/containerd.sock"
+	}
+	if obj.PodLogsDir == "" {
+		obj.PodLogsDir = DefaultPodLogsDir
+	}
+
+	if localFeatureGate.Enabled(features.KubeletCrashLoopBackOffMax) {
+		if obj.CrashLoopBackOff.MaxContainerRestartPeriod == nil {
+			obj.CrashLoopBackOff.MaxContainerRestartPeriod = &metav1.Duration{Duration: MaxContainerBackOff}
+		}
+	}
+
+	if localFeatureGate.Enabled(features.KubeletEnsureSecretPulledImages) {
+		if obj.ImagePullCredentialsVerificationPolicy == "" {
+			obj.ImagePullCredentialsVerificationPolicy = kubeletconfigv1beta1.NeverVerifyPreloadedImages
+		}
 	}
 }

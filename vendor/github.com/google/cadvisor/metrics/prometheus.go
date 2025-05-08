@@ -25,6 +25,7 @@ import (
 	v2 "github.com/google/cadvisor/info/v2"
 
 	"github.com/prometheus/client_golang/prometheus"
+
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 )
@@ -32,9 +33,14 @@ import (
 // asFloat64 converts a uint64 into a float64.
 func asFloat64(v uint64) float64 { return float64(v) }
 
+// asMicrosecondsToSeconds converts nanoseconds into a float64 representing seconds.
+func asMicrosecondsToSeconds(v uint64) float64 {
+	return float64(v) / 1e6
+}
+
 // asNanosecondsToSeconds converts nanoseconds into a float64 representing seconds.
 func asNanosecondsToSeconds(v uint64) float64 {
-	return float64(v) / float64(time.Second)
+	return float64(v) / 1e9
 }
 
 // fsValues is a helper method for assembling per-filesystem stats.
@@ -270,6 +276,13 @@ func NewPrometheusCollector(i infoProvider, f ContainerLabelsFunc, includedMetri
 					return metricValues{{value: float64(s.Cpu.LoadAverage), timestamp: s.Timestamp}}
 				},
 			}, {
+				name:      "container_cpu_load_d_average_10s",
+				help:      "Value of container cpu load.d average over the last 10 seconds.",
+				valueType: prometheus.GaugeValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: float64(s.Cpu.LoadDAverage), timestamp: s.Timestamp}}
+				},
+			}, {
 				name:        "container_tasks_state",
 				help:        "Number of tasks in given state",
 				extraLabels: []string{"state"},
@@ -377,6 +390,13 @@ func NewPrometheusCollector(i infoProvider, f ContainerLabelsFunc, includedMetri
 					return metricValues{{value: float64(s.Memory.RSS), timestamp: s.Timestamp}}
 				},
 			}, {
+				name:      "container_memory_kernel_usage",
+				help:      "Size of kernel memory allocated in bytes.",
+				valueType: prometheus.GaugeValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: float64(s.Memory.KernelUsage), timestamp: s.Timestamp}}
+				},
+			}, {
 				name:      "container_memory_mapped_file",
 				help:      "Size of memory mapped files in bytes.",
 				valueType: prometheus.GaugeValue,
@@ -421,6 +441,22 @@ func NewPrometheusCollector(i infoProvider, f ContainerLabelsFunc, includedMetri
 				valueType: prometheus.GaugeValue,
 				getValues: func(s *info.ContainerStats) metricValues {
 					return metricValues{{value: float64(s.Memory.WorkingSet), timestamp: s.Timestamp}}
+				},
+			},
+			{
+				name:      "container_memory_total_active_file_bytes",
+				help:      "Current total active file in bytes.",
+				valueType: prometheus.GaugeValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: float64(s.Memory.TotalActiveFile), timestamp: s.Timestamp}}
+				},
+			},
+			{
+				name:      "container_memory_total_inactive_file_bytes",
+				help:      "Current total inactive file in bytes.",
+				valueType: prometheus.GaugeValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: float64(s.Memory.TotalInactiveFile), timestamp: s.Timestamp}}
 				},
 			},
 			{
@@ -487,59 +523,6 @@ func NewPrometheusCollector(i infoProvider, f ContainerLabelsFunc, includedMetri
 						[]string{"anon", "hierarchy"}, s.Timestamp)...)
 					values = append(values, getNumaStatsPerNode(s.Memory.HierarchicalData.NumaStats.Unevictable,
 						[]string{"unevictable", "hierarchy"}, s.Timestamp)...)
-					return values
-				},
-			},
-		}...)
-	}
-	if includedMetrics.Has(container.AcceleratorUsageMetrics) {
-		c.containerMetrics = append(c.containerMetrics, []containerMetric{
-			{
-				name:        "container_accelerator_memory_total_bytes",
-				help:        "Total accelerator memory.",
-				valueType:   prometheus.GaugeValue,
-				extraLabels: []string{"make", "model", "acc_id"},
-				getValues: func(s *info.ContainerStats) metricValues {
-					values := make(metricValues, 0, len(s.Accelerators))
-					for _, value := range s.Accelerators {
-						values = append(values, metricValue{
-							value:     float64(value.MemoryTotal),
-							labels:    []string{value.Make, value.Model, value.ID},
-							timestamp: s.Timestamp,
-						})
-					}
-					return values
-				},
-			}, {
-				name:        "container_accelerator_memory_used_bytes",
-				help:        "Total accelerator memory allocated.",
-				valueType:   prometheus.GaugeValue,
-				extraLabels: []string{"make", "model", "acc_id"},
-				getValues: func(s *info.ContainerStats) metricValues {
-					values := make(metricValues, 0, len(s.Accelerators))
-					for _, value := range s.Accelerators {
-						values = append(values, metricValue{
-							value:     float64(value.MemoryUsed),
-							labels:    []string{value.Make, value.Model, value.ID},
-							timestamp: s.Timestamp,
-						})
-					}
-					return values
-				},
-			}, {
-				name:        "container_accelerator_duty_cycle",
-				help:        "Percent of time over the past sample period during which the accelerator was actively processing.",
-				valueType:   prometheus.GaugeValue,
-				extraLabels: []string{"make", "model", "acc_id"},
-				getValues: func(s *info.ContainerStats) metricValues {
-					values := make(metricValues, 0, len(s.Accelerators))
-					for _, value := range s.Accelerators {
-						values = append(values, metricValue{
-							value:     float64(value.DutyCycle),
-							labels:    []string{value.Make, value.Model, value.ID},
-							timestamp: s.Timestamp,
-						})
-					}
 					return values
 				},
 			},
@@ -1757,6 +1740,65 @@ func NewPrometheusCollector(i infoProvider, f ContainerLabelsFunc, includedMetri
 			},
 		}...)
 	}
+	if includedMetrics.Has(container.OOMMetrics) {
+		c.containerMetrics = append(c.containerMetrics, containerMetric{
+			name:      "container_oom_events_total",
+			help:      "Count of out of memory events observed for the container",
+			valueType: prometheus.CounterValue,
+			getValues: func(s *info.ContainerStats) metricValues {
+				return metricValues{{value: float64(s.OOMEvents), timestamp: s.Timestamp}}
+			},
+		})
+	}
+
+	if includedMetrics.Has(container.PressureMetrics) {
+		c.containerMetrics = append(c.containerMetrics, []containerMetric{
+			{
+				name:      "container_pressure_cpu_stalled_seconds_total",
+				help:      "Total time duration no tasks in the container could make progress due to CPU congestion.",
+				valueType: prometheus.CounterValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: asMicrosecondsToSeconds(s.Cpu.PSI.Full.Total), timestamp: s.Timestamp}}
+				},
+			}, {
+				name:      "container_pressure_cpu_waiting_seconds_total",
+				help:      "Total time duration tasks in the container have waited due to CPU congestion.",
+				valueType: prometheus.CounterValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: asMicrosecondsToSeconds(s.Cpu.PSI.Some.Total), timestamp: s.Timestamp}}
+				},
+			}, {
+				name:      "container_pressure_memory_stalled_seconds_total",
+				help:      "Total time duration no tasks in the container could make progress due to memory congestion.",
+				valueType: prometheus.CounterValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: asMicrosecondsToSeconds(s.Memory.PSI.Full.Total), timestamp: s.Timestamp}}
+				},
+			}, {
+				name:      "container_pressure_memory_waiting_seconds_total",
+				help:      "Total time duration tasks in the container have waited due to memory congestion.",
+				valueType: prometheus.CounterValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: asMicrosecondsToSeconds(s.Memory.PSI.Some.Total), timestamp: s.Timestamp}}
+				},
+			}, {
+				name:      "container_pressure_io_stalled_seconds_total",
+				help:      "Total time duration no tasks in the container could make progress due to IO congestion.",
+				valueType: prometheus.CounterValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: asMicrosecondsToSeconds(s.DiskIo.PSI.Full.Total), timestamp: s.Timestamp}}
+				},
+			}, {
+				name:      "container_pressure_io_waiting_seconds_total",
+				help:      "Total time duration tasks in the container have waited due to IO congestion.",
+				valueType: prometheus.CounterValue,
+				getValues: func(s *info.ContainerStats) metricValues {
+					return metricValues{{value: asMicrosecondsToSeconds(s.DiskIo.PSI.Some.Total), timestamp: s.Timestamp}}
+				},
+			},
+		}...)
+	}
+
 	return c
 }
 
@@ -1825,7 +1867,7 @@ func DefaultContainerLabels(container *info.ContainerInfo) map[string]string {
 }
 
 // BaseContainerLabels returns a ContainerLabelsFunc that exports the container
-// name, first alias, image name as well as white listed label values.
+// name, first alias, image name as well as all its white listed env and label values.
 func BaseContainerLabels(whiteList []string) func(container *info.ContainerInfo) map[string]string {
 	whiteListMap := make(map[string]struct{}, len(whiteList))
 	for _, k := range whiteList {
@@ -1844,6 +1886,9 @@ func BaseContainerLabels(whiteList []string) func(container *info.ContainerInfo)
 			if _, ok := whiteListMap[k]; ok {
 				set[ContainerLabelPrefix+k] = v
 			}
+		}
+		for k, v := range container.Spec.Envs {
+			set[ContainerEnvPrefix+k] = v
 		}
 		return set
 	}

@@ -24,6 +24,8 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/utils/exec"
@@ -85,11 +87,11 @@ func (plugin *gitRepoPlugin) SupportsMountOption() bool {
 	return false
 }
 
-func (plugin *gitRepoPlugin) SupportsBulkVolumeVerification() bool {
-	return false
+func (plugin *gitRepoPlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	return false, nil
 }
 
-func (plugin *gitRepoPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, opts volume.VolumeOptions) (volume.Mounter, error) {
+func (plugin *gitRepoPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod) (volume.Mounter, error) {
 	if err := validateVolume(spec.Volume.GitRepo); err != nil {
 		return nil, err
 	}
@@ -105,7 +107,6 @@ func (plugin *gitRepoPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, opts vol
 		revision: spec.Volume.GitRepo.Revision,
 		target:   spec.Volume.GitRepo.Directory,
 		exec:     exec.New(),
-		opts:     opts,
 	}, nil
 }
 
@@ -119,14 +120,16 @@ func (plugin *gitRepoPlugin) NewUnmounter(volName string, podUID types.UID) (vol
 	}, nil
 }
 
-func (plugin *gitRepoPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*volume.Spec, error) {
+func (plugin *gitRepoPlugin) ConstructVolumeSpec(volumeName, mountPath string) (volume.ReconstructedVolume, error) {
 	gitVolume := &v1.Volume{
 		Name: volumeName,
 		VolumeSource: v1.VolumeSource{
 			GitRepo: &v1.GitRepoVolumeSource{},
 		},
 	}
-	return volume.NewSpecFromVolume(gitVolume), nil
+	return volume.ReconstructedVolume{
+		Spec: volume.NewSpecFromVolume(gitVolume),
+	}, nil
 }
 
 // gitRepo volumes are directories which are pre-filled from a git repository.
@@ -154,28 +157,24 @@ type gitRepoVolumeMounter struct {
 	revision string
 	target   string
 	exec     exec.Interface
-	opts     volume.VolumeOptions
 }
 
 var _ volume.Mounter = &gitRepoVolumeMounter{}
 
 func (b *gitRepoVolumeMounter) GetAttributes() volume.Attributes {
 	return volume.Attributes{
-		ReadOnly:        false,
-		Managed:         true,
-		SupportsSELinux: true, // xattr change should be okay, TODO: double check
+		ReadOnly:       false,
+		Managed:        true,
+		SELinuxRelabel: true, // xattr change should be okay, TODO: double check
 	}
-}
-
-// Checks prior to mount operations to verify that the required components (binaries, etc.)
-// to mount the volume are available on the underlying node.
-// If not, it returns an error
-func (b *gitRepoVolumeMounter) CanMount() error {
-	return nil
 }
 
 // SetUp creates new directory and clones a git repo.
 func (b *gitRepoVolumeMounter) SetUp(mounterArgs volume.MounterArgs) error {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.GitRepoVolumeDriver) {
+		return fmt.Errorf("git-repo volume plugin has been disabled; if necessary, it may be re-enabled by enabling the feature-gate `GitRepoVolumeDriver`")
+	}
+
 	return b.SetUpAt(b.GetPath(), mounterArgs)
 }
 
@@ -186,7 +185,7 @@ func (b *gitRepoVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterArg
 	}
 
 	// Wrap EmptyDir, let it do the setup.
-	wrapped, err := b.plugin.host.NewWrapperMounter(b.volName, wrappedVolumeSpec(), &b.pod, b.opts)
+	wrapped, err := b.plugin.host.NewWrapperMounter(b.volName, wrappedVolumeSpec(), &b.pod)
 	if err != nil {
 		return err
 	}
@@ -236,8 +235,9 @@ func (b *gitRepoVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterArg
 		return fmt.Errorf("failed to exec 'git reset --hard': %s: %v", output, err)
 	}
 
-	volume.SetVolumeOwnership(b, mounterArgs.FsGroup, nil /*fsGroupChangePolicy*/, volumeutil.FSGroupCompleteHook(b.plugin, nil))
-
+	ownershipChanger := volume.NewVolumeOwnership(b, dir, mounterArgs.FsGroup, nil /*fsGroupChangePolicy*/, volumeutil.FSGroupCompleteHook(b.plugin, nil))
+	// We do not care about return value, this plugin is deprecated
+	_ = ownershipChanger.ChangePermissions()
 	volumeutil.SetReady(b.getMetaDir())
 	return nil
 }
@@ -261,6 +261,12 @@ func validateVolume(src *v1.GitRepoVolumeSource) error {
 	}
 	if err := validateNonFlagArgument(src.Directory, "directory"); err != nil {
 		return err
+	}
+	if (src.Revision != "") && (src.Directory != "") {
+		cleanedDir := filepath.Clean(src.Directory)
+		if strings.Contains(cleanedDir, "/") || (strings.Contains(cleanedDir, "\\")) {
+			return fmt.Errorf("%q is not a valid directory, it must not contain a directory separator", src.Directory)
+		}
 	}
 	return nil
 }

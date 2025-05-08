@@ -22,9 +22,10 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2/ktesting"
+	_ "k8s.io/klog/v2/ktesting/init"
 )
 
 func TestIsManagedDisk(t *testing.T) {
@@ -97,8 +98,10 @@ func TestGetDiskName(t *testing.T) {
 	}
 }
 
-func TestTranslateAzureDiskInTreeStorageClassToCSI(t *testing.T) {
+func TestTranslateAzureDiskInTreeInlineVolumeToCSI(t *testing.T) {
+	sharedBlobDiskKind := corev1.AzureDedicatedBlobDisk
 	translator := NewAzureDiskCSITranslator()
+	logger, _ := ktesting.NewTestContext(t)
 
 	cases := []struct {
 		name   string
@@ -127,7 +130,7 @@ func TestTranslateAzureDiskInTreeStorageClassToCSI(t *testing.T) {
 			},
 			expVol: &corev1.PersistentVolume{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "disk.csi.azure.com-diskname",
+					Name: "datadiskuri",
 				},
 				Spec: corev1.PersistentVolumeSpec{
 					PersistentVolumeSource: corev1.PersistentVolumeSource{
@@ -141,11 +144,24 @@ func TestTranslateAzureDiskInTreeStorageClassToCSI(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "azure disk volume with non-managed kind",
+			volume: &corev1.Volume{
+				VolumeSource: corev1.VolumeSource{
+					AzureDisk: &corev1.AzureDiskVolumeSource{
+						DiskName:    "diskname",
+						DataDiskURI: "datadiskuri",
+						Kind:        &sharedBlobDiskKind,
+					},
+				},
+			},
+			expErr: true,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Logf("Testing %v", tc.name)
-		got, err := translator.TranslateInTreeInlineVolumeToCSI(tc.volume, "")
+		got, err := translator.TranslateInTreeInlineVolumeToCSI(logger, tc.volume, "")
 		if err != nil && !tc.expErr {
 			t.Errorf("Did not expect error but got: %v", err)
 		}
@@ -162,10 +178,13 @@ func TestTranslateAzureDiskInTreeStorageClassToCSI(t *testing.T) {
 
 func TestTranslateAzureDiskInTreePVToCSI(t *testing.T) {
 	translator := NewAzureDiskCSITranslator()
+	logger, _ := ktesting.NewTestContext(t)
 
+	sharedBlobDiskKind := corev1.AzureDedicatedBlobDisk
 	cachingMode := corev1.AzureDataDiskCachingMode("cachingmode")
 	fsType := "fstype"
 	readOnly := true
+	diskURI := "/subscriptions/12/resourceGroups/23/providers/Microsoft.Compute/disks/name"
 
 	cases := []struct {
 		name   string
@@ -178,18 +197,18 @@ func TestTranslateAzureDiskInTreePVToCSI(t *testing.T) {
 			expErr: true,
 		},
 		{
-			name:   "no azure file volume",
+			name:   "no azure disk volume",
 			volume: &corev1.PersistentVolume{},
 			expErr: true,
 		},
 		{
-			name: "azure file volume",
+			name: "azure disk volume",
 			volume: &corev1.PersistentVolume{
 				Spec: corev1.PersistentVolumeSpec{
 					PersistentVolumeSource: corev1.PersistentVolumeSource{
 						AzureDisk: &corev1.AzureDiskVolumeSource{
 							CachingMode: &cachingMode,
-							DataDiskURI: "datadiskuri",
+							DataDiskURI: diskURI,
 							FSType:      &fsType,
 							ReadOnly:    &readOnly,
 						},
@@ -204,21 +223,218 @@ func TestTranslateAzureDiskInTreePVToCSI(t *testing.T) {
 							FSType:   "fstype",
 							ReadOnly: true,
 							VolumeAttributes: map[string]string{
-								azureDiskCachingMode: "cachingmode",
-								azureDiskFSType:      fsType,
-								azureDiskKind:        "Managed",
+								"cachingmode":   "cachingmode",
+								azureDiskFSType: fsType,
+								azureDiskKind:   "Managed",
 							},
-							VolumeHandle: "datadiskuri",
+							VolumeHandle: diskURI,
 						},
 					},
 				},
 			},
 		},
+		{
+			name: "azure disk volume with non-managed kind",
+			volume: &corev1.PersistentVolume{
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureDisk: &corev1.AzureDiskVolumeSource{
+							CachingMode: &cachingMode,
+							DataDiskURI: diskURI,
+							FSType:      &fsType,
+							ReadOnly:    &readOnly,
+							Kind:        &sharedBlobDiskKind,
+						},
+					},
+				},
+			},
+			expErr: true,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Logf("Testing %v", tc.name)
-		got, err := translator.TranslateInTreePVToCSI(tc.volume)
+		got, err := translator.TranslateInTreePVToCSI(logger, tc.volume)
+		if err != nil && !tc.expErr {
+			t.Errorf("Did not expect error but got: %v", err)
+		}
+
+		if err == nil && tc.expErr {
+			t.Errorf("Expected error, but did not get one.")
+		}
+
+		if !reflect.DeepEqual(got, tc.expVol) {
+			t.Errorf("Got parameters: %v, expected :%v", got, tc.expVol)
+		}
+	}
+}
+
+func TestTranslateTranslateCSIPVToInTree(t *testing.T) {
+	cachingModeNone := corev1.AzureDataDiskCachingNone
+	cachingModeReadOnly := corev1.AzureDataDiskCachingReadOnly
+	cachingModeReadWrite := corev1.AzureDataDiskCachingReadWrite
+	fsType := "fstype"
+	readOnly := true
+	diskURI := "/subscriptions/12/resourceGroups/23/providers/Microsoft.Compute/disks/name"
+	managed := corev1.AzureManagedDisk
+
+	translator := NewAzureDiskCSITranslator()
+	cases := []struct {
+		name        string
+		cachingMode corev1.AzureDataDiskCachingMode
+		volume      *corev1.PersistentVolume
+		expVol      *corev1.PersistentVolume
+		expErr      bool
+	}{
+		{
+			name:        "azure disk volume with ReadOnly cachingMode",
+			cachingMode: corev1.AzureDataDiskCachingReadOnly,
+			volume: &corev1.PersistentVolume{
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							Driver:   "disk.csi.azure.com",
+							FSType:   "fstype",
+							ReadOnly: true,
+							VolumeAttributes: map[string]string{
+								"cachingmode":   "ReadOnly",
+								azureDiskFSType: fsType,
+								azureDiskKind:   "managed",
+							},
+							VolumeHandle: diskURI,
+						},
+					},
+				},
+			},
+			expVol: &corev1.PersistentVolume{
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureDisk: &corev1.AzureDiskVolumeSource{
+							CachingMode: &cachingModeReadOnly,
+							DataDiskURI: diskURI,
+							FSType:      &fsType,
+							ReadOnly:    &readOnly,
+							Kind:        &managed,
+							DiskName:    "name",
+						},
+					},
+				},
+			},
+			expErr: false,
+		},
+		{
+			name:        "azure disk volume with ReadOnly cachingMode",
+			cachingMode: corev1.AzureDataDiskCachingReadOnly,
+			volume: &corev1.PersistentVolume{
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							Driver:   "disk.csi.azure.com",
+							FSType:   "fstype",
+							ReadOnly: true,
+							VolumeAttributes: map[string]string{
+								"cachingmode": "ReadOnly",
+								"fstype":      fsType,
+								azureDiskKind: "managed",
+							},
+							VolumeHandle: diskURI,
+						},
+					},
+				},
+			},
+			expVol: &corev1.PersistentVolume{
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureDisk: &corev1.AzureDiskVolumeSource{
+							CachingMode: &cachingModeReadOnly,
+							DataDiskURI: diskURI,
+							FSType:      &fsType,
+							ReadOnly:    &readOnly,
+							Kind:        &managed,
+							DiskName:    "name",
+						},
+					},
+				},
+			},
+			expErr: false,
+		},
+		{
+			name:        "azure disk volume with None cachingMode",
+			cachingMode: corev1.AzureDataDiskCachingReadOnly,
+			volume: &corev1.PersistentVolume{
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							Driver:   "disk.csi.azure.com",
+							FSType:   "fstype",
+							ReadOnly: true,
+							VolumeAttributes: map[string]string{
+								"cachingMode": "None",
+								"fsType":      fsType,
+								azureDiskKind: "managed",
+							},
+							VolumeHandle: diskURI,
+						},
+					},
+				},
+			},
+			expVol: &corev1.PersistentVolume{
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureDisk: &corev1.AzureDiskVolumeSource{
+							CachingMode: &cachingModeNone,
+							DataDiskURI: diskURI,
+							FSType:      &fsType,
+							ReadOnly:    &readOnly,
+							Kind:        &managed,
+							DiskName:    "name",
+						},
+					},
+				},
+			},
+			expErr: false,
+		},
+		{
+			name:        "azure disk volume with ReadWrite cachingMode",
+			cachingMode: corev1.AzureDataDiskCachingReadOnly,
+			volume: &corev1.PersistentVolume{
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							Driver:   "disk.csi.azure.com",
+							FSType:   "fstype",
+							ReadOnly: true,
+							VolumeAttributes: map[string]string{
+								"cachingMode": "ReadWrite",
+								"fsType":      fsType,
+								azureDiskKind: "managed",
+							},
+							VolumeHandle: diskURI,
+						},
+					},
+				},
+			},
+			expVol: &corev1.PersistentVolume{
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureDisk: &corev1.AzureDiskVolumeSource{
+							CachingMode: &cachingModeReadWrite,
+							DataDiskURI: diskURI,
+							FSType:      &fsType,
+							ReadOnly:    &readOnly,
+							Kind:        &managed,
+							DiskName:    "name",
+						},
+					},
+				},
+			},
+			expErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Logf("Testing %v", tc.name)
+		got, err := translator.TranslateCSIPVToInTree(tc.volume)
 		if err != nil && !tc.expErr {
 			t.Errorf("Did not expect error but got: %v", err)
 		}
@@ -235,6 +451,7 @@ func TestTranslateAzureDiskInTreePVToCSI(t *testing.T) {
 
 func TestTranslateInTreeStorageClassToCSI(t *testing.T) {
 	translator := NewAzureDiskCSITranslator()
+	logger, _ := ktesting.NewTestContext(t)
 
 	tcs := []struct {
 		name       string
@@ -269,12 +486,12 @@ func TestTranslateInTreeStorageClassToCSI(t *testing.T) {
 		},
 		{
 			name:       "some translated topology",
-			options:    NewStorageClass(map[string]string{}, generateToplogySelectors(v1.LabelTopologyZone, []string{"foo"})),
+			options:    NewStorageClass(map[string]string{}, generateToplogySelectors(corev1.LabelTopologyZone, []string{"foo"})),
 			expOptions: NewStorageClass(map[string]string{}, generateToplogySelectors(AzureDiskTopologyKey, []string{"foo"})),
 		},
 		{
 			name:       "some translated topology with beta labels",
-			options:    NewStorageClass(map[string]string{}, generateToplogySelectors(v1.LabelFailureDomainBetaZone, []string{"foo"})),
+			options:    NewStorageClass(map[string]string{}, generateToplogySelectors(corev1.LabelFailureDomainBetaZone, []string{"foo"})),
 			expOptions: NewStorageClass(map[string]string{}, generateToplogySelectors(AzureDiskTopologyKey, []string{"foo"})),
 		},
 		{
@@ -282,11 +499,26 @@ func TestTranslateInTreeStorageClassToCSI(t *testing.T) {
 			options: NewStorageClass(map[string]string{"zone": "foo"}, generateToplogySelectors(AzureDiskTopologyKey, []string{"foo"})),
 			expErr:  true,
 		},
+		{
+			name:       "topology in regions without zones",
+			options:    NewStorageClass(map[string]string{}, generateToplogySelectors(corev1.LabelTopologyZone, []string{"0"})),
+			expOptions: NewStorageClass(map[string]string{}, generateToplogySelectors(AzureDiskTopologyKey, []string{""})),
+		},
+		{
+			name:       "longer topology in regions without zones",
+			options:    NewStorageClass(map[string]string{}, generateToplogySelectors(corev1.LabelTopologyZone, []string{"1234"})),
+			expOptions: NewStorageClass(map[string]string{}, generateToplogySelectors(AzureDiskTopologyKey, []string{""})),
+		},
+		{
+			name:       "topology in regions with zones",
+			options:    NewStorageClass(map[string]string{}, generateToplogySelectors(corev1.LabelTopologyZone, []string{"centralus-1"})),
+			expOptions: NewStorageClass(map[string]string{}, generateToplogySelectors(AzureDiskTopologyKey, []string{"centralus-1"})),
+		},
 	}
 
 	for _, tc := range tcs {
 		t.Logf("Testing %v", tc.name)
-		gotOptions, err := translator.TranslateInTreeStorageClassToCSI(tc.options)
+		gotOptions, err := translator.TranslateInTreeStorageClassToCSI(logger, tc.options)
 		if err != nil && !tc.expErr {
 			t.Errorf("Did not expect error but got: %v", err)
 		}

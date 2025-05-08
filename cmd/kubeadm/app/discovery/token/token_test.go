@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pmezard/go-difflib/difflib"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -27,10 +29,9 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	tokenjws "k8s.io/cluster-bootstrap/token/jws"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
-
-	"github.com/pmezard/go-difflib/difflib"
 )
 
 func TestRetrieveValidatedConfigInfo(t *testing.T) {
@@ -247,7 +248,7 @@ users: null
 			}
 
 			// Set arbitrary discovery timeout and retry interval
-			test.cfg.Timeout = &metav1.Duration{Duration: time.Millisecond * 200}
+			timeout := time.Millisecond * 500
 			interval := time.Millisecond * 20
 
 			// Patch the JWS signature after a short delay
@@ -262,13 +263,13 @@ users: null
 			}
 
 			// Retrieve validated configuration
-			kubeconfig, err = retrieveValidatedConfigInfo(client, test.cfg, interval)
+			kubeconfig, err = retrieveValidatedConfigInfo(client, test.cfg, interval, timeout, false, true)
 			if (err != nil) != test.expectedError {
 				t.Errorf("expected error %v, got %v, error: %v", test.expectedError, err != nil, err)
 			}
 
 			// Return if an error is expected
-			if test.expectedError {
+			if err != nil {
 				return
 			}
 
@@ -302,7 +303,7 @@ type fakeConfigMap struct {
 }
 
 func (c *fakeConfigMap) createOrUpdate(client clientset.Interface) error {
-	return apiclient.CreateOrUpdateConfigMap(client, &v1.ConfigMap{
+	return apiclient.CreateOrUpdate(client.CoreV1().ConfigMaps(metav1.NamespacePublic), &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      c.name,
 			Namespace: metav1.NamespacePublic,

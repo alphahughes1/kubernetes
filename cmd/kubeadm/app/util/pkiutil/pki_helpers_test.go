@@ -23,13 +23,16 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
 	certutil "k8s.io/client-go/util/cert"
+	netutils "k8s.io/utils/net"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 )
 
@@ -50,7 +53,7 @@ func TestMain(m *testing.M) {
 		Config: certutil.Config{
 			CommonName: "Root CA 1",
 		},
-		PublicKeyAlgorithm: x509.RSA,
+		EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmRSA2048,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("Failed generating Root CA: %v", err))
@@ -110,7 +113,7 @@ func TestHasServerAuth(t *testing.T) {
 	// Override NewPrivateKey to reuse the same key for all certs
 	// since this test is only checking cert.ExtKeyUsage
 	privateKeyFunc := NewPrivateKey
-	NewPrivateKey = func(x509.PublicKeyAlgorithm) (crypto.Signer, error) {
+	NewPrivateKey = func(kubeadmapi.EncryptionAlgorithmType) (crypto.Signer, error) {
 		return rootCAKey, nil
 	}
 	defer func() {
@@ -139,7 +142,7 @@ func TestHasServerAuth(t *testing.T) {
 					CommonName: "test",
 					Usages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 				},
-				PublicKeyAlgorithm: x509.ECDSA,
+				EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmECDSAP256,
 			},
 			expected: true,
 		},
@@ -174,7 +177,7 @@ func TestHasServerAuth(t *testing.T) {
 }
 
 func TestWriteCertAndKey(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
@@ -191,7 +194,7 @@ func TestWriteCertAndKey(t *testing.T) {
 }
 
 func TestWriteCert(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
@@ -208,7 +211,7 @@ func TestWriteCert(t *testing.T) {
 }
 
 func TestWriteCertBundle(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
@@ -223,7 +226,7 @@ func TestWriteCertBundle(t *testing.T) {
 }
 
 func TestWriteKey(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
@@ -239,7 +242,7 @@ func TestWriteKey(t *testing.T) {
 }
 
 func TestWritePublicKey(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
@@ -255,18 +258,22 @@ func TestWritePublicKey(t *testing.T) {
 }
 
 func TestCertOrKeyExist(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
 	defer os.RemoveAll(tmpdir)
 
-	caCert := &x509.Certificate{}
-	actual := WriteCertAndKey(tmpdir, "foo", caCert, rootCAKey)
-	if actual != nil {
+	if err = WriteCertAndKey(tmpdir, "foo-0", rootCACert, rootCAKey); err != nil {
 		t.Errorf(
 			"failed WriteCertAndKey with an error: %v",
-			actual,
+			err,
+		)
+	}
+	if err = WriteCert(tmpdir, "foo-1", rootCACert); err != nil {
+		t.Errorf(
+			"failed WriteCert with an error: %v",
+			err,
 		)
 	}
 
@@ -283,9 +290,15 @@ func TestCertOrKeyExist(t *testing.T) {
 			expected: false,
 		},
 		{
-			desc:     "valid path and name",
+			desc:     "valid path and name, both cert and key exist",
 			path:     tmpdir,
-			name:     "foo",
+			name:     "foo-0",
+			expected: true,
+		},
+		{
+			desc:     "valid path and name, only cert exist",
+			path:     tmpdir,
+			name:     "foo-1",
 			expected: true,
 		},
 	}
@@ -304,7 +317,7 @@ func TestCertOrKeyExist(t *testing.T) {
 }
 
 func TestTryLoadCertAndKeyFromDisk(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
@@ -352,7 +365,7 @@ func TestTryLoadCertAndKeyFromDisk(t *testing.T) {
 }
 
 func TestTryLoadCertFromDisk(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
@@ -400,7 +413,7 @@ func TestTryLoadCertFromDisk(t *testing.T) {
 }
 
 func TestTryLoadCertChainFromDisk(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
@@ -500,7 +513,7 @@ func TestTryLoadKeyFromDisk(t *testing.T) {
 	}
 	for _, rt := range tests {
 		t.Run(rt.desc, func(t *testing.T) {
-			tmpdir, err := ioutil.TempDir("", "")
+			tmpdir, err := os.MkdirTemp("", "")
 			if err != nil {
 				t.Fatalf("Couldn't create tmpdir")
 			}
@@ -527,38 +540,44 @@ func TestTryLoadKeyFromDisk(t *testing.T) {
 
 func TestPathsForCertAndKey(t *testing.T) {
 	crtPath, keyPath := PathsForCertAndKey("/foo", "bar")
-	if crtPath != "/foo/bar.crt" {
+	expectedPath := filepath.FromSlash("/foo/bar.crt")
+	if crtPath != expectedPath {
 		t.Errorf("unexpected certificate path: %s", crtPath)
 	}
-	if keyPath != "/foo/bar.key" {
+	expectedPath = filepath.FromSlash("/foo/bar.key")
+	if keyPath != expectedPath {
 		t.Errorf("unexpected key path: %s", keyPath)
 	}
 }
 
 func TestPathForCert(t *testing.T) {
 	crtPath := pathForCert("/foo", "bar")
-	if crtPath != "/foo/bar.crt" {
+	expectedPath := filepath.FromSlash("/foo/bar.crt")
+	if crtPath != expectedPath {
 		t.Errorf("unexpected certificate path: %s", crtPath)
 	}
 }
 
 func TestPathForKey(t *testing.T) {
 	keyPath := pathForKey("/foo", "bar")
-	if keyPath != "/foo/bar.key" {
+	expectedPath := filepath.FromSlash("/foo/bar.key")
+	if keyPath != expectedPath {
 		t.Errorf("unexpected certificate path: %s", keyPath)
 	}
 }
 
 func TestPathForPublicKey(t *testing.T) {
 	pubPath := pathForPublicKey("/foo", "bar")
-	if pubPath != "/foo/bar.pub" {
+	expectedPath := filepath.FromSlash("/foo/bar.pub")
+	if pubPath != expectedPath {
 		t.Errorf("unexpected certificate path: %s", pubPath)
 	}
 }
 
 func TestPathForCSR(t *testing.T) {
 	csrPath := pathForCSR("/foo", "bar")
-	if csrPath != "/foo/bar.csr" {
+	expectedPath := filepath.FromSlash("/foo/bar.csr")
+	if csrPath != expectedPath {
 		t.Errorf("unexpected certificate path: %s", csrPath)
 	}
 }
@@ -616,13 +635,7 @@ func TestGetAPIServerAltNames(t *testing.T) {
 			}
 
 			for _, DNSName := range rt.expectedDNSNames {
-				found := false
-				for _, val := range altNames.DNSNames {
-					if val == DNSName {
-						found = true
-						break
-					}
-				}
+				found := slices.Contains(altNames.DNSNames, DNSName)
 
 				if !found {
 					t.Errorf("%s: altNames does not contain DNSName %s but %v", rt.name, DNSName, altNames.DNSNames)
@@ -632,7 +645,7 @@ func TestGetAPIServerAltNames(t *testing.T) {
 			for _, IPAddress := range rt.expectedIPAddresses {
 				found := false
 				for _, val := range altNames.IPs {
-					if val.Equal(net.ParseIP(IPAddress)) {
+					if val.Equal(netutils.ParseIPSloppy(IPAddress)) {
 						found = true
 						break
 					}
@@ -678,13 +691,7 @@ func TestGetEtcdAltNames(t *testing.T) {
 	expectedDNSNames := []string{"myNode", "localhost", proxy}
 	for _, DNSName := range expectedDNSNames {
 		t.Run(DNSName, func(t *testing.T) {
-			found := false
-			for _, val := range altNames.DNSNames {
-				if val == DNSName {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(altNames.DNSNames, DNSName)
 
 			if !found {
 				t.Errorf("altNames does not contain DNSName %s", DNSName)
@@ -697,7 +704,7 @@ func TestGetEtcdAltNames(t *testing.T) {
 		t.Run(IPAddress, func(t *testing.T) {
 			found := false
 			for _, val := range altNames.IPs {
-				if val.Equal(net.ParseIP(IPAddress)) {
+				if val.Equal(netutils.ParseIPSloppy(IPAddress)) {
 					found = true
 					break
 				}
@@ -740,13 +747,7 @@ func TestGetEtcdPeerAltNames(t *testing.T) {
 	expectedDNSNames := []string{hostname, proxy}
 	for _, DNSName := range expectedDNSNames {
 		t.Run(DNSName, func(t *testing.T) {
-			found := false
-			for _, val := range altNames.DNSNames {
-				if val == DNSName {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(altNames.DNSNames, DNSName)
 
 			if !found {
 				t.Errorf("altNames does not contain DNSName %s", DNSName)
@@ -756,7 +757,7 @@ func TestGetEtcdPeerAltNames(t *testing.T) {
 			for _, IPAddress := range expectedIPAddresses {
 				found := false
 				for _, val := range altNames.IPs {
-					if val.Equal(net.ParseIP(IPAddress)) {
+					if val.Equal(netutils.ParseIPSloppy(IPAddress)) {
 						found = true
 						break
 					}
@@ -847,7 +848,7 @@ func TestRemoveDuplicateAltNames(t *testing.T) {
 }
 
 func TestVerifyCertChain(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir")
 	}
@@ -918,6 +919,27 @@ func TestVerifyCertChain(t *testing.T) {
 					rt.expected,
 					(actual == nil),
 				)
+			}
+		})
+	}
+}
+
+func TestRSAKeySizeFromAlgorithmType(t *testing.T) {
+	var tests = []struct {
+		algorithm    kubeadmapi.EncryptionAlgorithmType
+		expectedSize int
+	}{
+		{algorithm: "unknown", expectedSize: 0},
+		{algorithm: "", expectedSize: 2048},
+		{algorithm: kubeadmapi.EncryptionAlgorithmRSA2048, expectedSize: 2048},
+		{algorithm: kubeadmapi.EncryptionAlgorithmRSA3072, expectedSize: 3072},
+		{algorithm: kubeadmapi.EncryptionAlgorithmRSA4096, expectedSize: 4096},
+	}
+	for _, rt := range tests {
+		t.Run(string(rt.algorithm), func(t *testing.T) {
+			size := rsaKeySizeFromAlgorithmType(rt.algorithm)
+			if size != rt.expectedSize {
+				t.Errorf("expected size: %d, got: %d", rt.expectedSize, size)
 			}
 		})
 	}

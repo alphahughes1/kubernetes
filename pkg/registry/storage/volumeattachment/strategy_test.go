@@ -17,15 +17,15 @@ limitations under the License.
 package volumeattachment
 
 import (
+	"context"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/diff"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/storage"
@@ -93,7 +93,7 @@ func TestVolumeAttachmentStrategy(t *testing.T) {
 	statusVolumeAttachment.Status = storage.VolumeAttachmentStatus{Attached: true}
 	Strategy.PrepareForCreate(ctx, statusVolumeAttachment)
 	if !apiequality.Semantic.DeepEqual(statusVolumeAttachment, volumeAttachment) {
-		t.Errorf("unexpected objects difference after creating with status: %v", diff.ObjectDiff(statusVolumeAttachment, volumeAttachment))
+		t.Errorf("unexpected objects difference after creating with status: %v", cmp.Diff(statusVolumeAttachment, volumeAttachment))
 	}
 
 	// Update of spec is disallowed
@@ -114,7 +114,7 @@ func TestVolumeAttachmentStrategy(t *testing.T) {
 	Strategy.PrepareForUpdate(ctx, statusVolumeAttachment, volumeAttachment)
 
 	if !apiequality.Semantic.DeepEqual(statusVolumeAttachment, volumeAttachment) {
-		t.Errorf("unexpected objects difference after modifying status: %v", diff.ObjectDiff(statusVolumeAttachment, volumeAttachment))
+		t.Errorf("unexpected objects difference after modifying status: %v", cmp.Diff(statusVolumeAttachment, volumeAttachment))
 	}
 }
 
@@ -127,34 +127,20 @@ func TestVolumeAttachmentStrategySourceInlineSpec(t *testing.T) {
 
 	volumeAttachment := getValidVolumeAttachmentWithInlineSpec("valid-attachment")
 	volumeAttachmentSaved := volumeAttachment.DeepCopy()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIMigration, true)()
 	Strategy.PrepareForCreate(ctx, volumeAttachment)
 	if volumeAttachment.Spec.Source.InlineVolumeSpec == nil {
 		t.Errorf("InlineVolumeSpec unexpectedly set to nil during PrepareForCreate")
 	}
 	if !apiequality.Semantic.DeepEqual(volumeAttachmentSaved, volumeAttachment) {
-		t.Errorf("unexpected difference in object after creation: %v", diff.ObjectDiff(volumeAttachment, volumeAttachmentSaved))
+		t.Errorf("unexpected difference in object after creation: %v", cmp.Diff(volumeAttachment, volumeAttachmentSaved))
 	}
 	Strategy.PrepareForUpdate(ctx, volumeAttachmentSaved, volumeAttachment)
 	if volumeAttachmentSaved.Spec.Source.InlineVolumeSpec == nil {
 		t.Errorf("InlineVolumeSpec unexpectedly set to nil during PrepareForUpdate")
 	}
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIMigration, false)()
 	Strategy.PrepareForUpdate(ctx, volumeAttachmentSaved, volumeAttachment)
 	if volumeAttachmentSaved.Spec.Source.InlineVolumeSpec == nil {
 		t.Errorf("InlineVolumeSpec unexpectedly set to nil during PrepareForUpdate")
-	}
-
-	volumeAttachment = getValidVolumeAttachmentWithInlineSpec("valid-attachment")
-	volumeAttachmentNew := volumeAttachment.DeepCopy()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIMigration, false)()
-	Strategy.PrepareForCreate(ctx, volumeAttachment)
-	if volumeAttachment.Spec.Source.InlineVolumeSpec != nil {
-		t.Errorf("InlineVolumeSpec unexpectedly not dropped during PrepareForCreate")
-	}
-	Strategy.PrepareForUpdate(ctx, volumeAttachmentNew, volumeAttachment)
-	if volumeAttachmentNew.Spec.Source.InlineVolumeSpec != nil {
-		t.Errorf("InlineVolumeSpec unexpectedly not dropped during PrepareForUpdate")
 	}
 }
 
@@ -174,7 +160,7 @@ func TestVolumeAttachmentStatusStrategy(t *testing.T) {
 	expectedVolumeAttachment := statusVolumeAttachment.DeepCopy()
 	StatusStrategy.PrepareForUpdate(ctx, statusVolumeAttachment, volumeAttachment)
 	if !apiequality.Semantic.DeepEqual(statusVolumeAttachment, expectedVolumeAttachment) {
-		t.Errorf("unexpected objects difference after modifying status: %v", diff.ObjectDiff(statusVolumeAttachment, expectedVolumeAttachment))
+		t.Errorf("unexpected objects difference after modifying status: %v", cmp.Diff(statusVolumeAttachment, expectedVolumeAttachment))
 	}
 
 	// spec and metadata modifications should be dropped
@@ -192,81 +178,92 @@ func TestVolumeAttachmentStatusStrategy(t *testing.T) {
 
 	StatusStrategy.PrepareForUpdate(ctx, newVolumeAttachment, volumeAttachment)
 	if !apiequality.Semantic.DeepEqual(newVolumeAttachment, volumeAttachment) {
-		t.Errorf("unexpected objects difference after modifying spec: %v", diff.ObjectDiff(newVolumeAttachment, volumeAttachment))
+		t.Errorf("unexpected objects difference after modifying spec: %v", cmp.Diff(newVolumeAttachment, volumeAttachment))
+	}
+
+	// Verify that error codes are dropped when the feature gate is disabled.
+	featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.MutableCSINodeAllocatableCount, false)
+
+	statusWithError := volumeAttachment.DeepCopy()
+	statusErrCode := int32(7)
+	statusWithError.Status = storage.VolumeAttachmentStatus{
+		Attached: true,
+		AttachError: &storage.VolumeError{
+			Message:   "attach error",
+			ErrorCode: &statusErrCode,
+		},
+		DetachError: &storage.VolumeError{
+			Message:   "detach error",
+			ErrorCode: &statusErrCode,
+		},
+	}
+
+	StatusStrategy.PrepareForUpdate(ctx, statusWithError, volumeAttachment)
+	if statusWithError.Status.AttachError != nil && statusWithError.Status.AttachError.ErrorCode != nil {
+		t.Errorf("expected AttachError.ErrorCode to be nil, got %v", *statusWithError.Status.AttachError.ErrorCode)
+	}
+	if statusWithError.Status.DetachError != nil && statusWithError.Status.DetachError.ErrorCode != nil {
+		t.Errorf("expected DetachError.ErrorCode to be nil, got %v", *statusWithError.Status.DetachError.ErrorCode)
+	}
+
+	// Verify that error codes are not dropped when set in the old object.
+	oldStatusWithError := volumeAttachment.DeepCopy()
+	oldStatusErrCode := int32(8)
+	oldStatusWithError.Status = storage.VolumeAttachmentStatus{
+		Attached: true,
+		AttachError: &storage.VolumeError{
+			Message:   "old attach error",
+			ErrorCode: &oldStatusErrCode,
+		},
+		DetachError: &storage.VolumeError{
+			Message:   "old detach error",
+			ErrorCode: &oldStatusErrCode,
+		},
+	}
+
+	newStatusWithError := oldStatusWithError.DeepCopy()
+	newStatusErrCode := int32(9)
+	newStatusWithError.Status = storage.VolumeAttachmentStatus{
+		Attached: true,
+		AttachError: &storage.VolumeError{
+			Message:   "new attach error",
+			ErrorCode: &newStatusErrCode,
+		},
+		DetachError: &storage.VolumeError{
+			Message:   "new detach error",
+			ErrorCode: &newStatusErrCode,
+		},
+	}
+
+	StatusStrategy.PrepareForUpdate(ctx, newStatusWithError, oldStatusWithError)
+	if newStatusWithError.Status.AttachError == nil || newStatusWithError.Status.AttachError.ErrorCode == nil {
+		t.Errorf("expected AttachError.ErrorCode to be preserved, got nil")
+	} else if *newStatusWithError.Status.AttachError.ErrorCode != newStatusErrCode {
+		t.Errorf("expected AttachError.ErrorCode to be %v, got %v", newStatusErrCode, *newStatusWithError.Status.AttachError.ErrorCode)
+	}
+	if newStatusWithError.Status.DetachError == nil || newStatusWithError.Status.DetachError.ErrorCode == nil {
+		t.Errorf("expected DetachError.ErrorCode to be preserved, got nil")
+	} else if *newStatusWithError.Status.DetachError.ErrorCode != newStatusErrCode {
+		t.Errorf("expected DetachError.ErrorCode to be %v, got %v", newStatusErrCode, *newStatusWithError.Status.DetachError.ErrorCode)
 	}
 }
 
-func TestBetaAndV1StatusUpdate(t *testing.T) {
-	tests := []struct {
-		requestInfo    genericapirequest.RequestInfo
-		newStatus      bool
-		expectedStatus bool
-	}{
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "storage.k8s.io",
-				APIVersion: "v1",
-				Resource:   "volumeattachments",
-			},
-			true,
-			false,
-		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "storage.k8s.io",
-				APIVersion: "v1beta1",
-				Resource:   "volumeattachments",
-			},
-			true,
-			true,
-		},
+func TestUpdatePreventsStatusWrite(t *testing.T) {
+	va := getValidVolumeAttachment("valid-attachment")
+	newAttachment := va.DeepCopy()
+	newAttachment.Status.Attached = true
+	Strategy.PrepareForUpdate(context.TODO(), newAttachment, va)
+	if newAttachment.Status.Attached {
+		t.Errorf("expected status to be %v got %v", false, newAttachment.Status.Attached)
 	}
-	for _, test := range tests {
-		va := getValidVolumeAttachment("valid-attachment")
-		newAttachment := va.DeepCopy()
-		newAttachment.Status.Attached = test.newStatus
-		context := genericapirequest.WithRequestInfo(genericapirequest.NewContext(), &test.requestInfo)
-		Strategy.PrepareForUpdate(context, newAttachment, va)
-		if newAttachment.Status.Attached != test.expectedStatus {
-			t.Errorf("expected status to be %v got %v", test.expectedStatus, newAttachment.Status.Attached)
-		}
-	}
-
 }
 
-func TestBetaAndV1StatusCreate(t *testing.T) {
-	tests := []struct {
-		requestInfo    genericapirequest.RequestInfo
-		newStatus      bool
-		expectedStatus bool
-	}{
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "storage.k8s.io",
-				APIVersion: "v1",
-				Resource:   "volumeattachments",
-			},
-			true,
-			false,
-		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "storage.k8s.io",
-				APIVersion: "v1beta1",
-				Resource:   "volumeattachments",
-			},
-			true,
-			true,
-		},
-	}
-	for _, test := range tests {
-		va := getValidVolumeAttachment("valid-attachment")
-		va.Status.Attached = test.newStatus
-		context := genericapirequest.WithRequestInfo(genericapirequest.NewContext(), &test.requestInfo)
-		Strategy.PrepareForCreate(context, va)
-		if va.Status.Attached != test.expectedStatus {
-			t.Errorf("expected status to be %v got %v", test.expectedStatus, va.Status.Attached)
-		}
+func TestCreatePreventsStatusWrite(t *testing.T) {
+	va := getValidVolumeAttachment("valid-attachment")
+	va.Status.Attached = true
+	Strategy.PrepareForCreate(context.TODO(), va)
+	if va.Status.Attached {
+		t.Errorf("expected status to be false got %v", va.Status.Attached)
 	}
 }
 
@@ -276,13 +273,11 @@ func TestVolumeAttachmentValidation(t *testing.T) {
 	tests := []struct {
 		name             string
 		volumeAttachment *storage.VolumeAttachment
-		expectBetaError  bool
-		expectV1Error    bool
+		expectError      bool
 	}{
 		{
 			"valid attachment",
 			getValidVolumeAttachment("foo"),
-			false,
 			false,
 		},
 		{
@@ -299,7 +294,6 @@ func TestVolumeAttachmentValidation(t *testing.T) {
 					NodeName: "valid-node",
 				},
 			},
-			false,
 			true,
 		},
 		{
@@ -316,7 +310,6 @@ func TestVolumeAttachmentValidation(t *testing.T) {
 					NodeName: "valid-node",
 				},
 			},
-			false,
 			true,
 		},
 		{
@@ -334,36 +327,17 @@ func TestVolumeAttachmentValidation(t *testing.T) {
 				},
 			},
 			true,
-			true,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-
-			testValidation := func(va *storage.VolumeAttachment, apiVersion string) field.ErrorList {
-				ctx := genericapirequest.WithRequestInfo(genericapirequest.NewContext(), &genericapirequest.RequestInfo{
-					APIGroup:   "storage.k8s.io",
-					APIVersion: apiVersion,
-					Resource:   "volumeattachments",
-				})
-				return Strategy.Validate(ctx, va)
+			err := Strategy.Validate(context.TODO(), test.volumeAttachment)
+			if len(err) > 0 && !test.expectError {
+				t.Errorf("Validation of object failed: %+v", err)
 			}
-
-			v1Err := testValidation(test.volumeAttachment, "v1")
-			if len(v1Err) > 0 && !test.expectV1Error {
-				t.Errorf("Validation of v1 object failed: %+v", v1Err)
-			}
-			if len(v1Err) == 0 && test.expectV1Error {
-				t.Errorf("Validation of v1 object unexpectedly succeeded")
-			}
-
-			betaErr := testValidation(test.volumeAttachment, "v1beta1")
-			if len(betaErr) > 0 && !test.expectBetaError {
-				t.Errorf("Validation of v1beta1 object failed: %+v", betaErr)
-			}
-			if len(betaErr) == 0 && test.expectBetaError {
-				t.Errorf("Validation of v1beta1 object unexpectedly succeeded")
+			if len(err) == 0 && test.expectError {
+				t.Errorf("Validation of object unexpectedly succeeded")
 			}
 		})
 	}

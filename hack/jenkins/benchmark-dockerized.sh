@@ -42,16 +42,12 @@ export KUBE_ROOT
 
 export PATH=${GOPATH}/bin:${PWD}/third_party/etcd:/usr/local/go/bin:${PATH}
 
-# Until all GOPATH references are removed from all build scripts as well,
-# explicitly disable module mode to avoid picking up user-set GO111MODULE preferences.
-# As individual scripts make use of go modules, they can explicitly set GO111MODULE=on
-export GO111MODULE=off
-
 # Install tools we need
-pushd "${KUBE_ROOT}/hack/tools" >/dev/null
-  GO111MODULE=on go install github.com/cespare/prettybench
-  GO111MODULE=on go install gotest.tools/gotestsum
-popd >/dev/null
+hack_tools_gotoolchain="${GOTOOLCHAIN:-}"
+if [ -n "${KUBE_HACK_TOOLS_GOTOOLCHAIN:-}" ]; then
+  hack_tools_gotoolchain="${KUBE_HACK_TOOLS_GOTOOLCHAIN}";
+fi
+GOTOOLCHAIN="${hack_tools_gotoolchain}" go -C "${KUBE_ROOT}/hack/tools" install github.com/cespare/prettybench
 
 # Disable the Go race detector.
 export KUBE_RACE=" "
@@ -66,7 +62,8 @@ cd "${GOPATH}/src/k8s.io/kubernetes"
 ./hack/install-etcd.sh
 
 # Run the benchmark tests and pretty-print the results into a separate file.
-make test-integration WHAT="$*" KUBE_TEST_ARGS="-run='XXX' -bench=${TEST_PREFIX:-.} -benchtime=${BENCHTIME:-1s} -benchmem  -alsologtostderr=false -logtostderr=false -data-items-dir=${ARTIFACTS}" \
+# Log output of the tests go to stderr.
+make test-integration WHAT="$*" KUBE_TEST_ARGS="-run='XXX' -bench=${TEST_PREFIX:-.} -benchtime=${BENCHTIME:-1s} -benchmem  -data-items-dir=${ARTIFACTS}" \
   | (go run test/integration/benchmark/extractlog/main.go) \
   | tee \
    >(prettybench -no-passthrough > "${ARTIFACTS}/BenchmarkResults.txt") \

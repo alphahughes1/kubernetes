@@ -32,7 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	v1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 )
 
 // AutoAPIServiceRegistration is an interface which callers can re-declare locally and properly cast to for
@@ -56,7 +56,7 @@ type crdRegistrationController struct {
 
 	// queue is where incoming work is placed to de-dup and to allow "easy" rate limited requeues on errors
 	// this is actually keyed by a groupVersion
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[schema.GroupVersion]
 }
 
 // NewCRDRegistrationController returns a controller which will register CRD GroupVersions with the auto APIService registration
@@ -67,7 +67,10 @@ func NewCRDRegistrationController(crdinformer crdinformers.CustomResourceDefinit
 		crdSynced:              crdinformer.Informer().HasSynced,
 		apiServiceRegistration: apiServiceRegistration,
 		syncedInitialSet:       make(chan struct{}),
-		queue:                  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "crd_autoregistration_controller"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[schema.GroupVersion](),
+			workqueue.TypedRateLimitingQueueConfig[schema.GroupVersion]{Name: "crd_autoregistration_controller"},
+		),
 	}
 	c.syncHandler = c.handleVersionUpdate
 
@@ -103,7 +106,7 @@ func NewCRDRegistrationController(crdinformer crdinformers.CustomResourceDefinit
 	return c
 }
 
-func (c *crdRegistrationController) Run(threadiness int, stopCh <-chan struct{}) {
+func (c *crdRegistrationController) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	// make sure the work queue is shutdown which will trigger workers to end
 	defer c.queue.ShutDown()
@@ -130,8 +133,8 @@ func (c *crdRegistrationController) Run(threadiness int, stopCh <-chan struct{})
 	}
 	close(c.syncedInitialSet)
 
-	// start up your worker threads based on threadiness.  Some controllers have multiple kinds of workers
-	for i := 0; i < threadiness; i++ {
+	// start up your worker threads based on workers.  Some controllers have multiple kinds of workers
+	for i := 0; i < workers; i++ {
 		// runWorker will loop until "something bad" happens.  The .Until will then rekick the worker
 		// after one second
 		go wait.Until(c.runWorker, time.Second, stopCh)
@@ -164,7 +167,7 @@ func (c *crdRegistrationController) processNextWorkItem() bool {
 	defer c.queue.Done(key)
 
 	// do your work on the key.  This method will contains your "do stuff" logic
-	err := c.syncHandler(key.(schema.GroupVersion))
+	err := c.syncHandler(key)
 	if err == nil {
 		// if you had no error, tell the queue to stop tracking history for your key.  This will
 		// reset things like failure counts for per-item rate limiting

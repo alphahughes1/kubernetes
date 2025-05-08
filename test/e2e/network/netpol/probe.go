@@ -17,18 +17,42 @@ limitations under the License.
 package netpol
 
 import (
-	"github.com/onsi/ginkgo"
+	"fmt"
+
+	"github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/kubernetes/test/e2e/framework"
+	netutils "k8s.io/utils/net"
 )
+
+// probeConnectivityArgs is set of arguments for a probeConnectivity
+type probeConnectivityArgs struct {
+	nsFrom              string
+	podFrom             string
+	containerFrom       string
+	addrTo              string
+	protocol            v1.Protocol
+	toPort              int
+	expectConnectivity  bool
+	timeoutSeconds      int
+	pollIntervalSeconds int
+	pollTimeoutSeconds  int
+}
+
+// decouple us from k8smanager.go
+type Prober interface {
+	probeConnectivity(args *probeConnectivityArgs) (bool, string, error)
+}
 
 // ProbeJob packages the data for the input of a pod->pod connectivity probe
 type ProbeJob struct {
-	PodFrom        *Pod
-	PodTo          *Pod
-	ToPort         int
-	ToPodDNSDomain string
-	Protocol       v1.Protocol
+	PodFrom            TestPod
+	PodTo              TestPod
+	PodToServiceIP     string
+	ToPort             int
+	ToPodDNSDomain     string
+	Protocol           v1.Protocol
+	ExpectConnectivity bool
 }
 
 // ProbeJobResults packages the data for the results of a pod->pod connectivity probe
@@ -40,22 +64,26 @@ type ProbeJobResults struct {
 }
 
 // ProbePodToPodConnectivity runs a series of probes in kube, and records the results in `testCase.Reachability`
-func ProbePodToPodConnectivity(k8s *kubeManager, model *Model, testCase *TestCase) {
-	allPods := model.AllPods()
+func ProbePodToPodConnectivity(prober Prober, allPods []TestPod, dnsDomain string, testCase *TestCase) {
 	size := len(allPods) * len(allPods)
 	jobs := make(chan *ProbeJob, size)
 	results := make(chan *ProbeJobResults, size)
-	for i := 0; i < model.GetWorkers(); i++ {
-		go probeWorker(k8s, jobs, results, model.GetProbeTimeoutSeconds())
+	for i := 0; i < getWorkers(); i++ {
+		go probeWorker(prober, jobs, results)
 	}
 	for _, podFrom := range allPods {
 		for _, podTo := range allPods {
+			// set connectivity expectation for the probe job, this allows to retry probe when observed value
+			// don't match expected value.
+			expectConnectivity := testCase.Reachability.Expected.Get(podFrom.PodString().String(), podTo.PodString().String())
+
 			jobs <- &ProbeJob{
-				PodFrom:        podFrom,
-				PodTo:          podTo,
-				ToPort:         testCase.ToPort,
-				ToPodDNSDomain: model.DNSDomain,
-				Protocol:       testCase.Protocol,
+				PodFrom:            podFrom,
+				PodTo:              podTo,
+				ToPort:             testCase.ToPort,
+				ToPodDNSDomain:     dnsDomain,
+				Protocol:           testCase.Protocol,
+				ExpectConnectivity: expectConnectivity,
 			}
 		}
 	}
@@ -83,11 +111,36 @@ func ProbePodToPodConnectivity(k8s *kubeManager, model *Model, testCase *TestCas
 
 // probeWorker continues polling a pod connectivity status, until the incoming "jobs" channel is closed, and writes results back out to the "results" channel.
 // it only writes pass/fail status to a channel and has no failure side effects, this is by design since we do not want to fail inside a goroutine.
-func probeWorker(k8s *kubeManager, jobs <-chan *ProbeJob, results chan<- *ProbeJobResults, timeoutSeconds int) {
+func probeWorker(prober Prober, jobs <-chan *ProbeJob, results chan<- *ProbeJobResults) {
 	defer ginkgo.GinkgoRecover()
 	for job := range jobs {
 		podFrom := job.PodFrom
-		connected, command, err := k8s.probeConnectivity(podFrom.Namespace, podFrom.Name, podFrom.Containers[0].Name(), job.PodTo.QualifiedServiceAddress(job.ToPodDNSDomain), job.Protocol, job.ToPort, timeoutSeconds)
+		// defensive programming: this should not be possible as we already check in initializeClusterFromModel
+		if netutils.ParseIPSloppy(job.PodTo.ServiceIP) == nil {
+			results <- &ProbeJobResults{
+				Job:         job,
+				IsConnected: false,
+				Err:         fmt.Errorf("empty service ip"),
+			}
+		}
+		// note that we can probe a dnsName instead of ServiceIP by using dnsName like so:
+		// we stopped doing this because we wanted to support netpol testing in non dns enabled
+		// clusters, but might re-enable it later.
+		// dnsName := job.PodTo.QualifiedServiceAddress(job.ToPodDNSDomain)
+
+		// TODO make this work on dual-stack clusters...
+		connected, command, err := prober.probeConnectivity(&probeConnectivityArgs{
+			nsFrom:              podFrom.Namespace,
+			podFrom:             podFrom.Name,
+			containerFrom:       podFrom.ContainerName,
+			addrTo:              job.PodTo.ServiceIP,
+			protocol:            job.Protocol,
+			toPort:              job.ToPort,
+			expectConnectivity:  job.ExpectConnectivity,
+			timeoutSeconds:      getProbeTimeoutSeconds(),
+			pollIntervalSeconds: getPollIntervalSeconds(),
+			pollTimeoutSeconds:  getPollTimeoutSeconds(),
+		})
 		result := &ProbeJobResults{
 			Job:         job,
 			IsConnected: connected,

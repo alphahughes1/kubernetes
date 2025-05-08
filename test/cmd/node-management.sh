@@ -88,30 +88,30 @@ run_cluster_management_tests() {
 
   # taint/untaint
   # Pre-condition: node doesn't have dedicated=foo:PreferNoSchedule taint
-  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}' "" # expect no output
+  kube::test::get_object_assert "nodes 127.0.0.1" "{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}" "" # expect no output
   # Dry-run
   kubectl taint node 127.0.0.1 --dry-run=client dedicated=foo:PreferNoSchedule
   kubectl taint node 127.0.0.1 --dry-run=server dedicated=foo:PreferNoSchedule
-  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}' "" # expect no output
+  kube::test::get_object_assert "nodes 127.0.0.1" "{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}" "" # expect no output
   # taint can add a taint (<key>=<value>:<effect>)
   kubectl taint node 127.0.0.1 dedicated=foo:PreferNoSchedule
-  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}' "dedicated=foo:PreferNoSchedule"
+  kube::test::get_object_assert "nodes 127.0.0.1" "{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}" "dedicated=foo:PreferNoSchedule"
   # taint can remove a taint
   kubectl taint node 127.0.0.1 dedicated-
   # taint can add a taint (<key>:<effect>)
   kubectl taint node 127.0.0.1 dedicated:PreferNoSchedule
-  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}' "dedicated=<no value>:PreferNoSchedule"
+  kube::test::get_object_assert "nodes 127.0.0.1" "{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}" "dedicated=<no value>:PreferNoSchedule"
   # Node has field manager for kubectl taint
   output_message=$(kubectl get node 127.0.0.1 --show-managed-fields -o=jsonpath='{.metadata.managedFields[*].manager}' "${kube_flags[@]:?}" 2>&1)
   kube::test::if_has_string "${output_message}" 'kubectl-taint'
   # Dry-run remove a taint
   kubectl taint node 127.0.0.1 --dry-run=client dedicated-
   kubectl taint node 127.0.0.1 --dry-run=server dedicated-
-  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}' "dedicated=<no value>:PreferNoSchedule"
+  kube::test::get_object_assert "nodes 127.0.0.1" "{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}" "dedicated=<no value>:PreferNoSchedule"
   # taint can remove a taint
   kubectl taint node 127.0.0.1 dedicated-
   # Post-condition: node doesn't have dedicated=foo:PreferNoSchedule taint
-  kube::test::get_object_assert "nodes 127.0.0.1" '{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}' "" # expect no output
+  kube::test::get_object_assert "nodes 127.0.0.1" "{{range .spec.taints}}{{if eq .key \"dedicated\"}}{{.key}}={{.value}}:{{.effect}}{{end}}{{end}}" "" # expect no output
 
   ### kubectl cordon update with --dry-run does not mark node unschedulable
   # Pre-condition: node is schedulable
@@ -177,9 +177,9 @@ run_cluster_management_tests() {
    # command - need to use force because pods are unmanaged, dry run (or skip-wait) because node is unready
    output_message=$(kubectl --v=6 drain --force --pod-selector type=test-pod --selector test=label --chunk-size=1 --dry-run=client 2>&1 "${kube_flags[@]}")
    # Post-condition: Check if we get a limit on node, and both limit and continue on pods
-   kube::test::if_has_string "${output_message}" "/v1/nodes?labelSelector=test%3Dlabel&limit=1 200 OK"
-   kube::test::if_has_string "${output_message}" "/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&labelSelector=type%3Dtest-pod&limit=1 200 OK"
-   kube::test::if_has_string "${output_message}" "/v1/pods?continue=.*&fieldSelector=spec.nodeName%3D127.0.0.1&labelSelector=type%3Dtest-pod&limit=1 200 OK"
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/nodes?labelSelector=test%3Dlabel&limit=1" status="200 OK"'
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&labelSelector=type%3Dtest-pod&limit=1" status="200 OK"'
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/pods?continue=.*&fieldSelector=spec.nodeName%3D127.0.0.1&labelSelector=type%3Dtest-pod&limit=1" status="200 OK"'
    # Post-condition: Check we evict multiple pages worth of pods
    kube::test::if_has_string "${output_message}" "evicting pod .*/test-pod-1"
    kube::test::if_has_string "${output_message}" "evicting pod .*/test-pod-2"
@@ -190,8 +190,8 @@ run_cluster_management_tests() {
    ### Test kubectl drain chunk size defaults to 500
    output_message=$(kubectl --v=6 drain --force --selector test=label --dry-run=client 2>&1 "${kube_flags[@]}")
    # Post-condition: Check if we get a limit
-   kube::test::if_has_string "${output_message}" "/v1/nodes?labelSelector=test%3Dlabel&limit=500 200 OK"
-   kube::test::if_has_string "${output_message}" "/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&limit=500 200 OK"
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/nodes?labelSelector=test%3Dlabel&limit=500" status="200 OK"'
+   kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/pods?fieldSelector=spec.nodeName%3D127.0.0.1&limit=500" status="200 OK"'
 
   ### kubectl cordon command fails when no arguments are passed
   # Pre-condition: node exists

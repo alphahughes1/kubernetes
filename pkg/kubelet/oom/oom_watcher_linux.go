@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -19,6 +20,7 @@ limitations under the License.
 package oom
 
 import (
+	"context"
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
@@ -45,6 +47,12 @@ var _ Watcher = &realWatcher{}
 // NewWatcher creates and initializes a OOMWatcher backed by Cadvisor as
 // the oom streamer.
 func NewWatcher(recorder record.EventRecorder) (Watcher, error) {
+	// for test purpose
+	_, ok := recorder.(*record.FakeRecorder)
+	if ok {
+		return nil, nil
+	}
+
 	oomStreamer, err := oomparser.New()
 	if err != nil {
 		return nil, err
@@ -64,16 +72,17 @@ const (
 )
 
 // Start watches for system oom's and records an event for every system oom encountered.
-func (ow *realWatcher) Start(ref *v1.ObjectReference) error {
+func (ow *realWatcher) Start(ctx context.Context, ref *v1.ObjectReference) error {
 	outStream := make(chan *oomparser.OomInstance, 10)
 	go ow.oomStreamer.StreamOoms(outStream)
 
 	go func() {
+		logger := klog.FromContext(ctx)
 		defer runtime.HandleCrash()
 
 		for event := range outStream {
 			if event.VictimContainerName == recordEventContainerName {
-				klog.V(1).InfoS("Got sys oom event", "event", event)
+				logger.V(1).Info("Got sys oom event", "event", event)
 				eventMsg := "System OOM encountered"
 				if event.ProcessName != "" && event.Pid != 0 {
 					eventMsg = fmt.Sprintf("%s, victim process: %s, pid: %d", eventMsg, event.ProcessName, event.Pid)
@@ -81,7 +90,7 @@ func (ow *realWatcher) Start(ref *v1.ObjectReference) error {
 				ow.recorder.Eventf(ref, v1.EventTypeWarning, systemOOMEvent, eventMsg)
 			}
 		}
-		klog.ErrorS(nil, "Unexpectedly stopped receiving OOM notifications")
+		logger.Error(nil, "Unexpectedly stopped receiving OOM notifications")
 	}()
 	return nil
 }

@@ -18,11 +18,11 @@ package testing
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp" //nolint:depguard
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -47,7 +47,7 @@ func GetRoundtripTestCases(t *testing.T, scheme *runtime.Scheme, codecs serializ
 
 	for gk, versions := range versionsForKind {
 		testdir := filepath.Join("testdata", gk.Kind, "roundtrip")
-		dirs, err := ioutil.ReadDir(testdir)
+		dirs, err := os.ReadDir(testdir)
 		if err != nil {
 			t.Fatalf("failed to read testdir %s: %v", testdir, err)
 		}

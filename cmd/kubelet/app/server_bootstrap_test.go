@@ -24,7 +24,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -48,7 +48,7 @@ import (
 // manager that will use the bootstrap client until we get a valid cert, then use our
 // provided identity on subsequent requests.
 func Test_buildClientCertificateManager(t *testing.T) {
-	testDir, err := ioutil.TempDir("", "kubeletcert")
+	testDir, err := os.MkdirTemp("", "kubeletcert")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,12 +73,14 @@ func Test_buildClientCertificateManager(t *testing.T) {
 	defer s.Close()
 
 	config1 := &restclient.Config{
-		UserAgent: "FirstClient",
-		Host:      s.URL,
+		UserAgent:     "FirstClient",
+		Host:          s.URL,
+		ContentConfig: restclient.ContentConfig{ContentType: runtime.ContentTypeJSON},
 	}
 	config2 := &restclient.Config{
-		UserAgent: "SecondClient",
-		Host:      s.URL,
+		UserAgent:     "SecondClient",
+		Host:          s.URL,
+		ContentConfig: restclient.ContentConfig{ContentType: runtime.ContentTypeJSON},
 	}
 
 	nodeName := types.NodeName("test")
@@ -134,7 +136,7 @@ func Test_buildClientCertificateManager(t *testing.T) {
 }
 
 func Test_buildClientCertificateManager_populateCertDir(t *testing.T) {
-	testDir, err := ioutil.TempDir("", "kubeletcert")
+	testDir, err := os.MkdirTemp("", "kubeletcert")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +217,7 @@ func getCSR(req *http.Request) (*certapi.CertificateSigningRequest, error) {
 	if req.Body == nil {
 		return nil, nil
 	}
-	body, err := ioutil.ReadAll(req.Body)
+	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}

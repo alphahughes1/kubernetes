@@ -19,14 +19,16 @@ package topologymanager
 import (
 	"k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 )
 
 type fakeManager struct {
-	hint *TopologyHint
+	hint   *TopologyHint
+	policy Policy
 }
 
-//NewFakeManager returns an instance of FakeManager
+// NewFakeManager returns an instance of FakeManager
 func NewFakeManager() Manager {
 	klog.InfoS("NewFakeManager")
 	return &fakeManager{}
@@ -36,7 +38,16 @@ func NewFakeManager() Manager {
 func NewFakeManagerWithHint(hint *TopologyHint) Manager {
 	klog.InfoS("NewFakeManagerWithHint")
 	return &fakeManager{
-		hint: hint,
+		hint:   hint,
+		policy: NewNonePolicy(),
+	}
+}
+
+// NewFakeManagerWithPolicy returns an instance of fake topology manager with specified policy
+func NewFakeManagerWithPolicy(policy Policy) Manager {
+	klog.InfoS("NewFakeManagerWithPolicy", "policy", policy.Name())
+	return &fakeManager{
+		policy: policy,
 	}
 }
 
@@ -47,6 +58,10 @@ func (m *fakeManager) GetAffinity(podUID string, containerName string) TopologyH
 	}
 
 	return *m.hint
+}
+
+func (m *fakeManager) GetPolicy() Policy {
+	return m.policy
 }
 
 func (m *fakeManager) AddHintProvider(h HintProvider) {
@@ -64,7 +79,5 @@ func (m *fakeManager) RemoveContainer(containerID string) error {
 
 func (m *fakeManager) Admit(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
 	klog.InfoS("Topology Admit Handler")
-	return lifecycle.PodAdmitResult{
-		Admit: true,
-	}
+	return admission.GetPodAdmitResult(nil)
 }

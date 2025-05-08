@@ -1,7 +1,7 @@
 # cluster-bootstrap
 
 Set of constants and helpers in support of
-https://github.com/kubernetes/community/blob/master/contributors/design-proposals/cluster-lifecycle/bootstrap-discovery.md
+https://github.com/kubernetes/design-proposals-archive/blob/main/cluster-lifecycle/bootstrap-discovery.md
 
 
 ## Purpose
@@ -19,3 +19,4 @@ Code changes are made in that location, merged into `k8s.io/kubernetes` and late
 
  1. Add API types to this repo.  This is for the helpers, not for the types.
  2. Directly modify any files under `token` in this repo.  Those are driven from `k8s.io/kubernetes/staging/src/k8s.io/cluster-bootstrap`.
+

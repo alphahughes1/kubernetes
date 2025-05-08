@@ -23,9 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	api "k8s.io/api/core/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util"
 	volumetypes "k8s.io/kubernetes/pkg/volume/util/types"
@@ -34,18 +32,11 @@ import (
 var _ volume.NodeExpandableVolumePlugin = &csiPlugin{}
 
 func (c *csiPlugin) RequiresFSResize() bool {
-	// We could check plugin's node capability but we instead are going to rely on
-	// NodeExpand to do the right thing and return early if plugin does not have
-	// node expansion capability.
-	if !utilfeature.DefaultFeatureGate.Enabled(features.ExpandCSIVolumes) {
-		klog.V(4).Infof("Resizing is not enabled for CSI volume")
-		return false
-	}
 	return true
 }
 
 func (c *csiPlugin) NodeExpand(resizeOptions volume.NodeResizeOptions) (bool, error) {
-	klog.V(4).Infof(log("Expander.NodeExpand(%s)", resizeOptions.DeviceMountPath))
+	klog.V(4).Info(log("Expander.NodeExpand(%s)", resizeOptions.DeviceMountPath))
 	csiSource, err := getCSISourceFromSpec(resizeOptions.VolumeSpec)
 	if err != nil {
 		return false, errors.New(log("Expander.NodeExpand failed to get CSI persistent source: %v", err))
@@ -53,7 +44,9 @@ func (c *csiPlugin) NodeExpand(resizeOptions volume.NodeResizeOptions) (bool, er
 
 	csClient, err := newCsiDriverClient(csiDriverName(csiSource.Driver))
 	if err != nil {
-		return false, err
+		// Treat the absence of the CSI driver as a transient error
+		// See https://github.com/kubernetes/kubernetes/issues/120268
+		return false, volumetypes.NewTransientOperationFailure(err.Error())
 	}
 	fsVolume, err := util.CheckVolumeModeFilesystem(resizeOptions.VolumeSpec)
 	if err != nil {
@@ -79,26 +72,22 @@ func (c *csiPlugin) nodeExpandWithClient(
 	}
 
 	if !nodeExpandSet {
-		return false, fmt.Errorf("Expander.NodeExpand found CSI plugin %s/%s to not support node expansion", c.GetPluginName(), driverName)
-	}
-
-	// Check whether "STAGE_UNSTAGE_VOLUME" is set
-	stageUnstageSet, err := csClient.NodeSupportsStageUnstage(ctx)
-	if err != nil {
-		return false, fmt.Errorf("Expander.NodeExpand failed to check if plugins supports stage_unstage %v", err)
-	}
-
-	// if plugin does not support STAGE_UNSTAGE but CSI volume path is staged
-	// it must mean this was placeholder staging performed by k8s and not CSI staging
-	// in which case we should return from here so as volume can be node published
-	// before we can resize
-	if !stageUnstageSet && resizeOptions.CSIVolumePhase == volume.CSIVolumeStaged {
-		return false, nil
+		return false, volumetypes.NewOperationNotSupportedError(fmt.Sprintf("NodeExpand is not supported by the CSI driver %s", driverName))
 	}
 
 	pv := resizeOptions.VolumeSpec.PersistentVolume
 	if pv == nil {
 		return false, fmt.Errorf("Expander.NodeExpand failed to find associated PersistentVolume for plugin %s", c.GetPluginName())
+	}
+	nodeExpandSecrets := map[string]string{}
+	expandClient := c.host.GetKubeClient()
+
+	if csiSource.NodeExpandSecretRef != nil {
+		nodeExpandSecrets, err = getCredentialsFromSecret(expandClient, csiSource.NodeExpandSecretRef)
+		if err != nil {
+			return false, fmt.Errorf("expander.NodeExpand failed to get NodeExpandSecretRef %s/%s: %v",
+				csiSource.NodeExpandSecretRef.Namespace, csiSource.NodeExpandSecretRef.Name, err)
+		}
 	}
 
 	opts := csiResizeOptions{
@@ -109,6 +98,7 @@ func (c *csiPlugin) nodeExpandWithClient(
 		fsType:            csiSource.FSType,
 		accessMode:        api.ReadWriteOnce,
 		mountOptions:      pv.Spec.MountOptions,
+		secrets:           nodeExpandSecrets,
 	}
 
 	if !fsVolume {
@@ -129,6 +119,11 @@ func (c *csiPlugin) nodeExpandWithClient(
 			failedConditionErr := fmt.Errorf("Expander.NodeExpand failed to expand the volume : %w", volumetypes.NewFailedPreconditionError(err.Error()))
 			return false, failedConditionErr
 		}
+
+		if isInfeasibleError(err) {
+			infeasibleError := volumetypes.NewInfeasibleError(fmt.Sprintf("Expander.NodeExpand failed to expand the volume %s", err.Error()))
+			return false, infeasibleError
+		}
 		return false, fmt.Errorf("Expander.NodeExpand failed to expand the volume : %w", err)
 	}
 	return true, nil
@@ -144,4 +139,26 @@ func inUseError(err error) bool {
 	// of in-use volumes
 	// More info - https://github.com/container-storage-interface/spec/blob/master/spec.md#controllerexpandvolume-errors
 	return st.Code() == codes.FailedPrecondition
+}
+
+// IsInfeasibleError returns true for grpc errors that are considered terminal in a way
+// that they indicate CSI operation as infeasible.
+// This function returns a subset of final errors. All infeasible errors are also final errors.
+func isInfeasibleError(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		// This is not gRPC error. The operation must have failed before gRPC
+		// method was called, otherwise we would get gRPC error.
+		// We don't know if any previous volume operation is in progress, be on the safe side.
+		return false
+	}
+	switch st.Code() {
+	case codes.InvalidArgument,
+		codes.OutOfRange,
+		codes.NotFound:
+		return true
+	}
+	// All other errors mean that operation either did not
+	// even start or failed. It is for sure are not infeasible errors
+	return false
 }

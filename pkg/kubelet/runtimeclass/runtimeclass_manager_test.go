@@ -24,7 +24,7 @@ import (
 
 	"k8s.io/kubernetes/pkg/kubelet/runtimeclass"
 	rctest "k8s.io/kubernetes/pkg/kubelet/runtimeclass/testing"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestLookupRuntimeHandler(t *testing.T) {
@@ -33,10 +33,10 @@ func TestLookupRuntimeHandler(t *testing.T) {
 		expected    string
 		expectError bool
 	}{
-		{rcn: pointer.StringPtr(""), expected: ""},
-		{rcn: pointer.StringPtr(rctest.EmptyRuntimeClass), expected: ""},
-		{rcn: pointer.StringPtr(rctest.SandboxRuntimeClass), expected: "kata-containers"},
-		{rcn: pointer.StringPtr("phantom"), expectError: true},
+		{rcn: ptr.To(""), expected: ""},
+		{rcn: ptr.To(rctest.EmptyRuntimeClass), expected: ""},
+		{rcn: ptr.To(rctest.SandboxRuntimeClass), expected: "kata-containers"},
+		{rcn: ptr.To("phantom"), expectError: true},
 	}
 
 	manager := runtimeclass.NewManager(rctest.NewPopulatedClient())

@@ -18,15 +18,15 @@ package latest
 
 import (
 	"k8s.io/component-base/config/v1alpha1"
-	"k8s.io/kube-scheduler/config/v1beta2"
+	v1 "k8s.io/kube-scheduler/config/v1"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/scheme"
 )
 
-// Default creates a default configuration of the latset versioned type.
+// Default creates a default configuration of the latest versioned type.
 // This function needs to be updated whenever we bump the scheduler's component config version.
 func Default() (*config.KubeSchedulerConfiguration, error) {
-	versionedCfg := v1beta2.KubeSchedulerConfiguration{}
+	versionedCfg := v1.KubeSchedulerConfiguration{}
 	versionedCfg.DebuggingConfiguration = *v1alpha1.NewRecommendedDebuggingConfiguration()
 
 	scheme.Scheme.Default(&versionedCfg)
@@ -38,6 +38,6 @@ func Default() (*config.KubeSchedulerConfiguration, error) {
 	// because the field will be cleared later by API machinery during
 	// conversion. See KubeSchedulerConfiguration internal type definition for
 	// more details.
-	cfg.TypeMeta.APIVersion = v1beta2.SchemeGroupVersion.String()
+	cfg.TypeMeta.APIVersion = v1.SchemeGroupVersion.String()
 	return &cfg, nil
 }

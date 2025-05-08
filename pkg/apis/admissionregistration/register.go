@@ -51,6 +51,14 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&ValidatingWebhookConfigurationList{},
 		&MutatingWebhookConfiguration{},
 		&MutatingWebhookConfigurationList{},
+		&ValidatingAdmissionPolicy{},
+		&ValidatingAdmissionPolicyList{},
+		&ValidatingAdmissionPolicyBinding{},
+		&ValidatingAdmissionPolicyBindingList{},
+		&MutatingAdmissionPolicy{},
+		&MutatingAdmissionPolicyList{},
+		&MutatingAdmissionPolicyBinding{},
+		&MutatingAdmissionPolicyBindingList{},
 	)
 	return nil
 }

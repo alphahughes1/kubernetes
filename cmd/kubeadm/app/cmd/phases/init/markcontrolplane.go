@@ -18,6 +18,7 @@ package phases
 
 import (
 	"github.com/pkg/errors"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
@@ -43,6 +44,7 @@ func NewMarkControlPlanePhase() workflow.Phase {
 		InheritFlags: []string{
 			options.NodeName,
 			options.CfgPath,
+			options.DryRun,
 		},
 		Run: runMarkControlPlane,
 	}

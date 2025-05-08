@@ -19,7 +19,7 @@ package run
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"reflect"
@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
 	"k8s.io/kubectl/pkg/cmd/delete"
@@ -180,14 +181,14 @@ func TestRunArgsFollowDashRules(t *testing.T) {
 					}
 					return &http.Response{
 						StatusCode: http.StatusOK,
-						Body:       ioutil.NopCloser(bytes.NewBuffer([]byte("{}"))),
+						Body:       io.NopCloser(bytes.NewBuffer([]byte("{}"))),
 					}, nil
 				}),
 			}
 
 			tf.ClientConfigVal = &restclient.Config{}
 
-			cmd := NewCmdRun(tf, genericclioptions.NewTestIOStreamsDiscard())
+			cmd := NewCmdRun(tf, genericiooptions.NewTestIOStreamsDiscard())
 			cmd.Flags().Set("image", "nginx")
 
 			printFlags := genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme)
@@ -198,7 +199,7 @@ func TestRunArgsFollowDashRules(t *testing.T) {
 			}
 
 			deleteFlags := delete.NewDeleteFlags("to use to replace the resource.")
-			deleteOptions, err := deleteFlags.ToOptions(nil, genericclioptions.NewTestIOStreamsDiscard())
+			deleteOptions, err := deleteFlags.ToOptions(nil, genericiooptions.NewTestIOStreamsDiscard())
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 				return
@@ -207,7 +208,7 @@ func TestRunArgsFollowDashRules(t *testing.T) {
 				PrintFlags:    printFlags,
 				DeleteOptions: deleteOptions,
 
-				IOStreams: genericclioptions.NewTestIOStreamsDiscard(),
+				IOStreams: genericiooptions.NewTestIOStreamsDiscard(),
 
 				Image: "nginx",
 
@@ -261,7 +262,7 @@ func TestGenerateService(t *testing.T) {
 						{
 							Port:       80,
 							Protocol:   "TCP",
-							TargetPort: intstr.FromInt(80),
+							TargetPort: intstr.FromInt32(80),
 						},
 					},
 					Selector: map[string]string{
@@ -294,7 +295,7 @@ func TestGenerateService(t *testing.T) {
 						{
 							Port:       80,
 							Protocol:   "TCP",
-							TargetPort: intstr.FromInt(80),
+							TargetPort: intstr.FromInt32(80),
 						},
 					},
 					Selector: map[string]string{
@@ -338,7 +339,7 @@ func TestGenerateService(t *testing.T) {
 					case test.expectPOST && m == "POST" && p == "/namespaces/test/services":
 						sawPOST = true
 						body := cmdtesting.ObjBody(codec, &test.service)
-						data, err := ioutil.ReadAll(req.Body)
+						data, err := io.ReadAll(req.Body)
 						if err != nil {
 							t.Fatalf("unexpected error: %v", err)
 						}
@@ -368,9 +369,9 @@ func TestGenerateService(t *testing.T) {
 				return
 			}
 
-			ioStreams, _, buff, _ := genericclioptions.NewTestIOStreams()
+			ioStreams, _, buff, _ := genericiooptions.NewTestIOStreams()
 			deleteFlags := delete.NewDeleteFlags("to use to replace the resource.")
-			deleteOptions, err := deleteFlags.ToOptions(nil, genericclioptions.NewTestIOStreamsDiscard())
+			deleteOptions, err := deleteFlags.ToOptions(nil, genericiooptions.NewTestIOStreamsDiscard())
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 				return
@@ -495,6 +496,16 @@ func TestRunValidations(t *testing.T) {
 			},
 			expectedErr: "stdin is required for containers with -t/--tty",
 		},
+		{
+			name: "test invalid override type error",
+			args: []string{"test"},
+			flags: map[string]string{
+				"image":         "busybox",
+				"overrides":     "{}",
+				"override-type": "foo",
+			},
+			expectedErr: "invalid override type: foo",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -509,7 +520,7 @@ func TestRunValidations(t *testing.T) {
 			}
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
 
-			streams, _, _, bufErr := genericclioptions.NewTestIOStreams()
+			streams, _, _, bufErr := genericiooptions.NewTestIOStreams()
 			cmdutil.BehaviorOnFatal(func(str string, code int) {
 				bufErr.Write([]byte(str))
 			})
@@ -569,7 +580,7 @@ func TestExpose(t *testing.T) {
 						body := cmdtesting.ObjBody(codec, pod)
 						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: body}, nil
 					case m == "POST" && p == "/namespaces/test/services":
-						data, err := ioutil.ReadAll(req.Body)
+						data, err := io.ReadAll(req.Body)
 						if err != nil {
 							t.Fatalf("unexpected error: %v", err)
 						}
@@ -601,7 +612,7 @@ func TestExpose(t *testing.T) {
 				}),
 			}
 
-			streams, _, _, bufErr := genericclioptions.NewTestIOStreams()
+			streams, _, _, bufErr := genericiooptions.NewTestIOStreams()
 			cmdutil.BehaviorOnFatal(func(str string, code int) {
 				bufErr.Write([]byte(str))
 			})
@@ -627,5 +638,130 @@ func TestExpose(t *testing.T) {
 			}
 		})
 
+	}
+}
+
+func TestRunOverride(t *testing.T) {
+	tests := []struct {
+		name           string
+		overrides      string
+		overrideType   string
+		expectedOutput string
+	}{
+		{
+			name:         "run with merge override type should replace spec",
+			overrides:    `{"spec":{"containers":[{"name":"test","resources":{"limits":{"cpu":"200m"}}}]}}`,
+			overrideType: "merge",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: test
+  name: test
+  namespace: ns
+spec:
+  containers:
+  - name: test
+    resources:
+      limits:
+        cpu: 200m
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+`,
+		},
+		{
+			name:         "run with no override type specified, should perform an RFC7396 JSON Merge Patch",
+			overrides:    `{"spec":{"containers":[{"name":"test","resources":{"limits":{"cpu":"200m"}}}]}}`,
+			overrideType: "",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: test
+  name: test
+  namespace: ns
+spec:
+  containers:
+  - name: test
+    resources:
+      limits:
+        cpu: 200m
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+`,
+		},
+		{
+			name:         "run with strategic override type should merge spec, preserving container image",
+			overrides:    `{"spec":{"containers":[{"name":"test","resources":{"limits":{"cpu":"200m"}}}]}}`,
+			overrideType: "strategic",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: test
+  name: test
+  namespace: ns
+spec:
+  containers:
+  - image: busybox
+    name: test
+    resources:
+      limits:
+        cpu: 200m
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+`,
+		},
+		{
+			name: "run with json override type should perform add, replace, and remove operations",
+			overrides: `[
+				{"op": "add", "path": "/metadata/labels/foo", "value": "bar"},
+				{"op": "replace", "path": "/spec/containers/0/resources", "value": {"limits": {"cpu": "200m"}}},
+				{"op": "remove", "path": "/spec/dnsPolicy"}
+			]`,
+			overrideType: "json",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    foo: bar
+    run: test
+  name: test
+  namespace: ns
+spec:
+  containers:
+  - image: busybox
+    name: test
+    resources:
+      limits:
+        cpu: 200m
+  restartPolicy: Always
+status: {}
+`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tf := cmdtesting.NewTestFactory().WithNamespace("ns")
+			defer tf.Cleanup()
+
+			streams, _, bufOut, _ := genericiooptions.NewTestIOStreams()
+
+			cmd := NewCmdRun(tf, streams)
+			cmd.Flags().Set("dry-run", "client")
+			cmd.Flags().Set("output", "yaml")
+			cmd.Flags().Set("image", "busybox")
+			cmd.Flags().Set("overrides", test.overrides)
+			cmd.Flags().Set("override-type", test.overrideType)
+			cmd.Run(cmd, []string{"test"})
+
+			actualOutput := bufOut.String()
+			if actualOutput != test.expectedOutput {
+				t.Errorf("unexpected output.\n\nExpected:\n%v\nActual:\n%v", test.expectedOutput, actualOutput)
+			}
+		})
 	}
 }

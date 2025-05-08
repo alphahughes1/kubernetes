@@ -42,7 +42,7 @@ There are three ways to specify an image used by each testing suite: `image`,
 
   * `image_family` should be used if you always want to use latest image in the
     same family. Tests will start to use new images once COS releases
-    new image. This is not predictable and test can potentially be broken becase of this. The probability of a
+    new image. This is not predictable and test can potentially be broken because of this. The probability of a
     breakage due to the OS itself is low for LTS or stable image, but high for dev or beta image.
     If things went wrong, it will be hard to rollback
     images using `image_regex` and `image_family`. e.g:
@@ -79,7 +79,7 @@ following guidelines are proposed for image choice in E2E testing.
     'image' should be used to specify the image.
 
   * To integrate continuously with other container
-    related technologies like runc, containerd, docker and kubernertes, the
+    related technologies like runc, containerd, docker and kubernetes, the
     latest LTS or stable images are preferred. 'image_family' should be used to
     specify the image.
 

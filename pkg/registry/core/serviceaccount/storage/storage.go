@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
@@ -38,11 +39,12 @@ type REST struct {
 }
 
 // NewREST returns a RESTStorage object that will work against service accounts.
-func NewREST(optsGetter generic.RESTOptionsGetter, issuer token.TokenGenerator, auds authenticator.Audiences, max time.Duration, podStorage, secretStorage *genericregistry.Store, extendExpiration bool) (*REST, error) {
+func NewREST(optsGetter generic.RESTOptionsGetter, issuer token.TokenGenerator, auds authenticator.Audiences, max time.Duration, podStorage, secretStorage, nodeStorage rest.Getter, extendExpiration bool, maxExtendedExpiration time.Duration) (*REST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &api.ServiceAccount{} },
-		NewListFunc:              func() runtime.Object { return &api.ServiceAccountList{} },
-		DefaultQualifiedResource: api.Resource("serviceaccounts"),
+		NewFunc:                   func() runtime.Object { return &api.ServiceAccount{} },
+		NewListFunc:               func() runtime.Object { return &api.ServiceAccountList{} },
+		DefaultQualifiedResource:  api.Resource("serviceaccounts"),
+		SingularQualifiedResource: api.Resource("serviceaccount"),
 
 		CreateStrategy:      serviceaccount.Strategy,
 		UpdateStrategy:      serviceaccount.Strategy,
@@ -59,13 +61,16 @@ func NewREST(optsGetter generic.RESTOptionsGetter, issuer token.TokenGenerator, 
 	var trest *TokenREST
 	if issuer != nil && podStorage != nil && secretStorage != nil {
 		trest = &TokenREST{
-			svcaccts:             store,
-			pods:                 podStorage,
-			secrets:              secretStorage,
-			issuer:               issuer,
-			auds:                 auds,
-			maxExpirationSeconds: int64(max.Seconds()),
-			extendExpiration:     extendExpiration,
+			svcaccts:                     store,
+			pods:                         podStorage,
+			secrets:                      secretStorage,
+			nodes:                        nodeStorage,
+			issuer:                       issuer,
+			auds:                         auds,
+			audsSet:                      sets.NewString(auds...),
+			maxExpirationSeconds:         int64(max.Seconds()),
+			maxExtendedExpirationSeconds: int64(maxExtendedExpiration.Seconds()),
+			extendExpiration:             extendExpiration,
 		}
 	}
 

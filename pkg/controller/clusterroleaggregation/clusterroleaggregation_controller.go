@@ -22,7 +22,6 @@ import (
 	"sort"
 	"time"
 
-	"k8s.io/apiserver/pkg/features"
 	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
 	"k8s.io/klog/v2"
 
@@ -33,7 +32,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	rbacinformers "k8s.io/client-go/informers/rbac/v1"
 	rbacclient "k8s.io/client-go/kubernetes/typed/rbac/v1"
 	rbaclisters "k8s.io/client-go/listers/rbac/v1"
@@ -49,8 +47,8 @@ type ClusterRoleAggregationController struct {
 	clusterRoleLister  rbaclisters.ClusterRoleLister
 	clusterRolesSynced cache.InformerSynced
 
-	syncHandler func(key string) error
-	queue       workqueue.RateLimitingInterface
+	syncHandler func(ctx context.Context, key string) error
+	queue       workqueue.TypedRateLimitingInterface[string]
 }
 
 // NewClusterRoleAggregation creates a new controller
@@ -60,7 +58,12 @@ func NewClusterRoleAggregation(clusterRoleInformer rbacinformers.ClusterRoleInfo
 		clusterRoleLister:  clusterRoleInformer.Lister(),
 		clusterRolesSynced: clusterRoleInformer.Informer().HasSynced,
 
-		queue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ClusterRoleAggregator"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Name: "ClusterRoleAggregator",
+			},
+		),
 	}
 	c.syncHandler = c.syncClusterRole
 
@@ -78,7 +81,7 @@ func NewClusterRoleAggregation(clusterRoleInformer rbacinformers.ClusterRoleInfo
 	return c
 }
 
-func (c *ClusterRoleAggregationController) syncClusterRole(key string) error {
+func (c *ClusterRoleAggregationController) syncClusterRole(ctx context.Context, key string) error {
 	_, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
@@ -125,37 +128,33 @@ func (c *ClusterRoleAggregationController) syncClusterRole(key string) error {
 		return nil
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.ServerSideApply) {
-		err = c.applyClusterRoles(sharedClusterRole.Name, newPolicyRules)
-		if errors.IsUnsupportedMediaType(err) { // TODO: Remove this fallback at least one release after ServerSideApply GA
-			// When Server Side Apply is not enabled, fallback to Update. This is required when running
-			// 1.21 since api-server can be 1.20 during the upgrade/downgrade.
-			// Since Server Side Apply is enabled by default in Beta, this fallback only kicks in
-			// if the feature has been disabled using its feature flag.
-			err = c.updateClusterRoles(sharedClusterRole, newPolicyRules)
-		}
-	} else {
-		err = c.updateClusterRoles(sharedClusterRole, newPolicyRules)
+	err = c.applyClusterRoles(ctx, sharedClusterRole.Name, newPolicyRules)
+	if errors.IsUnsupportedMediaType(err) { // TODO: Remove this fallback at least one release after ServerSideApply GA
+		// When Server Side Apply is not enabled, fallback to Update. This is required when running
+		// 1.21 since api-server can be 1.20 during the upgrade/downgrade.
+		// Since Server Side Apply is enabled by default in Beta, this fallback only kicks in
+		// if the feature has been disabled using its feature flag.
+		err = c.updateClusterRoles(ctx, sharedClusterRole, newPolicyRules)
 	}
 	return err
 }
 
-func (c *ClusterRoleAggregationController) applyClusterRoles(name string, newPolicyRules []rbacv1.PolicyRule) error {
+func (c *ClusterRoleAggregationController) applyClusterRoles(ctx context.Context, name string, newPolicyRules []rbacv1.PolicyRule) error {
 	clusterRoleApply := rbacv1ac.ClusterRole(name).
 		WithRules(toApplyPolicyRules(newPolicyRules)...)
 
 	opts := metav1.ApplyOptions{FieldManager: "clusterrole-aggregation-controller", Force: true}
-	_, err := c.clusterRoleClient.ClusterRoles().Apply(context.TODO(), clusterRoleApply, opts)
+	_, err := c.clusterRoleClient.ClusterRoles().Apply(ctx, clusterRoleApply, opts)
 	return err
 }
 
-func (c *ClusterRoleAggregationController) updateClusterRoles(sharedClusterRole *rbacv1.ClusterRole, newPolicyRules []rbacv1.PolicyRule) error {
+func (c *ClusterRoleAggregationController) updateClusterRoles(ctx context.Context, sharedClusterRole *rbacv1.ClusterRole, newPolicyRules []rbacv1.PolicyRule) error {
 	clusterRole := sharedClusterRole.DeepCopy()
 	clusterRole.Rules = nil
 	for _, rule := range newPolicyRules {
 		clusterRole.Rules = append(clusterRole.Rules, *rule.DeepCopy())
 	}
-	_, err := c.clusterRoleClient.ClusterRoles().Update(context.TODO(), clusterRole, metav1.UpdateOptions{})
+	_, err := c.clusterRoleClient.ClusterRoles().Update(ctx, clusterRole, metav1.UpdateOptions{})
 	return err
 }
 
@@ -187,37 +186,38 @@ func ruleExists(haystack []rbacv1.PolicyRule, needle rbacv1.PolicyRule) bool {
 }
 
 // Run starts the controller and blocks until stopCh is closed.
-func (c *ClusterRoleAggregationController) Run(workers int, stopCh <-chan struct{}) {
+func (c *ClusterRoleAggregationController) Run(ctx context.Context, workers int) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	klog.Infof("Starting ClusterRoleAggregator")
-	defer klog.Infof("Shutting down ClusterRoleAggregator")
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting ClusterRoleAggregator controller")
+	defer logger.Info("Shutting down ClusterRoleAggregator controller")
 
-	if !cache.WaitForNamedCacheSync("ClusterRoleAggregator", stopCh, c.clusterRolesSynced) {
+	if !cache.WaitForNamedCacheSync("ClusterRoleAggregator", ctx.Done(), c.clusterRolesSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
-	<-stopCh
+	<-ctx.Done()
 }
 
-func (c *ClusterRoleAggregationController) runWorker() {
-	for c.processNextWorkItem() {
+func (c *ClusterRoleAggregationController) runWorker(ctx context.Context) {
+	for c.processNextWorkItem(ctx) {
 	}
 }
 
-func (c *ClusterRoleAggregationController) processNextWorkItem() bool {
+func (c *ClusterRoleAggregationController) processNextWorkItem(ctx context.Context) bool {
 	dsKey, quit := c.queue.Get()
 	if quit {
 		return false
 	}
 	defer c.queue.Done(dsKey)
 
-	err := c.syncHandler(dsKey.(string))
+	err := c.syncHandler(ctx, dsKey)
 	if err == nil {
 		c.queue.Forget(dsKey)
 		return true

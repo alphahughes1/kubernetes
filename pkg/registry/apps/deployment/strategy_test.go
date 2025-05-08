@@ -20,20 +20,23 @@ import (
 	"reflect"
 	"testing"
 
+	"k8s.io/utils/ptr"
+
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/apiserver/pkg/registry/rest"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	podtest "k8s.io/kubernetes/pkg/api/pod/testing"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 const (
-	fakeImageName  = "fake-name"
-	fakeImage      = "fakeimage"
 	deploymentName = "test-deployment"
 	namespace      = "test-namespace"
 )
@@ -61,6 +64,70 @@ func TestStatusUpdates(t *testing.T) {
 		if !reflect.DeepEqual(test.expected, test.obj) {
 			t.Errorf("Unexpected object mismatch! Expected:\n%#v\ngot:\n%#v", test.expected, test.obj)
 		}
+	}
+}
+
+func TestStatusUpdatesWithDeploymentReplicaSetTerminatingReplicas(t *testing.T) {
+	tests := []struct {
+		name                                          string
+		enableDeploymentReplicaSetTerminatingReplicas bool
+		terminatingReplicas                           *int32
+		terminatingReplicasUpdate                     *int32
+		expectedTerminatingReplicas                   *int32
+	}{
+		{
+			name: "should not allow updates when feature gate is disabled",
+			enableDeploymentReplicaSetTerminatingReplicas: false,
+			terminatingReplicas:                           nil,
+			terminatingReplicasUpdate:                     ptr.To[int32](2),
+			expectedTerminatingReplicas:                   nil,
+		},
+		{
+			name: "should allow update when the field is in use when feature gate is disabled",
+			enableDeploymentReplicaSetTerminatingReplicas: false,
+			terminatingReplicas:                           ptr.To[int32](2),
+			terminatingReplicasUpdate:                     ptr.To[int32](5),
+			expectedTerminatingReplicas:                   ptr.To[int32](5),
+		},
+		{
+			name: "should allow updates when feature gate is enabled",
+			enableDeploymentReplicaSetTerminatingReplicas: true,
+			terminatingReplicas:                           nil,
+			terminatingReplicasUpdate:                     ptr.To[int32](2),
+			expectedTerminatingReplicas:                   ptr.To[int32](2),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.DeploymentReplicaSetTerminatingReplicas, tc.enableDeploymentReplicaSetTerminatingReplicas)
+
+			ctx := genericapirequest.NewDefaultContext()
+			validSelector := map[string]string{"a": "b"}
+			oldDeploy := newDeploymentWithSelectorLabels(validSelector)
+			oldDeploy.Spec.Replicas = 3
+			oldDeploy.Status.Replicas = 3
+			oldDeploy.Status.TerminatingReplicas = tc.terminatingReplicas
+
+			newDeploy := newDeploymentWithSelectorLabels(validSelector)
+			newDeploy.Spec.Replicas = 3
+			newDeploy.Status.Replicas = 2
+			newDeploy.Status.TerminatingReplicas = tc.terminatingReplicasUpdate
+
+			StatusStrategy.PrepareForUpdate(ctx, newDeploy, oldDeploy)
+			if newDeploy.Status.Replicas != 2 {
+				t.Errorf("ReplicaSet status updates should allow change of replicas: %v", newDeploy.Status.Replicas)
+			}
+			if !ptr.Equal(newDeploy.Status.TerminatingReplicas, tc.expectedTerminatingReplicas) {
+				t.Errorf("ReplicaSet status updates failed, expected terminating pods: %v, got: %v", ptr.Deref(tc.expectedTerminatingReplicas, -1), ptr.Deref(newDeploy.Status.TerminatingReplicas, -1))
+			}
+
+			errs := StatusStrategy.ValidateUpdate(ctx, newDeploy, oldDeploy)
+
+			if len(errs) != 0 {
+				t.Errorf("Unexpected error %v", errs)
+			}
+		})
 	}
 }
 
@@ -100,6 +167,26 @@ func TestSelectorImmutability(t *testing.T) {
 		{
 			genericapirequest.RequestInfo{
 				APIGroup:   "apps",
+				APIVersion: "v1",
+				Resource:   "deployments",
+			},
+			map[string]string{"a": "b"},
+			map[string]string{"c": "v1"},
+			field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: field.NewPath("spec").Child("selector").String(),
+					BadValue: &metav1.LabelSelector{
+						MatchLabels:      map[string]string{"c": "v1"},
+						MatchExpressions: []metav1.LabelSelectorRequirement{},
+					},
+					Detail: "field is immutable",
+				},
+			},
+		},
+		{
+			genericapirequest.RequestInfo{
+				APIGroup:   "apps",
 				APIVersion: "v1beta2",
 				Resource:   "deployments",
 			},
@@ -116,25 +203,6 @@ func TestSelectorImmutability(t *testing.T) {
 					Detail: "field is immutable",
 				},
 			},
-		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "apps",
-				APIVersion: "v1beta1",
-				Resource:   "deployments",
-			},
-			map[string]string{"a": "b"},
-			map[string]string{"c": "d"},
-			field.ErrorList{},
-		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "extensions",
-				APIVersion: "v1beta1",
-			},
-			map[string]string{"a": "b"},
-			map[string]string{"c": "d"},
-			field.ErrorList{},
 		},
 	}
 
@@ -168,88 +236,21 @@ func newDeploymentWithSelectorLabels(selectorLabels map[string]string) *apps.Dep
 			Strategy: apps.DeploymentStrategy{
 				Type: apps.RollingUpdateDeploymentStrategyType,
 				RollingUpdate: &apps.RollingUpdateDeployment{
-					MaxSurge:       intstr.FromInt(1),
-					MaxUnavailable: intstr.FromInt(1),
+					MaxSurge:       intstr.FromInt32(1),
+					MaxUnavailable: intstr.FromInt32(1),
 				},
 			},
 			Template: api.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: selectorLabels,
 				},
-				Spec: api.PodSpec{
-					RestartPolicy: api.RestartPolicyAlways,
-					DNSPolicy:     api.DNSDefault,
-					Containers:    []api.Container{{Name: fakeImageName, Image: fakeImage, ImagePullPolicy: api.PullNever, TerminationMessagePolicy: api.TerminationMessageReadFile}},
-				},
+				Spec: podtest.MakePodSpec(),
 			},
 		},
 	}
 }
 
-func TestDeploymentDefaultGarbageCollectionPolicy(t *testing.T) {
-	// Make sure we correctly implement the interface.
-	// Otherwise a typo could silently change the default.
-	var gcds rest.GarbageCollectionDeleteStrategy = Strategy
-	tests := []struct {
-		requestInfo      genericapirequest.RequestInfo
-		expectedGCPolicy rest.GarbageCollectionPolicy
-		isNilRequestInfo bool
-	}{
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "extensions",
-				APIVersion: "v1beta1",
-				Resource:   "deployments",
-			},
-			rest.OrphanDependents,
-			false,
-		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "apps",
-				APIVersion: "v1beta1",
-				Resource:   "deployments",
-			},
-			rest.OrphanDependents,
-			false,
-		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "apps",
-				APIVersion: "v1beta2",
-				Resource:   "deployments",
-			},
-			rest.OrphanDependents,
-			false,
-		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "apps",
-				APIVersion: "v1",
-				Resource:   "deployments",
-			},
-			rest.DeleteDependents,
-			false,
-		},
-		{
-			expectedGCPolicy: rest.DeleteDependents,
-			isNilRequestInfo: true,
-		},
-	}
-
-	for _, test := range tests {
-		context := genericapirequest.NewContext()
-		if !test.isNilRequestInfo {
-			context = genericapirequest.WithRequestInfo(context, &test.requestInfo)
-		}
-		if got, want := gcds.DefaultGarbageCollectionPolicy(context), test.expectedGCPolicy; got != want {
-			t.Errorf("%s/%s: DefaultGarbageCollectionPolicy() = %#v, want %#v", test.requestInfo.APIGroup,
-				test.requestInfo.APIVersion, got, want)
-		}
-	}
-}
-
-func newDeploymentWithHugePageValue(reousreceName api.ResourceName, value resource.Quantity) *apps.Deployment {
+func newDeploymentWithHugePageValue(resourceName api.ResourceName, value resource.Quantity) *apps.Deployment {
 	return &apps.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            deploymentName,
@@ -264,8 +265,8 @@ func newDeploymentWithHugePageValue(reousreceName api.ResourceName, value resour
 			Strategy: apps.DeploymentStrategy{
 				Type: apps.RollingUpdateDeploymentStrategyType,
 				RollingUpdate: &apps.RollingUpdateDeployment{
-					MaxSurge:       intstr.FromInt(1),
-					MaxUnavailable: intstr.FromInt(1),
+					MaxSurge:       intstr.FromInt32(1),
+					MaxUnavailable: intstr.FromInt32(1),
 				},
 			},
 			Template: api.PodTemplateSpec{
@@ -274,25 +275,19 @@ func newDeploymentWithHugePageValue(reousreceName api.ResourceName, value resour
 					Name:      "foo",
 					Labels:    map[string]string{"foo": "bar"},
 				},
-				Spec: api.PodSpec{
-					RestartPolicy: api.RestartPolicyAlways,
-					DNSPolicy:     api.DNSDefault,
-					Containers: []api.Container{{
-						Name:                     fakeImageName,
-						Image:                    fakeImage,
-						ImagePullPolicy:          api.PullNever,
-						TerminationMessagePolicy: api.TerminationMessageReadFile,
-						Resources: api.ResourceRequirements{
+				Spec: podtest.MakePodSpec(
+					podtest.SetContainers(podtest.MakeContainer("ctr", podtest.SetContainerResources(
+						api.ResourceRequirements{
 							Requests: api.ResourceList{
 								api.ResourceName(api.ResourceCPU): resource.MustParse("10"),
-								api.ResourceName(reousreceName):   value,
+								api.ResourceName(resourceName):    value,
 							},
 							Limits: api.ResourceList{
 								api.ResourceName(api.ResourceCPU): resource.MustParse("10"),
-								api.ResourceName(reousreceName):   value,
+								api.ResourceName(resourceName):    value,
 							},
-						}},
-					}},
+						}))),
+				),
 			},
 		},
 	}

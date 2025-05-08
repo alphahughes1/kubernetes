@@ -286,7 +286,7 @@ func testDefaulting(t *testing.T, watchCache bool) {
 	}
 
 	t.Logf("Creating CR and expecting defaulted fields in spec, but status does not exist at all")
-	fooClient := dynamicClient.Resource(schema.GroupVersionResource{crd.Spec.Group, crd.Spec.Versions[0].Name, crd.Spec.Names.Plural})
+	fooClient := dynamicClient.Resource(schema.GroupVersionResource{Group: crd.Spec.Group, Version: crd.Spec.Versions[0].Name, Resource: crd.Spec.Names.Plural})
 	foo := &unstructured.Unstructured{}
 	if err := yaml.Unmarshal([]byte(defaultingFooInstance), &foo.Object); err != nil {
 		t.Fatal(err)
@@ -316,8 +316,8 @@ func testDefaulting(t *testing.T, watchCache bool) {
 	addDefault("v1beta2", "c", "C")
 
 	t.Logf("wait until GET sees 'c' in both status and spec")
-	if err := wait.PollImmediate(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-		obj, err := fooClient.Get(context.TODO(), foo.GetName(), metav1.GetOptions{})
+	if err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, wait.ForeverTestTimeout, true, func(ctx context.Context) (bool, error) {
+		obj, err := fooClient.Get(ctx, foo.GetName(), metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -333,7 +333,7 @@ func testDefaulting(t *testing.T, watchCache bool) {
 	mustExist(foo.Object, [][]string{{"spec", "a"}, {"spec", "b"}, {"spec", "c"}, {"status", "a"}, {"status", "b"}, {"status", "c"}})
 
 	t.Logf("wait until GET sees 'c' in both status and spec of cached get")
-	if err := wait.PollImmediate(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
+	if err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, wait.ForeverTestTimeout, true, func(ctx context.Context) (bool, error) {
 		obj, err := fooClient.Get(context.TODO(), foo.GetName(), metav1.GetOptions{ResourceVersion: "0"})
 		if err != nil {
 			return false, err
@@ -376,8 +376,21 @@ func testDefaulting(t *testing.T, watchCache bool) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer w.Stop()
 		select {
 		case event := <-w.ResultChan():
+			// since the RV we watch from can be compacted
+			// during the execution of the test,
+			// tolerate the expiration error.
+			//
+			// see: https://github.com/kubernetes/kubernetes/issues/125760
+			if event.Type == watch.Error {
+				if !apierrors.IsResourceExpired(apierrors.FromObject(event.Object)) {
+					t.Fatalf("unexpected watch event: %v, %#v", event.Type, event.Object)
+				}
+				t.Logf("skipping the WATCH at RV = %s, because the revision has been compacetd, err: %#v", initialResourceVersion, event.Object)
+				break
+			}
 			if event.Type != watch.Modified {
 				t.Fatalf("unexpected watch event: %v, %#v", event.Type, event.Object)
 			}
@@ -396,8 +409,8 @@ func testDefaulting(t *testing.T, watchCache bool) {
 	t.Logf("Add 'c' default to the REST version, remove it from the storage version, and wait until GET no longer sees it in both status and spec")
 	addDefault("v1beta1", "c", "C")
 	removeDefault("v1beta2", "c")
-	if err := wait.PollImmediate(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-		obj, err := fooClient.Get(context.TODO(), foo.GetName(), metav1.GetOptions{})
+	if err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, wait.ForeverTestTimeout, true, func(ctx context.Context) (bool, error) {
+		obj, err := fooClient.Get(ctx, foo.GetName(), metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -421,8 +434,8 @@ func testDefaulting(t *testing.T, watchCache bool) {
 	removeDefault("v1beta1", "a")
 	removeDefault("v1beta1", "b")
 	removeDefault("v1beta1", "c")
-	if err := wait.PollImmediate(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-		obj, err := fooClient.Get(context.TODO(), foo.GetName(), metav1.GetOptions{})
+	if err := wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, wait.ForeverTestTimeout, true, func(ctx context.Context) (bool, error) {
+		obj, err := fooClient.Get(ctx, foo.GetName(), metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -658,8 +671,8 @@ func TestCustomResourceDefaultingOfMetaFields(t *testing.T) {
 	t.Logf("CR created: %#v", returnedFoo.UnstructuredContent())
 
 	// get persisted object
-	RESTOptionsGetter := serveroptions.NewCRDRESTOptionsGetter(*options.RecommendedOptions.Etcd)
-	restOptions, err := RESTOptionsGetter.GetRESTOptions(schema.GroupResource{Group: crd.Spec.Group, Resource: crd.Spec.Names.Plural})
+	RESTOptionsGetter := serveroptions.NewCRDRESTOptionsGetter(*options.RecommendedOptions.Etcd, nil, nil)
+	restOptions, err := RESTOptionsGetter.GetRESTOptions(schema.GroupResource{Group: crd.Spec.Group, Resource: crd.Spec.Names.Plural}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

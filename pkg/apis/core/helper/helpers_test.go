@@ -17,11 +17,9 @@ limitations under the License.
 package helper
 
 import (
-	"reflect"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/kubernetes/pkg/apis/core"
 )
 
@@ -62,7 +60,7 @@ func TestIsStandardResource(t *testing.T) {
 		{"requests.hugepages-2Mi", true},
 	}
 	for i, tc := range testCases {
-		if IsStandardResourceName(tc.input) != tc.output {
+		if IsStandardResourceName(core.ResourceName(tc.input)) != tc.output {
 			t.Errorf("case[%d], input: %s, expected: %t, got: %t", i, tc.input, tc.output, !tc.output)
 		}
 	}
@@ -79,7 +77,7 @@ func TestIsStandardContainerResource(t *testing.T) {
 		{"hugepages-2Mi", true},
 	}
 	for i, tc := range testCases {
-		if IsStandardContainerResourceName(tc.input) != tc.output {
+		if IsStandardContainerResourceName(core.ResourceName(tc.input)) != tc.output {
 			t.Errorf("case[%d], input: %s, expected: %t, got: %t", i, tc.input, tc.output, !tc.output)
 		}
 	}
@@ -87,24 +85,41 @@ func TestIsStandardContainerResource(t *testing.T) {
 
 func TestGetAccessModesFromString(t *testing.T) {
 	modes := GetAccessModesFromString("ROX")
-	if !containsAccessMode(modes, core.ReadOnlyMany) {
+	if !ContainsAccessMode(modes, core.ReadOnlyMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadOnlyMany, modes)
 	}
 
 	modes = GetAccessModesFromString("ROX,RWX")
-	if !containsAccessMode(modes, core.ReadOnlyMany) {
+	if !ContainsAccessMode(modes, core.ReadOnlyMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadOnlyMany, modes)
 	}
-	if !containsAccessMode(modes, core.ReadWriteMany) {
+	if !ContainsAccessMode(modes, core.ReadWriteMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteMany, modes)
 	}
 
 	modes = GetAccessModesFromString("RWO,ROX,RWX")
-	if !containsAccessMode(modes, core.ReadOnlyMany) {
+	if !ContainsAccessMode(modes, core.ReadWriteOnce) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteOnce, modes)
+	}
+	if !ContainsAccessMode(modes, core.ReadOnlyMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadOnlyMany, modes)
 	}
-	if !containsAccessMode(modes, core.ReadWriteMany) {
+	if !ContainsAccessMode(modes, core.ReadWriteMany) {
 		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteMany, modes)
+	}
+
+	modes = GetAccessModesFromString("RWO,ROX,RWX,RWOP")
+	if !ContainsAccessMode(modes, core.ReadWriteOnce) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteOnce, modes)
+	}
+	if !ContainsAccessMode(modes, core.ReadOnlyMany) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadOnlyMany, modes)
+	}
+	if !ContainsAccessMode(modes, core.ReadWriteMany) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteMany, modes)
+	}
+	if !ContainsAccessMode(modes, core.ReadWriteOncePod) {
+		t.Errorf("Expected mode %s, but got %+v", core.ReadWriteOncePod, modes)
 	}
 }
 
@@ -115,70 +130,6 @@ func TestRemoveDuplicateAccessModes(t *testing.T) {
 	modes = removeDuplicateAccessModes(modes)
 	if len(modes) != 2 {
 		t.Errorf("Expected 2 distinct modes in set but found %v", len(modes))
-	}
-}
-
-func TestNodeSelectorRequirementsAsSelector(t *testing.T) {
-	matchExpressions := []core.NodeSelectorRequirement{{
-		Key:      "foo",
-		Operator: core.NodeSelectorOpIn,
-		Values:   []string{"bar", "baz"},
-	}}
-	mustParse := func(s string) labels.Selector {
-		out, e := labels.Parse(s)
-		if e != nil {
-			panic(e)
-		}
-		return out
-	}
-	tc := []struct {
-		in        []core.NodeSelectorRequirement
-		out       labels.Selector
-		expectErr bool
-	}{
-		{in: nil, out: labels.Nothing()},
-		{in: []core.NodeSelectorRequirement{}, out: labels.Nothing()},
-		{
-			in:  matchExpressions,
-			out: mustParse("foo in (baz,bar)"),
-		},
-		{
-			in: []core.NodeSelectorRequirement{{
-				Key:      "foo",
-				Operator: core.NodeSelectorOpExists,
-				Values:   []string{"bar", "baz"},
-			}},
-			expectErr: true,
-		},
-		{
-			in: []core.NodeSelectorRequirement{{
-				Key:      "foo",
-				Operator: core.NodeSelectorOpGt,
-				Values:   []string{"1"},
-			}},
-			out: mustParse("foo>1"),
-		},
-		{
-			in: []core.NodeSelectorRequirement{{
-				Key:      "bar",
-				Operator: core.NodeSelectorOpLt,
-				Values:   []string{"7"},
-			}},
-			out: mustParse("bar<7"),
-		},
-	}
-
-	for i, tc := range tc {
-		out, err := NodeSelectorRequirementsAsSelector(tc.in)
-		if err == nil && tc.expectErr {
-			t.Errorf("[%v]expected error but got none.", i)
-		}
-		if err != nil && !tc.expectErr {
-			t.Errorf("[%v]did not expect error but got: %v", i, err)
-		}
-		if !reflect.DeepEqual(out, tc.out) {
-			t.Errorf("[%v]expected:\n\t%+v\nbut got:\n\t%+v", i, tc.out, out)
-		}
 	}
 }
 
@@ -414,6 +365,51 @@ func TestIsServiceIPSet(t *testing.T) {
 			}
 			if IsServiceIPSet(&s) != tc.output {
 				t.Errorf("case, input: %v, expected: %v, got: %v", tc.input, tc.output, !tc.output)
+			}
+		})
+	}
+}
+
+func TestHasInvalidLabelValueInNodeSelectorTerms(t *testing.T) {
+	testCases := []struct {
+		name   string
+		terms  []core.NodeSelectorTerm
+		expect bool
+	}{
+		{
+			name: "valid values",
+			terms: []core.NodeSelectorTerm{{
+				MatchExpressions: []core.NodeSelectorRequirement{{
+					Key:      "foo",
+					Operator: core.NodeSelectorOpIn,
+					Values:   []string{"far"},
+				}},
+			}},
+			expect: false,
+		},
+		{
+			name:   "empty terms",
+			terms:  []core.NodeSelectorTerm{},
+			expect: false,
+		},
+		{
+			name: "invalid label value",
+			terms: []core.NodeSelectorTerm{{
+				MatchExpressions: []core.NodeSelectorRequirement{{
+					Key:      "foo",
+					Operator: core.NodeSelectorOpIn,
+					Values:   []string{"-1"},
+				}},
+			}},
+			expect: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := HasInvalidLabelValueInNodeSelectorTerms(tc.terms)
+			if got != tc.expect {
+				t.Errorf("exepct %v, got %v", tc.expect, got)
 			}
 		})
 	}

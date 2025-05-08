@@ -132,9 +132,6 @@ func (j *JSONPath) FindResults(data interface{}) ([][]reflect.Value, error) {
 			}
 			continue
 		}
-		if len(results) == 0 {
-			break
-		}
 		fullResult = append(fullResult, results)
 	}
 	return fullResult, nil
@@ -575,6 +572,9 @@ func (j *JSONPath) evalToText(v reflect.Value) ([]byte, error) {
 	iface, ok := template.PrintableValue(v)
 	if !ok {
 		return nil, fmt.Errorf("can't print type %s", v.Type())
+	}
+	if iface == nil {
+		return []byte("null"), nil
 	}
 	var buffer bytes.Buffer
 	fmt.Fprint(&buffer, iface)

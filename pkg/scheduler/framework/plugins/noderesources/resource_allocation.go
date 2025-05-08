@@ -17,58 +17,65 @@ limitations under the License.
 package noderesources
 
 import (
+	"context"
+
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
+
+	resourcehelper "k8s.io/component-helpers/resource"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 )
 
-// resourceToWeightMap contains resource name and weight.
-type resourceToWeightMap map[v1.ResourceName]int64
-
-// defaultRequestedRatioResources is used to set default requestToWeight map for CPU and memory
-var defaultRequestedRatioResources = resourceToWeightMap{v1.ResourceMemory: 1, v1.ResourceCPU: 1}
+// scorer is decorator for resourceAllocationScorer
+type scorer func(args *config.NodeResourcesFitArgs) *resourceAllocationScorer
 
 // resourceAllocationScorer contains information to calculate resource allocation score.
 type resourceAllocationScorer struct {
-	Name                string
-	scorer              func(requested, allocable resourceToValueMap) int64
-	resourceToWeightMap resourceToWeightMap
-
-	enablePodOverhead bool
+	Name                            string
+	enableInPlacePodVerticalScaling bool
+	enablePodLevelResources         bool
+	// used to decide whether to use Requested or NonZeroRequested for
+	// cpu and memory.
+	useRequested bool
+	scorer       func(requested, allocable []int64) int64
+	resources    []config.ResourceSpec
 }
-
-// resourceToValueMap contains resource name and score.
-type resourceToValueMap map[v1.ResourceName]int64
 
 // score will use `scorer` function to calculate the score.
 func (r *resourceAllocationScorer) score(
+	ctx context.Context,
 	pod *v1.Pod,
-	nodeInfo *framework.NodeInfo) (int64, *framework.Status) {
+	nodeInfo *framework.NodeInfo,
+	podRequests []int64) (int64, *framework.Status) {
+	logger := klog.FromContext(ctx)
 	node := nodeInfo.Node()
-	if node == nil {
-		return 0, framework.NewStatus(framework.Error, "node not found")
-	}
-	if r.resourceToWeightMap == nil {
+
+	// resources not set, nothing scheduled,
+	if len(r.resources) == 0 {
 		return 0, framework.NewStatus(framework.Error, "resources not found")
 	}
-	requested := make(resourceToValueMap)
-	allocatable := make(resourceToValueMap)
-	for resource := range r.resourceToWeightMap {
-		alloc, req := calculateResourceAllocatableRequest(nodeInfo, pod, resource, r.enablePodOverhead)
-		if alloc != 0 {
-			// Only fill the extended resource entry when it's non-zero.
-			allocatable[resource], requested[resource] = alloc, req
+
+	requested := make([]int64, len(r.resources))
+	allocatable := make([]int64, len(r.resources))
+	for i := range r.resources {
+		alloc, req := r.calculateResourceAllocatableRequest(logger, nodeInfo, v1.ResourceName(r.resources[i].Name), podRequests[i])
+		// Only fill the extended resource entry when it's non-zero.
+		if alloc == 0 {
+			continue
 		}
+		allocatable[i] = alloc
+		requested[i] = req
 	}
 
 	score := r.scorer(requested, allocatable)
 
-	if klog.V(10).Enabled() {
-		klog.Infof(
-			"%v -> %v: %v, map of allocatable resources %v, map of requested resources %v ,score %d,",
-			pod.Name, node.Name, r.Name,
-			allocatable, requested, score,
+	if loggerV := logger.V(10); loggerV.Enabled() { // Serializing these maps is costly.
+		loggerV.Info("Listed internal info for allocatable resources, requested resources and score", "pod",
+			klog.KObj(pod), "node", klog.KObj(node), "resourceAllocationScorer", r.Name,
+			"allocatableResource", allocatable, "requestedResource", requested, "resourceScore", score,
 		)
 	}
 
@@ -79,8 +86,12 @@ func (r *resourceAllocationScorer) score(
 // - 1st param: quantity of allocatable resource on the node.
 // - 2nd param: aggregated quantity of requested resource on the node.
 // Note: if it's an extended resource, and the pod doesn't request it, (0, 0) is returned.
-func calculateResourceAllocatableRequest(nodeInfo *framework.NodeInfo, pod *v1.Pod, resource v1.ResourceName, enablePodOverhead bool) (int64, int64) {
-	podRequest := calculatePodResourceRequest(pod, resource, enablePodOverhead)
+func (r *resourceAllocationScorer) calculateResourceAllocatableRequest(logger klog.Logger, nodeInfo *framework.NodeInfo, resource v1.ResourceName, podRequest int64) (int64, int64) {
+	requested := nodeInfo.NonZeroRequested
+	if r.useRequested {
+		requested = nodeInfo.Requested
+	}
+
 	// If it's an extended resource, and the pod doesn't request it. We return (0, 0)
 	// as an implication to bypass scoring on this resource.
 	if podRequest == 0 && schedutil.IsScalarResourceName(resource) {
@@ -88,9 +99,9 @@ func calculateResourceAllocatableRequest(nodeInfo *framework.NodeInfo, pod *v1.P
 	}
 	switch resource {
 	case v1.ResourceCPU:
-		return nodeInfo.Allocatable.MilliCPU, (nodeInfo.NonZeroRequested.MilliCPU + podRequest)
+		return nodeInfo.Allocatable.MilliCPU, (requested.MilliCPU + podRequest)
 	case v1.ResourceMemory:
-		return nodeInfo.Allocatable.Memory, (nodeInfo.NonZeroRequested.Memory + podRequest)
+		return nodeInfo.Allocatable.Memory, (requested.Memory + podRequest)
 	case v1.ResourceEphemeralStorage:
 		return nodeInfo.Allocatable.EphemeralStorage, (nodeInfo.Requested.EphemeralStorage + podRequest)
 	default:
@@ -98,37 +109,49 @@ func calculateResourceAllocatableRequest(nodeInfo *framework.NodeInfo, pod *v1.P
 			return nodeInfo.Allocatable.ScalarResources[resource], (nodeInfo.Requested.ScalarResources[resource] + podRequest)
 		}
 	}
-	if klog.V(10).Enabled() {
-		klog.Infof("requested resource %v not considered for node score calculation", resource)
-	}
+	logger.V(10).Info("Requested resource is omitted for node score calculation", "resourceName", resource)
 	return 0, 0
 }
 
-// calculatePodResourceRequest returns the total non-zero requests. If Overhead is defined for the pod and the
-// PodOverhead feature is enabled, the Overhead is added to the result.
-// podResourceRequest = max(sum(podSpec.Containers), podSpec.InitContainers) + overHead
-func calculatePodResourceRequest(pod *v1.Pod, resource v1.ResourceName, enablePodOverhead bool) int64 {
-	var podRequest int64
-	for i := range pod.Spec.Containers {
-		container := &pod.Spec.Containers[i]
-		value := schedutil.GetNonzeroRequestForResource(resource, &container.Resources.Requests)
-		podRequest += value
+// calculatePodResourceRequest returns the total non-zero requests. If Overhead is defined for the pod
+// the Overhead is added to the result.
+func (r *resourceAllocationScorer) calculatePodResourceRequest(pod *v1.Pod, resourceName v1.ResourceName) int64 {
+
+	opts := resourcehelper.PodResourcesOptions{
+		UseStatusResources: r.enableInPlacePodVerticalScaling,
+		// SkipPodLevelResources is set to false when PodLevelResources feature is enabled.
+		SkipPodLevelResources: !r.enablePodLevelResources,
 	}
 
-	for i := range pod.Spec.InitContainers {
-		initContainer := &pod.Spec.InitContainers[i]
-		value := schedutil.GetNonzeroRequestForResource(resource, &initContainer.Resources.Requests)
-		if podRequest < value {
-			podRequest = value
+	if !r.useRequested {
+		opts.NonMissingContainerRequests = v1.ResourceList{
+			v1.ResourceCPU:    *resource.NewMilliQuantity(schedutil.DefaultMilliCPURequest, resource.DecimalSI),
+			v1.ResourceMemory: *resource.NewQuantity(schedutil.DefaultMemoryRequest, resource.DecimalSI),
 		}
 	}
 
-	// If Overhead is being utilized, add to the total requests for the pod
-	if pod.Spec.Overhead != nil && enablePodOverhead {
-		if quantity, found := pod.Spec.Overhead[resource]; found {
-			podRequest += quantity.Value()
+	requests := resourcehelper.PodRequests(pod, opts)
+
+	quantity := requests[resourceName]
+	if resourceName == v1.ResourceCPU {
+		return quantity.MilliValue()
+	}
+	return quantity.Value()
+}
+
+func (r *resourceAllocationScorer) calculatePodResourceRequestList(pod *v1.Pod, resources []config.ResourceSpec) []int64 {
+	podRequests := make([]int64, len(resources))
+	for i := range resources {
+		podRequests[i] = r.calculatePodResourceRequest(pod, v1.ResourceName(resources[i].Name))
+	}
+	return podRequests
+}
+
+func (r *resourceAllocationScorer) isBestEffortPod(podRequests []int64) bool {
+	for _, request := range podRequests {
+		if request != 0 {
+			return false
 		}
 	}
-
-	return podRequest
+	return true
 }

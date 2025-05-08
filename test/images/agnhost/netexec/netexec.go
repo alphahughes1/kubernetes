@@ -21,23 +21,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ishidawataru/sctp"
 	"github.com/spf13/cobra"
 
 	utilnet "k8s.io/apimachinery/pkg/util/net"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	netutils "k8s.io/utils/net"
 )
 
 var (
@@ -50,6 +53,7 @@ var (
 	privKeyFile        = ""
 	httpOverride       = ""
 	udpListenAddresses = ""
+	delayShutdown      = 0
 )
 
 const bindToAny = ""
@@ -62,6 +66,9 @@ var CmdNetexec = &cobra.Command{
 
 - /: Returns the request's timestamp.
 - /clientip: Returns the request's IP address.
+- /header: Returns the request's header value corresponding to the key provided or the entire 
+  header marshalled as json, if no form value (key) is provided.
+  ("/header?key=X-Forwarded-For" or /header)
 - /dial: Creates a given number of requests to the given host and port using the given protocol,
   and returns a JSON with the fields "responses" (successful request responses) and "errors" (
   failed request responses). Returns "200 OK" status code if the last request succeeded,
@@ -83,9 +90,13 @@ var CmdNetexec = &cobra.Command{
 		shutdown.
 	- "wait": The amount of time to wait before starting shutdown. Acceptable values are
 	  golang durations. If 0 the process will start shutdown immediately.
-- "/healthz": Returns "200 OK" if the server is ready, "412 Status Precondition Failed"
+- "/healthz": Returns "200 OK" if the server is healthy, "412 Status Precondition Failed"
   otherwise. The server is considered not ready if the UDP server did not start yet or
   it exited.
+- "/readyz": Returns "200 OK" if the server is ready to receive traffic, "412 Status Precondition Failed", if the
+  server is not yet ready to receive traffic, but may be ready later, and "503" if the server is shutting down.
+  When a sig-term is observed, the /readyz will report 503, but healthz will report 200 to indicate that the
+  server is healthy (don't kill it), but the it should not be sent traffic (remove from endpoints).
 - "/hostname": Returns the server's hostname.
 - "/hostName": Returns the server's hostname.
 - "/redirect": Returns a redirect response to the given "location", with the optional status "code"
@@ -105,11 +116,13 @@ will be upgraded to HTTPS. The image has default, "localhost"-based cert/privkey
 If "--http-override" is set, the HTTP(S) server will always serve the override path & options,
 ignoring the request URL.
 
-It will also start a UDP server on the indicated UDP port that responds to the following commands:
+It will also start a UDP server on the indicated UDP port and addresses that responds to the following commands:
 
 - "hostname": Returns the server's hostname
 - "echo <msg>": Returns the given <msg>
 - "clientip": Returns the request's IP address
+
+The UDP server can be disabled by setting --udp-port to -1.
 
 Additionally, if (and only if) --sctp-port is passed, it will start an SCTP server on that port,
 responding to the same commands as the UDP server.
@@ -128,6 +141,7 @@ func init() {
 	CmdNetexec.Flags().IntVar(&sctpPort, "sctp-port", -1, "SCTP Listen Port")
 	CmdNetexec.Flags().StringVar(&httpOverride, "http-override", "", "Override the HTTP handler to always respond as if it were a GET with this path & params")
 	CmdNetexec.Flags().StringVar(&udpListenAddresses, "udp-listen-addresses", "", "A comma separated list of ip addresses the udp servers listen from")
+	CmdNetexec.Flags().IntVar(&delayShutdown, "delay-shutdown", 0, "Number of seconds to delay shutdown when receiving SIGTERM.")
 }
 
 // atomicBool uses load/store operations on an int32 to simulate an atomic boolean.
@@ -151,9 +165,28 @@ func (a *atomicBool) get() bool {
 
 func main(cmd *cobra.Command, args []string) {
 	exitCh := make(chan shutdownRequest)
+
+	sigTermReceived := make(chan struct{})
+	go func() {
+		termCh := make(chan os.Signal, 1)
+		signal.Notify(termCh, syscall.SIGTERM)
+
+		<-termCh
+		close(sigTermReceived)
+	}()
+
+	go func() {
+		<-sigTermReceived
+		if delayShutdown > 0 {
+			log.Printf("Sleeping %d seconds before terminating...", delayShutdown)
+			time.Sleep(time.Duration(delayShutdown) * time.Second)
+		}
+		os.Exit(0)
+	}()
+
 	if httpOverride != "" {
 		mux := http.NewServeMux()
-		addRoutes(mux, exitCh)
+		addRoutes(mux, sigTermReceived, exitCh)
 
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			overrideReq, err := http.NewRequestWithContext(r.Context(), "GET", httpOverride, nil)
@@ -164,17 +197,22 @@ func main(cmd *cobra.Command, args []string) {
 			mux.ServeHTTP(w, overrideReq)
 		})
 	} else {
-		addRoutes(http.DefaultServeMux, exitCh)
+		addRoutes(http.DefaultServeMux, sigTermReceived, exitCh)
 	}
 
-	udpBindTo, err := parseAddresses(udpListenAddresses)
-	if err != nil {
-		log.Fatal(err)
+	// UDP server
+	if udpPort != -1 {
+		udpBindTo, err := parseAddresses(udpListenAddresses)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, address := range udpBindTo {
+			go startUDPServer(address, udpPort)
+		}
 	}
 
-	for _, address := range udpBindTo {
-		go startUDPServer(address, udpPort)
-	}
+	// SCTP server
 	if sctpPort != -1 {
 		go startSCTPServer(sctpPort)
 	}
@@ -187,13 +225,15 @@ func main(cmd *cobra.Command, args []string) {
 	}
 }
 
-func addRoutes(mux *http.ServeMux, exitCh chan shutdownRequest) {
+func addRoutes(mux *http.ServeMux, sigTermReceived chan struct{}, exitCh chan shutdownRequest) {
 	mux.HandleFunc("/", rootHandler)
 	mux.HandleFunc("/clientip", clientIPHandler)
+	mux.HandleFunc("/header", headerHandler)
 	mux.HandleFunc("/dial", dialHandler)
 	mux.HandleFunc("/echo", echoHandler)
 	mux.HandleFunc("/exit", func(w http.ResponseWriter, req *http.Request) { exitHandler(w, req, exitCh) })
 	mux.HandleFunc("/healthz", healthzHandler)
+	mux.HandleFunc("/readyz", readyzHandler(sigTermReceived))
 	mux.HandleFunc("/hostname", hostnameHandler)
 	mux.HandleFunc("/redirect", redirectHandler)
 	mux.HandleFunc("/shell", shellHandler)
@@ -245,7 +285,22 @@ func echoHandler(w http.ResponseWriter, r *http.Request) {
 
 func clientIPHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("GET /clientip")
-	fmt.Fprintf(w, r.RemoteAddr)
+	fmt.Fprint(w, r.RemoteAddr)
+}
+func headerHandler(w http.ResponseWriter, r *http.Request) {
+	key := r.FormValue("key")
+	if key != "" {
+		log.Printf("GET /header?key=%s", key)
+		fmt.Fprintf(w, "%s", r.Header.Get(key))
+	} else {
+		log.Printf("GET /header")
+		data, err := json.Marshal(r.Header)
+		if err != nil {
+			fmt.Fprintf(w, "error marshalling header, err: %v", err)
+			return
+		}
+		fmt.Fprintf(w, "%s", string(data))
+	}
 }
 
 type shutdownRequest struct {
@@ -295,6 +350,32 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusPreconditionFailed)
+}
+
+// readyzHandler response with a 200 if the UDP server is ready. It serves as a readyz that will return a 503
+// once a sig-term has been received.   This allows for graceful removal from endpoints during a pod delete flow.
+func readyzHandler(sigTermReceived chan struct{}) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("GET /readyz")
+
+		select {
+		case <-sigTermReceived:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			if _, err := w.Write([]byte("shutting down")); err != nil {
+				utilruntime.HandleError(err)
+			}
+			return
+
+		default:
+			if serverReady.get() {
+				if _, err := w.Write([]byte("ok")); err != nil {
+					utilruntime.HandleError(err)
+				}
+				return
+			}
+			w.WriteHeader(http.StatusPreconditionFailed)
+		}
+	}
 }
 
 func shutdownHandler(w http.ResponseWriter, r *http.Request) {
@@ -383,7 +464,7 @@ func dialHTTP(request string, addr net.Addr) (string, error) {
 	defer transport.CloseIdleConnections()
 	if err == nil {
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err == nil {
 			return string(body), nil
 		}
@@ -481,7 +562,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	f, err := ioutil.TempFile("/uploads", "upload")
+	f, err := os.CreateTemp("/uploads", "upload")
 	if err != nil {
 		result["error"] = "Unable to open file for write"
 		bytes, err := json.Marshal(result)
@@ -553,7 +634,7 @@ func redirectHandler(w http.ResponseWriter, r *http.Request) {
 // udp server supports the hostName, echo and clientIP commands.
 func startUDPServer(address string, udpPort int) {
 	serverAddress, err := net.ResolveUDPAddr("udp", net.JoinHostPort(address, strconv.Itoa(udpPort)))
-	assertNoError(err, fmt.Sprintf("failed to resolve UDP address for port %d", sctpPort))
+	assertNoError(err, fmt.Sprintf("failed to resolve UDP address for port %d", udpPort))
 	serverConn, err := net.ListenUDP("udp", serverAddress)
 	assertNoError(err, fmt.Sprintf("failed to create listener for UDP address %v", serverAddress))
 	defer serverConn.Close()
@@ -612,7 +693,11 @@ func startSCTPServer(sctpPort int) {
 	for {
 		conn, err := listener.AcceptSCTP()
 		assertNoError(err, fmt.Sprintf("failed accepting SCTP connections"))
-		clientAddress := conn.RemoteAddr().String()
+		remoteAddr, err := conn.SCTPRemoteAddr(0)
+		if err != nil {
+			assertNoError(err, "failed to get SCTP client remote address")
+		}
+		clientAddress := remoteAddr.String()
 		n, err := conn.Read(buf)
 		assertNoError(err, fmt.Sprintf("failed to read from SCTP client %s", clientAddress))
 		receivedText := strings.ToLower(strings.TrimSpace(string(buf[0:n])))
@@ -660,7 +745,7 @@ func parseAddresses(addresses string) ([]string, error) {
 	res := make([]string, 0)
 	split := strings.Split(addresses, ",")
 	for _, address := range split {
-		netAddr := net.ParseIP(address)
+		netAddr := netutils.ParseIPSloppy(address)
 		if netAddr == nil {
 			return nil, fmt.Errorf("parseAddress: invalid address %s", address)
 		}

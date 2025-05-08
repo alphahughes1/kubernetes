@@ -156,13 +156,18 @@ func (t *tokenSimple) invalidateUser(username string) {
 }
 
 func (t *tokenSimple) enable() {
+	t.simpleTokensMu.Lock()
+	defer t.simpleTokensMu.Unlock()
+	if t.simpleTokenKeeper != nil { // already enabled
+		return
+	}
 	if t.simpleTokenTTL <= 0 {
 		t.simpleTokenTTL = simpleTokenTTLDefault
 	}
 
 	delf := func(tk string) {
 		if username, ok := t.simpleTokens[tk]; ok {
-			t.lg.Info(
+			t.lg.Debug(
 				"deleted a simple token",
 				zap.String("user-name", username),
 				zap.String("token", tk),

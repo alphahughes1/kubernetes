@@ -17,6 +17,7 @@ limitations under the License.
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -24,7 +25,6 @@ import (
 	"sync/atomic"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"k8s.io/kubernetes/test/e2e/storage/drivers/csi-test/mock/cache"
 
@@ -47,19 +47,21 @@ const (
 
 // Manifest is the SP's manifest.
 var Manifest = map[string]string{
-	"url": "https://k8s.io/kubernetes/test/e2e/storage/drivers/csi-test/mock",
+	"url": "https://github.com/kubernetes/kubernetes/tree/master/test/e2e/storage/drivers/csi-test/mock",
 }
 
 type Config struct {
-	DisableAttach              bool
-	DriverName                 string
-	AttachLimit                int64
-	NodeExpansionRequired      bool
-	DisableControllerExpansion bool
-	DisableOnlineExpansion     bool
-	PermissiveTargetPath       bool
-	EnableTopology             bool
-	IO                         DirIO
+	DisableAttach               bool
+	DriverName                  string
+	AttachLimit                 int64
+	NodeExpansionRequired       bool
+	NodeVolumeConditionRequired bool
+	VolumeMountGroupRequired    bool
+	DisableControllerExpansion  bool
+	DisableOnlineExpansion      bool
+	PermissiveTargetPath        bool
+	EnableTopology              bool
+	IO                          DirIO
 }
 
 // DirIO is an abstraction over direct os calls.
@@ -70,6 +72,9 @@ type DirIO interface {
 	Mkdir(path string) error
 	// RemoveAll removes the path and everything contained inside it. It's not an error if the path does not exist.
 	RemoveAll(path string) error
+	// Rename changes the name of a file or directory. The parent directory
+	// of newPath must exist.
+	Rename(oldPath, newPath string) error
 }
 
 type OSDirIO struct{}
@@ -94,6 +99,10 @@ func (o OSDirIO) Mkdir(path string) error {
 
 func (o OSDirIO) RemoveAll(path string) error {
 	return os.RemoveAll(path)
+}
+
+func (o OSDirIO) Rename(oldPath, newPath string) error {
+	return os.Rename(oldPath, newPath)
 }
 
 // Service is the CSI Mock service provider.
@@ -157,7 +166,6 @@ const (
 	gib    int64 = mib * 1024
 	gib100 int64 = gib * 100
 	tib    int64 = gib * 1024
-	tib100 int64 = tib * 100
 )
 
 func (s *service) newVolume(name string, capcity int64) csi.Volume {

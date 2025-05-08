@@ -148,8 +148,7 @@ func expectMatchDirect(t *testing.T, selector, ls Set) {
 	}
 }
 
-//lint:ignore U1000 currently commented out in TODO of TestSetMatches
-//nolint:unused,deadcode
+//nolint:staticcheck,unused //iccheck // U1000 currently commented out in TODO of TestSetMatches
 func expectNoMatchDirect(t *testing.T, selector, ls Set) {
 	if SelectorFromSet(selector).Matches(ls) {
 		t.Errorf("Wanted '%s' to not match '%s', but it did.", selector, ls)
@@ -223,14 +222,6 @@ func TestLexer(t *testing.T) {
 			t.Errorf("Got '%s' it should be '%s'", lit, v.s)
 		}
 	}
-}
-
-func min(l, r int) (m int) {
-	m = r
-	if l < r {
-		m = l
-	}
-	return m
 }
 
 func TestLexerSequence(t *testing.T) {
@@ -810,11 +801,70 @@ func BenchmarkSelectorFromValidatedSet(b *testing.B) {
 		"foo": "foo",
 		"bar": "bar",
 	}
+	matchee := Set(map[string]string{
+		"foo":   "foo",
+		"bar":   "bar",
+		"extra": "label",
+	})
 
 	for i := 0; i < b.N; i++ {
-		if SelectorFromValidatedSet(set).Empty() {
+		s := SelectorFromValidatedSet(set)
+		if s.Empty() {
 			b.Errorf("Unexpected selector")
 		}
+		if !s.Matches(matchee) {
+			b.Errorf("Unexpected match")
+		}
+	}
+}
+
+func BenchmarkSetSelector(b *testing.B) {
+	set := map[string]string{
+		"foo": "foo",
+		"bar": "bar",
+	}
+	matchee := Set(map[string]string{
+		"foo":   "foo",
+		"bar":   "bar",
+		"extra": "label",
+	})
+
+	for i := 0; i < b.N; i++ {
+		s := ValidatedSetSelector(set)
+		if s.Empty() {
+			b.Errorf("Unexpected selector")
+		}
+		if !s.Matches(matchee) {
+			b.Errorf("Unexpected match")
+		}
+	}
+}
+
+func TestSetSelectorString(t *testing.T) {
+	cases := []struct {
+		set Set
+		out string
+	}{
+		{
+			Set{},
+			"",
+		},
+		{
+			Set{"app": "foo"},
+			"app=foo",
+		},
+		{
+			Set{"app": "foo", "a": "b"},
+			"a=b,app=foo",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.out, func(t *testing.T) {
+			if got := ValidatedSetSelector(tt.set).String(); tt.out != got {
+				t.Fatalf("expected %v, got %v", tt.out, got)
+			}
+		})
 	}
 }
 

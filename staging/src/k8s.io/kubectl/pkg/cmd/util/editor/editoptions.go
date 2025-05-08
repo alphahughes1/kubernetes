@@ -19,6 +19,7 @@ package editor
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,8 +29,8 @@ import (
 	goruntime "runtime"
 	"strings"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/spf13/cobra"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	"k8s.io/klog/v2"
 
 	corev1 "k8s.io/api/core/v1"
@@ -44,6 +45,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/cli-runtime/pkg/resource"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
@@ -64,6 +66,7 @@ type EditOptions struct {
 	WindowsLineEndings bool
 
 	cmdutil.ValidateOptions
+	ValidationDirective string
 
 	OriginalResult *resource.Result
 
@@ -75,7 +78,7 @@ type EditOptions struct {
 
 	managedFields map[types.UID][]metav1.ManagedFieldsEntry
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 
 	Recorder            genericclioptions.Recorder
 	f                   cmdutil.Factory
@@ -83,10 +86,12 @@ type EditOptions struct {
 	updatedResultGetter func(data []byte) *resource.Result
 
 	FieldManager string
+
+	Subresource string
 }
 
 // NewEditOptions returns an initialized EditOptions instance
-func NewEditOptions(editMode EditMode, ioStreams genericclioptions.IOStreams) *EditOptions {
+func NewEditOptions(editMode EditMode, ioStreams genericiooptions.IOStreams) *EditOptions {
 	return &EditOptions{
 		RecordFlags: genericclioptions.NewRecordFlags(),
 
@@ -183,6 +188,7 @@ func (o *EditOptions) Complete(f cmdutil.Factory, args []string, cmd *cobra.Comm
 	}
 	r := b.NamespaceParam(cmdNamespace).DefaultNamespace().
 		FilenameParam(enforceNamespace, &o.FilenameOptions).
+		Subresource(o.Subresource).
 		ContinueOnError().
 		Flatten().
 		Do()
@@ -197,6 +203,7 @@ func (o *EditOptions) Complete(f cmdutil.Factory, args []string, cmd *cobra.Comm
 		return f.NewBuilder().
 			Unstructured().
 			Stream(bytes.NewReader(data), "edited-file").
+			Subresource(o.Subresource).
 			ContinueOnError().
 			Flatten().
 			Do()
@@ -205,6 +212,11 @@ func (o *EditOptions) Complete(f cmdutil.Factory, args []string, cmd *cobra.Comm
 	o.ToPrinter = func(operation string) (printers.ResourcePrinter, error) {
 		o.PrintFlags.NamePrintFlags.Operation = operation
 		return o.PrintFlags.ToPrinter()
+	}
+
+	o.ValidationDirective, err = cmdutil.GetValidationDirective(cmd)
+	if err != nil {
+		return err
 	}
 
 	o.CmdNamespace = cmdNamespace
@@ -298,7 +310,7 @@ func (o *EditOptions) Run() error {
 			klog.V(4).Infof("User edited:\n%s", string(edited))
 
 			// Apply validation
-			schema, err := o.f.Validator(o.EnableValidation)
+			schema, err := o.f.Validator(o.ValidationDirective)
 			if err != nil {
 				return preservedFile(err, file, o.ErrOut)
 			}
@@ -560,12 +572,12 @@ func (o *EditOptions) annotationPatch(update *resource.Info) error {
 	if err != nil {
 		return err
 	}
-	helper := resource.NewHelper(client, mapping).WithFieldManager(o.FieldManager)
+	helper := resource.NewHelper(client, mapping).
+		WithFieldManager(o.FieldManager).
+		WithFieldValidation(o.ValidationDirective).
+		WithSubresource(o.Subresource)
 	_, err = helper.Patch(o.CmdNamespace, update.Name, patchType, patch, nil)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // GetApplyPatch is used to get and apply patches
@@ -667,8 +679,14 @@ func (o *EditOptions) visitToPatch(originalInfos []*resource.Info, patchVisitor 
 				klog.V(4).Infof("Unable to calculate diff, no merge is possible: %v", err)
 				return err
 			}
+			var patchMap map[string]interface{}
+			err = json.Unmarshal(patch, &patchMap)
+			if err != nil {
+				klog.V(4).Infof("Unable to calculate diff, no merge is possible: %v", err)
+				return err
+			}
 			for _, precondition := range preconditions {
-				if !precondition(patch) {
+				if !precondition(patchMap) {
 					klog.V(4).Infof("Unable to calculate diff, no merge is possible: %v", err)
 					return fmt.Errorf("%s", "At least one of apiVersion, kind and name was changed")
 				}
@@ -693,6 +711,8 @@ func (o *EditOptions) visitToPatch(originalInfos []*resource.Info, patchVisitor 
 
 		patched, err := resource.NewHelper(info.Client, info.Mapping).
 			WithFieldManager(o.FieldManager).
+			WithFieldValidation(o.ValidationDirective).
+			WithSubresource(o.Subresource).
 			Patch(info.Namespace, info.Name, patchType, patch, nil)
 		if err != nil {
 			fmt.Fprintln(o.ErrOut, results.addError(err, info))
@@ -712,6 +732,7 @@ func (o *EditOptions) visitToCreate(createVisitor resource.Visitor) error {
 	err := createVisitor.Visit(func(info *resource.Info, incomingErr error) error {
 		obj, err := resource.NewHelper(info.Client, info.Mapping).
 			WithFieldManager(o.FieldManager).
+			WithFieldValidation(o.ValidationDirective).
 			Create(info.Namespace, true, info.Object)
 		if err != nil {
 			return err

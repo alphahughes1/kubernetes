@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -55,6 +56,16 @@ func GetBlockDeviceInfo(sysfs sysfs.SysFs) (map[string]info.DiskInfo, error) {
 		// Ignore non-disk devices.
 		// TODO(rjnagal): Maybe just match hd, sd, and dm prefixes.
 		if strings.HasPrefix(name, "loop") || strings.HasPrefix(name, "ram") || strings.HasPrefix(name, "sr") {
+			continue
+		}
+		// Ignore "hidden" devices (i.e. nvme path device sysfs entries).
+		// These devices are in the form of /dev/nvme$Xc$Yn$Z and will
+		// not have a device handle (i.e. "hidden")
+		isHidden, err := sysfs.IsBlockDeviceHidden(name)
+		if err != nil {
+			return nil, err
+		}
+		if isHidden {
 			continue
 		}
 		diskInfo := info.DiskInfo{
@@ -104,7 +115,7 @@ func GetNetworkDevices(sysfs sysfs.SysFs) ([]info.NetInfo, error) {
 	for _, dev := range devs {
 		name := dev.Name()
 		// Ignore docker, loopback, and veth devices.
-		ignoredDevices := []string{"lo", "veth", "docker"}
+		ignoredDevices := []string{"lo", "veth", "docker", "nerdctl"}
 		ignored := false
 		for _, prefix := range ignoredDevices {
 			if strings.HasPrefix(name, prefix) {
@@ -200,7 +211,7 @@ func GetNodesInfo(sysFs sysfs.SysFs) ([]info.Node, int, error) {
 	}
 
 	if len(nodesDirs) == 0 {
-		klog.Warningf("Nodes topology is not available, providing CPU topology")
+		klog.V(4).Info("Nodes topology is not available, providing CPU topology")
 		return getCPUTopology(sysFs)
 	}
 
@@ -239,6 +250,11 @@ func GetNodesInfo(sysFs sysfs.SysFs) ([]info.Node, int, error) {
 
 		hugepagesDirectory := fmt.Sprintf("%s/%s", nodeDir, hugepagesDir)
 		node.HugePages, err = GetHugePagesInfo(sysFs, hugepagesDirectory)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		node.Distances, err = getDistances(sysFs, nodeDir)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -332,20 +348,34 @@ func addCacheInfo(sysFs sysfs.SysFs, node *info.Node) error {
 
 		for _, cache := range caches {
 			c := info.Cache{
+				Id:    cache.Id,
 				Size:  cache.Size,
 				Level: cache.Level,
 				Type:  cache.Type,
 			}
-			if cache.Cpus == numThreadsPerNode && cache.Level > cacheLevel2 {
-				// Add a node-level cache.
-				cacheFound := false
-				for _, nodeCache := range node.Caches {
-					if nodeCache == c {
-						cacheFound = true
+			if cache.Level > cacheLevel2 {
+				if cache.Cpus == numThreadsPerNode {
+					// Add a node level cache.
+					cacheFound := false
+					for _, nodeCache := range node.Caches {
+						if nodeCache == c {
+							cacheFound = true
+						}
 					}
-				}
-				if !cacheFound {
-					node.Caches = append(node.Caches, c)
+					if !cacheFound {
+						node.Caches = append(node.Caches, c)
+					}
+				} else {
+					// Add uncore cache, for architecture in which l3 cache only shared among some cores.
+					uncoreCacheFound := false
+					for _, uncoreCache := range node.Cores[coreID].UncoreCaches {
+						if uncoreCache == c {
+							uncoreCacheFound = true
+						}
+					}
+					if !uncoreCacheFound {
+						node.Cores[coreID].UncoreCaches = append(node.Cores[coreID].UncoreCaches, c)
+					}
 				}
 			} else if cache.Cpus == numThreadsPerCore {
 				// Add core level cache
@@ -375,6 +405,27 @@ func getNodeMemInfo(sysFs sysfs.SysFs, nodeDir string) (uint64, error) {
 	}
 	memory = memory * 1024 // Convert to bytes
 	return uint64(memory), nil
+}
+
+// getDistances returns information about distances between NUMA nodes
+func getDistances(sysFs sysfs.SysFs, nodeDir string) ([]uint64, error) {
+	rawDistance, err := sysFs.GetDistances(nodeDir)
+	if err != nil {
+		//Ignore if per-node info is not available.
+		klog.Warningf("Found node without distance information, nodeDir: %s", nodeDir)
+		return nil, nil
+	}
+
+	distances := []uint64{}
+	for _, distance := range strings.Split(rawDistance, " ") {
+		distanceUint, err := strconv.ParseUint(distance, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %s to int", distance)
+		}
+		distances = append(distances, distanceUint)
+	}
+
+	return distances, nil
 }
 
 // getCoresInfo returns information about physical cores
@@ -414,12 +465,35 @@ func getCoresInfo(sysFs sysfs.SysFs, cpuDirs []string) ([]info.Core, error) {
 			return nil, err
 		}
 
+		var bookID, drawerID string
+		// s390/s390x additional cpu topology levels
+		if runtime.GOARCH == "s390x" {
+			bookID, err = sysFs.GetBookID(cpuDir)
+			if os.IsNotExist(err) {
+				klog.Warningf("Cannot read book id for %s, book_id file does not exist, err: %s", cpuDir, err)
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+			drawerID, err = sysFs.GetDrawerID(cpuDir)
+			if os.IsNotExist(err) {
+				klog.Warningf("Cannot read drawer id for %s, drawer_id file does not exist, err: %s", cpuDir, err)
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+		}
+
 		coreIDx := -1
 		for id, core := range cores {
 			if core.Id == physicalID && core.SocketID == physicalPackageID {
-				coreIDx = id
+				// For s390x, we need to check the BookID and DrawerID match as well.
+				if runtime.GOARCH != "s390x" || (core.BookID == bookID && core.DrawerID == drawerID) {
+					coreIDx = id
+				}
 			}
 		}
+
 		if coreIDx == -1 {
 			cores = append(cores, info.Core{})
 			coreIDx = len(cores) - 1
@@ -428,6 +502,8 @@ func getCoresInfo(sysFs sysfs.SysFs, cpuDirs []string) ([]info.Core, error) {
 
 		desiredCore.Id = physicalID
 		desiredCore.SocketID = physicalPackageID
+		desiredCore.BookID = bookID
+		desiredCore.DrawerID = drawerID
 
 		if len(desiredCore.Threads) == 0 {
 			desiredCore.Threads = []int{cpuID}

@@ -33,7 +33,7 @@ import (
 	e2erc "k8s.io/kubernetes/test/e2e/framework/rc"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 )
 
 // TODO: Cleanup this file.
@@ -53,7 +53,7 @@ var CurrentSuite Suite
 
 // PrePulledImages are a list of images used in e2e/common tests. These images should be prepulled
 // before tests starts, so that the tests won't fail due image pulling flakes.
-// Currently, this is only used by node e2e test.
+// Currently, this is only used by node e2e test and E2E tests.
 // See also updateImageAllowList() in ../../e2e_node/image_list.go
 // TODO(random-liu): Change the image puller pod to use similar mechanism.
 var PrePulledImages = sets.NewString(
@@ -63,8 +63,17 @@ var PrePulledImages = sets.NewString(
 	imageutils.GetE2EImage(imageutils.Nginx),
 	imageutils.GetE2EImage(imageutils.Httpd),
 	imageutils.GetE2EImage(imageutils.VolumeNFSServer),
-	imageutils.GetE2EImage(imageutils.VolumeGlusterServer),
 	imageutils.GetE2EImage(imageutils.NonRoot),
+)
+
+// WindowsPrePulledImages are a list of images used in e2e/common tests. These images should be prepulled
+// before tests starts, so that the tests won't fail due image pulling flakes. These images also have
+// Windows support. Currently, this is only used by E2E tests.
+var WindowsPrePulledImages = sets.NewString(
+	imageutils.GetE2EImage(imageutils.Agnhost),
+	imageutils.GetE2EImage(imageutils.BusyBox),
+	imageutils.GetE2EImage(imageutils.Nginx),
+	imageutils.GetE2EImage(imageutils.Httpd),
 )
 
 type testImagesStruct struct {
@@ -111,33 +120,31 @@ func SubstituteImageName(content string) string {
 	return contentWithImageName.String()
 }
 
-func svcByName(name string, port int) *v1.Service {
+func svcByName(name string, port int, selector map[string]string) *v1.Service {
 	return &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
 		Spec: v1.ServiceSpec{
-			Type: v1.ServiceTypeNodePort,
-			Selector: map[string]string{
-				"name": name,
-			},
+			Type:     v1.ServiceTypeNodePort,
+			Selector: selector,
 			Ports: []v1.ServicePort{{
 				Port:       int32(port),
-				TargetPort: intstr.FromInt(port),
+				TargetPort: intstr.FromInt32(int32(port)),
 			}},
 		},
 	}
 }
 
-// NewSVCByName creates a service by name.
-func NewSVCByName(c clientset.Interface, ns, name string) error {
+// NewSVCByName creates a service with the specified selector.
+func NewSVCByName(c clientset.Interface, ns, name string, selector map[string]string) error {
 	const testPort = 9376
-	_, err := c.CoreV1().Services(ns).Create(context.TODO(), svcByName(name, testPort), metav1.CreateOptions{})
+	_, err := c.CoreV1().Services(ns).Create(context.TODO(), svcByName(name, testPort, selector), metav1.CreateOptions{})
 	return err
 }
 
-// NewRCByName creates a replication controller with a selector by name of name.
-func NewRCByName(c clientset.Interface, ns, name string, replicas int32, gracePeriod *int64, containerArgs []string) (*v1.ReplicationController, error) {
+// NewRCByName creates a replication controller with a selector by a specified set of labels.
+func NewRCByName(c clientset.Interface, ns, name string, replicas int32, gracePeriod *int64, containerArgs []string, rcLabels map[string]string) (*v1.ReplicationController, error) {
 	ginkgo.By(fmt.Sprintf("creating replication controller %s", name))
 
 	if containerArgs == nil {
@@ -145,7 +152,7 @@ func NewRCByName(c clientset.Interface, ns, name string, replicas int32, gracePe
 	}
 
 	return c.CoreV1().ReplicationControllers(ns).Create(context.TODO(), rcByNamePort(
-		name, replicas, framework.ServeHostnameImage, containerArgs, 9376, v1.ProtocolTCP, map[string]string{}, gracePeriod), metav1.CreateOptions{})
+		name, replicas, imageutils.GetE2EImage(imageutils.Agnhost), containerArgs, 9376, v1.ProtocolTCP, rcLabels, gracePeriod), metav1.CreateOptions{})
 }
 
 // RestartNodes restarts specific nodes.
@@ -185,11 +192,11 @@ func RestartNodes(c clientset.Interface, nodes []v1.Node) error {
 		if err := wait.Poll(30*time.Second, framework.RestartNodeReadyAgainTimeout, func() (bool, error) {
 			newNode, err := c.CoreV1().Nodes().Get(context.TODO(), node.Name, metav1.GetOptions{})
 			if err != nil {
-				return false, fmt.Errorf("error getting node info after reboot: %s", err)
+				return false, fmt.Errorf("error getting node info after reboot: %w", err)
 			}
 			return node.Status.NodeInfo.BootID != newNode.Status.NodeInfo.BootID, nil
 		}); err != nil {
-			return fmt.Errorf("error waiting for node %s boot ID to change: %s", node.Name, err)
+			return fmt.Errorf("error waiting for node %s boot ID to change: %w", node.Name, err)
 		}
 	}
 	return nil

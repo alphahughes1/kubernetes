@@ -21,10 +21,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"time"
 
 	storagev1 "k8s.io/api/storage/v1"
+	storagev1beta1 "k8s.io/api/storage/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,7 +35,6 @@ import (
 	klog "k8s.io/klog/v2"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2econfig "k8s.io/kubernetes/test/e2e/framework/config"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
@@ -42,7 +42,7 @@ import (
 	"k8s.io/kubernetes/test/e2e/storage/testsuites"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/gomega"
 )
 
 // DriverDefinition needs to be filled in via a .yaml or .json
@@ -77,6 +77,30 @@ type driverDefinition struct {
 
 		// FromExistingClassName specifies the name of a pre-installed
 		// StorageClass that will be copied and used for the tests.
+		FromExistingClassName string
+	}
+
+	// VolumeAttributesClass must be set to enable volume modification tests.
+	// The default is to not run those tests.
+	VolumeAttributesClass struct {
+		// FromName set to true enables the usage of a
+		// VolumeAttributesClass with DriverInfo.Name as
+		// provisioner and no parameters.
+		FromName bool
+
+		// FromFile is used only when FromName is false.  It
+		// loads a storage class from the given .yaml or .json
+		// file. File names are resolved by the
+		// framework.testfiles package, which typically means
+		// that they can be absolute or relative to the test
+		// suite's --repo-root parameter.
+		//
+		// This can be used when the VolumeAttributesClass
+		// is meant to have additional parameters.
+		FromFile string
+
+		// FromExistingClassName specifies the name of a pre-installed
+		// VolumeAttributesClass that will be copied and used for the tests.
 		FromExistingClassName string
 	}
 
@@ -162,7 +186,7 @@ func (t testDriverParameter) Set(filename string) error {
 // to define the tests.
 func AddDriverDefinition(filename string) error {
 	driver, err := loadDriverDefinition(filename)
-	e2elog.Logf("Driver loaded from path [%s]: %+v", filename, driver)
+	framework.Logf("Driver loaded from path [%s]: %+v", filename, driver)
 	if err != nil {
 		return err
 	}
@@ -170,10 +194,12 @@ func AddDriverDefinition(filename string) error {
 		return fmt.Errorf("%q: DriverInfo.Name not set", filename)
 	}
 
-	description := "External Storage " + storageframework.GetDriverNameWithFeatureTags(driver)
-	ginkgo.Describe(description, func() {
+	args := []interface{}{"External Storage"}
+	args = append(args, storageframework.GetDriverNameWithFeatureTags(driver)...)
+	args = append(args, func() {
 		storageframework.DefineTestSuites(driver, testsuites.CSISuites)
 	})
+	framework.Describe(args...)
 
 	return nil
 }
@@ -182,7 +208,7 @@ func loadDriverDefinition(filename string) (*driverDefinition, error) {
 	if filename == "" {
 		return nil, fmt.Errorf("missing file name")
 	}
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -203,11 +229,18 @@ func loadDriverDefinition(filename string) (*driverDefinition, error) {
 		return nil, fmt.Errorf("%s: %w", filename, err)
 	}
 
-	// to ensure backward compatibility if controller expansion is enabled then set online expansion to true
+	// To ensure backward compatibility: if controller expansion is enabled,
+	// then set both online and offline expansion to true
 	if _, ok := driver.GetDriverInfo().Capabilities[storageframework.CapOnlineExpansion]; !ok &&
 		driver.GetDriverInfo().Capabilities[storageframework.CapControllerExpansion] {
 		caps := driver.DriverInfo.Capabilities
 		caps[storageframework.CapOnlineExpansion] = true
+		driver.DriverInfo.Capabilities = caps
+	}
+	if _, ok := driver.GetDriverInfo().Capabilities[storageframework.CapOfflineExpansion]; !ok &&
+		driver.GetDriverInfo().Capabilities[storageframework.CapControllerExpansion] {
+		caps := driver.DriverInfo.Capabilities
+		caps[storageframework.CapOfflineExpansion] = true
 		driver.DriverInfo.Capabilities = caps
 	}
 	return driver, nil
@@ -264,7 +297,7 @@ func (d *driverDefinition) SkipUnsupportedTest(pattern storageframework.TestPatt
 
 }
 
-func (d *driverDefinition) GetDynamicProvisionStorageClass(e2econfig *storageframework.PerTestConfig, fsType string) *storagev1.StorageClass {
+func (d *driverDefinition) GetDynamicProvisionStorageClass(ctx context.Context, e2econfig *storageframework.PerTestConfig, fsType string) *storagev1.StorageClass {
 	var (
 		sc  *storagev1.StorageClass
 		err error
@@ -275,21 +308,23 @@ func (d *driverDefinition) GetDynamicProvisionStorageClass(e2econfig *storagefra
 	case d.StorageClass.FromName:
 		sc = &storagev1.StorageClass{Provisioner: d.DriverInfo.Name}
 	case d.StorageClass.FromExistingClassName != "":
-		sc, err = f.ClientSet.StorageV1().StorageClasses().Get(context.TODO(), d.StorageClass.FromExistingClassName, metav1.GetOptions{})
+		sc, err = f.ClientSet.StorageV1().StorageClasses().Get(ctx, d.StorageClass.FromExistingClassName, metav1.GetOptions{})
 		framework.ExpectNoError(err, "getting storage class %s", d.StorageClass.FromExistingClassName)
 	case d.StorageClass.FromFile != "":
 		var ok bool
 		items, err := utils.LoadFromManifests(d.StorageClass.FromFile)
 		framework.ExpectNoError(err, "load storage class from %s", d.StorageClass.FromFile)
-		framework.ExpectEqual(len(items), 1, "exactly one item from %s", d.StorageClass.FromFile)
+		gomega.Expect(items).To(gomega.HaveLen(1), "exactly one item from %s", d.StorageClass.FromFile)
 		err = utils.PatchItems(f, f.Namespace, items...)
 		framework.ExpectNoError(err, "patch items")
 
 		sc, ok = items[0].(*storagev1.StorageClass)
-		framework.ExpectEqual(ok, true, "storage class from %s", d.StorageClass.FromFile)
+		if !ok {
+			framework.Failf("storage class from %s", d.StorageClass.FromFile)
+		}
 	}
 
-	framework.ExpectNotEqual(sc, nil, "storage class is unexpectantly nil")
+	gomega.Expect(sc).ToNot(gomega.BeNil(), "storage class is unexpectantly nil")
 
 	if fsType != "" {
 		if sc.Parameters == nil {
@@ -303,7 +338,7 @@ func (d *driverDefinition) GetDynamicProvisionStorageClass(e2econfig *storagefra
 }
 
 func (d *driverDefinition) GetTimeouts() *framework.TimeoutContext {
-	timeouts := framework.NewTimeoutContextWithDefaults()
+	timeouts := framework.NewTimeoutContext()
 	if d.Timeouts == nil {
 		return timeouts
 	}
@@ -339,7 +374,7 @@ func (d *driverDefinition) GetTimeouts() *framework.TimeoutContext {
 }
 
 func loadSnapshotClass(filename string) (*unstructured.Unstructured, error) {
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +387,7 @@ func loadSnapshotClass(filename string) (*unstructured.Unstructured, error) {
 	return snapshotClass, nil
 }
 
-func (d *driverDefinition) GetSnapshotClass(e2econfig *storageframework.PerTestConfig, parameters map[string]string) *unstructured.Unstructured {
+func (d *driverDefinition) GetSnapshotClass(ctx context.Context, e2econfig *storageframework.PerTestConfig, parameters map[string]string) *unstructured.Unstructured {
 	if !d.SnapshotClass.FromName && d.SnapshotClass.FromFile == "" && d.SnapshotClass.FromExistingClassName == "" {
 		e2eskipper.Skipf("Driver %q does not support snapshotting - skipping", d.DriverInfo.Name)
 	}
@@ -365,7 +400,7 @@ func (d *driverDefinition) GetSnapshotClass(e2econfig *storageframework.PerTestC
 	case d.SnapshotClass.FromName:
 		// Do nothing (just use empty parameters)
 	case d.SnapshotClass.FromExistingClassName != "":
-		snapshotClass, err := f.DynamicClient.Resource(utils.SnapshotClassGVR).Get(context.TODO(), d.SnapshotClass.FromExistingClassName, metav1.GetOptions{})
+		snapshotClass, err := f.DynamicClient.Resource(utils.SnapshotClassGVR).Get(ctx, d.SnapshotClass.FromExistingClassName, metav1.GetOptions{})
 		framework.ExpectNoError(err, "getting snapshot class %s", d.SnapshotClass.FromExistingClassName)
 
 		if params, ok := snapshotClass.Object["parameters"].(map[string]interface{}); ok {
@@ -395,6 +430,43 @@ func (d *driverDefinition) GetSnapshotClass(e2econfig *storageframework.PerTestC
 	return utils.GenerateSnapshotClassSpec(snapshotter, parameters, ns)
 }
 
+func (d *driverDefinition) GetVolumeAttributesClass(ctx context.Context, e2econfig *storageframework.PerTestConfig) *storagev1beta1.VolumeAttributesClass {
+	if !d.VolumeAttributesClass.FromName && d.VolumeAttributesClass.FromFile == "" && d.VolumeAttributesClass.FromExistingClassName == "" {
+		e2eskipper.Skipf("Driver %q has no configured VolumeAttributesClass - skipping", d.DriverInfo.Name)
+		return nil
+	}
+
+	var (
+		vac *storagev1beta1.VolumeAttributesClass
+		err error
+	)
+
+	f := e2econfig.Framework
+	switch {
+	case d.VolumeAttributesClass.FromName:
+		vac = &storagev1beta1.VolumeAttributesClass{DriverName: d.DriverInfo.Name}
+	case d.VolumeAttributesClass.FromExistingClassName != "":
+		vac, err = f.ClientSet.StorageV1beta1().VolumeAttributesClasses().Get(ctx, d.VolumeAttributesClass.FromExistingClassName, metav1.GetOptions{})
+		framework.ExpectNoError(err, "getting VolumeAttributesClass %s", d.VolumeAttributesClass.FromExistingClassName)
+	case d.VolumeAttributesClass.FromFile != "":
+		var ok bool
+		items, err := utils.LoadFromManifests(d.VolumeAttributesClass.FromFile)
+		framework.ExpectNoError(err, "load VolumeAttributesClass from %s", d.VolumeAttributesClass.FromFile)
+		gomega.Expect(items).To(gomega.HaveLen(1), "exactly one item from %s", d.VolumeAttributesClass.FromFile)
+		err = utils.PatchItems(f, f.Namespace, items...)
+		framework.ExpectNoError(err, "patch VolumeAttributesClass from %s", d.VolumeAttributesClass.FromFile)
+
+		vac, ok = items[0].(*storagev1beta1.VolumeAttributesClass)
+		if !ok {
+			framework.Failf("cast VolumeAttributesClass from %s", d.VolumeAttributesClass.FromFile)
+		}
+	}
+
+	gomega.Expect(vac).ToNot(gomega.BeNil(), "VolumeAttributesClass is unexpectantly nil")
+
+	return storageframework.CopyVolumeAttributesClass(vac, f.Namespace.Name, "e2e-vac")
+}
+
 func (d *driverDefinition) GetVolume(e2econfig *storageframework.PerTestConfig, volumeNumber int) (map[string]string, bool, bool) {
 	if len(d.InlineVolumes) == 0 {
 		e2eskipper.Skipf("%s does not have any InlineVolumeAttributes defined", d.DriverInfo.Name)
@@ -407,12 +479,19 @@ func (d *driverDefinition) GetCSIDriverName(e2econfig *storageframework.PerTestC
 	return d.DriverInfo.Name
 }
 
-func (d *driverDefinition) PrepareTest(f *framework.Framework) (*storageframework.PerTestConfig, func()) {
+func (d *driverDefinition) PrepareTest(ctx context.Context, f *framework.Framework) *storageframework.PerTestConfig {
 	e2econfig := &storageframework.PerTestConfig{
 		Driver:              d,
 		Prefix:              "external",
 		Framework:           f,
 		ClientNodeSelection: e2epod.NodeSelection{Name: d.ClientNodeName},
 	}
-	return e2econfig, func() {}
+
+	if framework.NodeOSDistroIs("windows") {
+		e2econfig.ClientNodeSelection.Selector = map[string]string{"kubernetes.io/os": "windows"}
+	} else {
+		e2econfig.ClientNodeSelection.Selector = map[string]string{"kubernetes.io/os": "linux"}
+	}
+
+	return e2econfig
 }

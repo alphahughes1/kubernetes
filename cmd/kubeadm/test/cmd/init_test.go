@@ -19,21 +19,31 @@ package kubeadm
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/lithammer/dedent"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
+
+	"k8s.io/apimachinery/pkg/util/version"
 )
 
-func runKubeadmInit(args ...string) (string, string, int, error) {
-	const dryRunDir = "KUBEADM_INIT_DRYRUN_DIR"
-	if err := os.Setenv(dryRunDir, os.TempDir()); err != nil {
-		panic(fmt.Sprintf("could not set the %s environment variable", dryRunDir))
-	}
+func runKubeadmInit(t testing.TB, args ...string) (string, string, int, error) {
+	t.Helper()
+	t.Setenv("KUBEADM_INIT_DRYRUN_DIR", os.TempDir())
 	kubeadmPath := getKubeadmPath()
 	kubeadmArgs := []string{"init", "--dry-run", "--ignore-preflight-errors=all"}
 	kubeadmArgs = append(kubeadmArgs, args...)
 	return RunCmd(kubeadmPath, kubeadmArgs...)
+}
+
+func getKubeadmVersion() *version.Version {
+	kubeadmPath := getKubeadmPath()
+	kubeadmArgs := []string{"version", "-o=short"}
+	out, _, _, err := RunCmd(kubeadmPath, kubeadmArgs...)
+	if err != nil {
+		panic(fmt.Sprintf("could not run 'kubeadm version -o=short': %v", err))
+	}
+	return version.MustParseSemantic(strings.TrimSpace(out))
 }
 
 func TestCmdInitToken(t *testing.T) {
@@ -61,7 +71,7 @@ func TestCmdInitToken(t *testing.T) {
 
 	for _, rt := range initTest {
 		t.Run(rt.name, func(t *testing.T) {
-			_, _, _, err := runKubeadmInit(rt.args)
+			_, _, _, err := runKubeadmInit(t, rt.args)
 			if (err == nil) != rt.expected {
 				t.Fatalf(dedent.Dedent(`
 					CmdInitToken test case %q failed with an error: %v
@@ -93,14 +103,14 @@ func TestCmdInitKubernetesVersion(t *testing.T) {
 		},
 		{
 			name:     "valid version is accepted",
-			args:     "--kubernetes-version=" + constants.CurrentKubernetesVersion.String(),
+			args:     "--kubernetes-version=" + getKubeadmVersion().String(),
 			expected: true,
 		},
 	}
 
 	for _, rt := range initTest {
 		t.Run(rt.name, func(t *testing.T) {
-			_, _, _, err := runKubeadmInit(rt.args)
+			_, _, _, err := runKubeadmInit(t, rt.args)
 			if (err == nil) != rt.expected {
 				t.Fatalf(dedent.Dedent(`
 					CmdInitKubernetesVersion test case %q failed with an error: %v
@@ -136,18 +146,18 @@ func TestCmdInitConfig(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "don't allow mixed arguments v1beta2",
-			args:     "--kubernetes-version=1.11.0 --config=testdata/init/v1beta2.yaml",
-			expected: false,
-		},
-		{
-			name:     "can load v1beta2 config",
+			name:     "can't load v1beta2 config",
 			args:     "--config=testdata/init/v1beta2.yaml",
-			expected: true,
+			expected: false,
 		},
 		{
 			name:     "can load v1beta3 config",
 			args:     "--config=testdata/init/v1beta3.yaml",
+			expected: true,
+		},
+		{
+			name:     "can load v1beta4 config",
+			args:     "--config=testdata/init/v1beta4.yaml",
 			expected: true,
 		},
 		{
@@ -169,7 +179,7 @@ func TestCmdInitConfig(t *testing.T) {
 
 	for _, rt := range initTest {
 		t.Run(rt.name, func(t *testing.T) {
-			_, _, _, err := runKubeadmInit(rt.args)
+			_, _, _, err := runKubeadmInit(t, rt.args)
 			if (err == nil) != rt.expected {
 				t.Fatalf(dedent.Dedent(`
 						CmdInitConfig test case %q failed with an error: %v
@@ -218,7 +228,7 @@ func TestCmdInitAPIPort(t *testing.T) {
 
 	for _, rt := range initTest {
 		t.Run(rt.name, func(t *testing.T) {
-			_, _, _, err := runKubeadmInit(rt.args)
+			_, _, _, err := runKubeadmInit(t, rt.args)
 			if (err == nil) != rt.expected {
 				t.Fatalf(dedent.Dedent(`
 							CmdInitAPIPort test case %q failed with an error: %v
@@ -253,10 +263,6 @@ func TestCmdInitFeatureGates(t *testing.T) {
 			args: "",
 		},
 		{
-			name: "feature gate IPv6DualStack=false",
-			args: "--feature-gates=IPv6DualStack=false",
-		},
-		{
 			name: "feature gate PublicKeysECDSA=true",
 			args: "--feature-gates=PublicKeysECDSA=true",
 		},
@@ -264,7 +270,7 @@ func TestCmdInitFeatureGates(t *testing.T) {
 
 	for _, rt := range initTest {
 		t.Run(rt.name, func(t *testing.T) {
-			_, _, exitcode, err := runKubeadmInit(rt.args)
+			_, _, exitcode, err := runKubeadmInit(t, rt.args)
 			if exitcode == PanicExitcode {
 				t.Fatalf(dedent.Dedent(`
 							CmdInitFeatureGates test case %q failed with an error: %v

@@ -19,112 +19,31 @@ limitations under the License.
 package fake
 
 import (
-	"context"
-
-	crv1 "k8s.io/apiextensions-apiserver/examples/client-go/pkg/apis/cr/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	labels "k8s.io/apimachinery/pkg/labels"
-	schema "k8s.io/apimachinery/pkg/runtime/schema"
-	types "k8s.io/apimachinery/pkg/types"
-	watch "k8s.io/apimachinery/pkg/watch"
-	testing "k8s.io/client-go/testing"
+	v1 "k8s.io/apiextensions-apiserver/examples/client-go/pkg/apis/cr/v1"
+	crv1 "k8s.io/apiextensions-apiserver/examples/client-go/pkg/client/applyconfiguration/cr/v1"
+	typedcrv1 "k8s.io/apiextensions-apiserver/examples/client-go/pkg/client/clientset/versioned/typed/cr/v1"
+	gentype "k8s.io/client-go/gentype"
 )
 
-// FakeExamples implements ExampleInterface
-type FakeExamples struct {
+// fakeExamples implements ExampleInterface
+type fakeExamples struct {
+	*gentype.FakeClientWithListAndApply[*v1.Example, *v1.ExampleList, *crv1.ExampleApplyConfiguration]
 	Fake *FakeCrV1
-	ns   string
 }
 
-var examplesResource = schema.GroupVersionResource{Group: "cr.example.apiextensions.k8s.io", Version: "v1", Resource: "examples"}
-
-var examplesKind = schema.GroupVersionKind{Group: "cr.example.apiextensions.k8s.io", Version: "v1", Kind: "Example"}
-
-// Get takes name of the example, and returns the corresponding example object, and an error if there is any.
-func (c *FakeExamples) Get(ctx context.Context, name string, options v1.GetOptions) (result *crv1.Example, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewGetAction(examplesResource, c.ns, name), &crv1.Example{})
-
-	if obj == nil {
-		return nil, err
+func newFakeExamples(fake *FakeCrV1, namespace string) typedcrv1.ExampleInterface {
+	return &fakeExamples{
+		gentype.NewFakeClientWithListAndApply[*v1.Example, *v1.ExampleList, *crv1.ExampleApplyConfiguration](
+			fake.Fake,
+			namespace,
+			v1.SchemeGroupVersion.WithResource("examples"),
+			v1.SchemeGroupVersion.WithKind("Example"),
+			func() *v1.Example { return &v1.Example{} },
+			func() *v1.ExampleList { return &v1.ExampleList{} },
+			func(dst, src *v1.ExampleList) { dst.ListMeta = src.ListMeta },
+			func(list *v1.ExampleList) []*v1.Example { return gentype.ToPointerSlice(list.Items) },
+			func(list *v1.ExampleList, items []*v1.Example) { list.Items = gentype.FromPointerSlice(items) },
+		),
+		fake,
 	}
-	return obj.(*crv1.Example), err
-}
-
-// List takes label and field selectors, and returns the list of Examples that match those selectors.
-func (c *FakeExamples) List(ctx context.Context, opts v1.ListOptions) (result *crv1.ExampleList, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewListAction(examplesResource, examplesKind, c.ns, opts), &crv1.ExampleList{})
-
-	if obj == nil {
-		return nil, err
-	}
-
-	label, _, _ := testing.ExtractFromListOptions(opts)
-	if label == nil {
-		label = labels.Everything()
-	}
-	list := &crv1.ExampleList{ListMeta: obj.(*crv1.ExampleList).ListMeta}
-	for _, item := range obj.(*crv1.ExampleList).Items {
-		if label.Matches(labels.Set(item.Labels)) {
-			list.Items = append(list.Items, item)
-		}
-	}
-	return list, err
-}
-
-// Watch returns a watch.Interface that watches the requested examples.
-func (c *FakeExamples) Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
-	return c.Fake.
-		InvokesWatch(testing.NewWatchAction(examplesResource, c.ns, opts))
-
-}
-
-// Create takes the representation of a example and creates it.  Returns the server's representation of the example, and an error, if there is any.
-func (c *FakeExamples) Create(ctx context.Context, example *crv1.Example, opts v1.CreateOptions) (result *crv1.Example, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewCreateAction(examplesResource, c.ns, example), &crv1.Example{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*crv1.Example), err
-}
-
-// Update takes the representation of a example and updates it. Returns the server's representation of the example, and an error, if there is any.
-func (c *FakeExamples) Update(ctx context.Context, example *crv1.Example, opts v1.UpdateOptions) (result *crv1.Example, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateAction(examplesResource, c.ns, example), &crv1.Example{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*crv1.Example), err
-}
-
-// Delete takes name of the example and deletes it. Returns an error if one occurs.
-func (c *FakeExamples) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
-	_, err := c.Fake.
-		Invokes(testing.NewDeleteAction(examplesResource, c.ns, name), &crv1.Example{})
-
-	return err
-}
-
-// DeleteCollection deletes a collection of objects.
-func (c *FakeExamples) DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error {
-	action := testing.NewDeleteCollectionAction(examplesResource, c.ns, listOpts)
-
-	_, err := c.Fake.Invokes(action, &crv1.ExampleList{})
-	return err
-}
-
-// Patch applies the patch and returns the patched example.
-func (c *FakeExamples) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *crv1.Example, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(examplesResource, c.ns, name, pt, data, subresources...), &crv1.Example{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*crv1.Example), err
 }

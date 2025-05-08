@@ -19,22 +19,33 @@ package apimachinery
 import (
 	"context"
 	"fmt"
-	"strconv"
 
-	g "github.com/onsi/ginkgo"
+	g "github.com/onsi/ginkgo/v2"
 	o "github.com/onsi/gomega"
 
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
 	"k8s.io/client-go/kubernetes"
-
+	aggregatorclientset "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
+	imageutils "k8s.io/kubernetes/test/utils/image"
+	admissionapi "k8s.io/pod-security-admission/api"
+	samplev1alpha1 "k8s.io/sample-apiserver/pkg/apis/wardle/v1alpha1"
+	samplev1alpha1client "k8s.io/sample-apiserver/pkg/generated/clientset/versioned/typed/wardle/v1alpha1"
 )
 
 var _ = SIGDescribe("client-go should negotiate", func() {
 	f := framework.NewDefaultFramework("protocol")
-	f.SkipNamespaceCreation = true
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
 	for _, s := range []string{
 		"application/json",
@@ -44,22 +55,33 @@ var _ = SIGDescribe("client-go should negotiate", func() {
 	} {
 		accept := s
 		g.It(fmt.Sprintf("watch and report errors with accept %q", accept), func() {
+			g.By("creating an object for which we will watch")
+			ns := f.Namespace.Name
+			client := f.ClientSet.CoreV1().ConfigMaps(ns)
+			configMapName := "e2e-client-go-test-negotiation"
+			testConfigMap := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: configMapName}}
+			before, err := client.List(context.TODO(), metav1.ListOptions{})
+			framework.ExpectNoError(err)
+			_, err = client.Create(context.TODO(), testConfigMap, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+			opts := metav1.ListOptions{
+				ResourceVersion: before.ResourceVersion,
+				FieldSelector:   fields.SelectorFromSet(fields.Set{"metadata.name": configMapName}).String(),
+			}
+
+			g.By("watching for changes on the object")
 			cfg, err := framework.LoadConfig()
 			framework.ExpectNoError(err)
 
 			cfg.AcceptContentTypes = accept
 
 			c := kubernetes.NewForConfigOrDie(cfg)
-			svcs, err := c.CoreV1().Services("default").Get(context.TODO(), "kubernetes", metav1.GetOptions{})
-			framework.ExpectNoError(err)
-			rv, err := strconv.Atoi(svcs.ResourceVersion)
-			framework.ExpectNoError(err)
-			w, err := c.CoreV1().Services("default").Watch(context.TODO(), metav1.ListOptions{ResourceVersion: strconv.Itoa(rv - 1)})
+			w, err := c.CoreV1().ConfigMaps(ns).Watch(context.TODO(), opts)
 			framework.ExpectNoError(err)
 			defer w.Stop()
 
 			evt, ok := <-w.ResultChan()
-			o.Expect(ok).To(o.BeTrue())
+			o.Expect(ok).To(o.BeTrueBecause("unexpected watch event: %v, %#v", evt.Type, evt.Object))
 			switch evt.Type {
 			case watch.Added, watch.Modified:
 				// this is allowed
@@ -82,4 +104,68 @@ var _ = SIGDescribe("client-go should negotiate", func() {
 			}
 		})
 	}
+})
+
+var _ = SIGDescribe("CBOR", feature.CBOR, func() {
+	f := framework.NewDefaultFramework("cbor")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
+
+	// Must be serial to avoid conflict with other tests that set up a sample apiserver.
+	f.It("clients remain compatible with the 1.17 sample-apiserver", f.WithSerial(), func(ctx context.Context) {
+		clientfeaturestesting.SetFeatureDuringTest(g.GinkgoTB(), clientfeatures.ClientsAllowCBOR, true)
+		clientfeaturestesting.SetFeatureDuringTest(g.GinkgoTB(), clientfeatures.ClientsPreferCBOR, true)
+
+		clientConfig, err := framework.LoadConfig()
+		framework.ExpectNoError(err)
+
+		aggregatorClient, err := aggregatorclientset.NewForConfig(clientConfig)
+		framework.ExpectNoError(err)
+
+		dynamicClient, err := dynamic.NewForConfig(clientConfig)
+		framework.ExpectNoError(err)
+
+		objectNames := generateSampleAPIServerObjectNames(f.Namespace.Name)
+		g.DeferCleanup(func(ctx context.Context) {
+			cleanupSampleAPIServer(ctx, f.ClientSet, aggregatorClient, objectNames, samplev1alpha1.SchemeGroupVersion.Version+"."+samplev1alpha1.SchemeGroupVersion.Group)
+		})
+		SetUpSampleAPIServer(ctx, f, aggregatorClient, imageutils.GetE2EImage(imageutils.APIServer), objectNames, samplev1alpha1.SchemeGroupVersion.Group, samplev1alpha1.SchemeGroupVersion.Version)
+
+		flunder := samplev1alpha1.Flunder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-flunder",
+			},
+		}
+
+		g.By("making requests with a generated client", func() {
+			sampleClient, err := samplev1alpha1client.NewForConfig(clientConfig)
+			framework.ExpectNoError(err)
+
+			_, err = sampleClient.Flunders(f.Namespace.Name).List(ctx, metav1.ListOptions{LabelSelector: "a,!a"})
+			framework.ExpectNoError(err, "Failed to list with generated client")
+
+			_, err = sampleClient.Flunders(f.Namespace.Name).Create(ctx, &flunder, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+			o.Expect(err).To(o.MatchError(apierrors.IsUnsupportedMediaType, "Expected 415 (Unsupported Media Type) response on first write with generated client"))
+
+			_, err = sampleClient.Flunders(f.Namespace.Name).Create(ctx, &flunder, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+			framework.ExpectNoError(err, "Expected subsequent writes to succeed with generated client")
+		})
+
+		g.By("making requests with a dynamic client", func() {
+			unstructuredFlunderContent, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&flunder)
+			framework.ExpectNoError(err)
+			unstructuredFlunder := &unstructured.Unstructured{Object: unstructuredFlunderContent}
+
+			flunderDynamicClient := dynamicClient.Resource(samplev1alpha1.SchemeGroupVersion.WithResource("flunders")).Namespace(f.Namespace.Name)
+
+			list, err := flunderDynamicClient.List(ctx, metav1.ListOptions{LabelSelector: "a,!a"})
+			framework.ExpectNoError(err, "Failed to list with dynamic client")
+			o.Expect(list.GetObjectKind().GroupVersionKind()).To(o.Equal(samplev1alpha1.SchemeGroupVersion.WithKind("FlunderList")))
+
+			_, err = flunderDynamicClient.Create(ctx, unstructuredFlunder, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+			o.Expect(err).To(o.MatchError(apierrors.IsUnsupportedMediaType, "Expected 415 (Unsupported Media Type) response on first write with dynamic client"))
+
+			_, err = flunderDynamicClient.Create(ctx, unstructuredFlunder, metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+			framework.ExpectNoError(err, "Expected subsequent writes to succeed with dynamic client")
+		})
+	})
 })

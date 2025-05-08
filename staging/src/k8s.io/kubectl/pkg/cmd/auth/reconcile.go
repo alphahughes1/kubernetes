@@ -28,6 +28,7 @@ import (
 	rbacv1alpha1 "k8s.io/api/rbac/v1alpha1"
 	rbacv1beta1 "k8s.io/api/rbac/v1beta1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/cli-runtime/pkg/resource"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -53,12 +54,12 @@ type ReconcileOptions struct {
 
 	PrintObject printers.ResourcePrinterFunc
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 var (
 	reconcileLong = templates.LongDesc(`
-		Reconciles rules for RBAC Role, RoleBinding, ClusterRole, and ClusterRoleBinding objects.
+		Reconciles rules for RBAC role, role binding, cluster role, and cluster role binding objects.
 
 		Missing objects are created, and the containing namespace is created for namespaced objects, if required.
 
@@ -71,12 +72,12 @@ var (
 		This is preferred to 'apply' for RBAC resources so that semantically-aware merging of rules and subjects is done.`)
 
 	reconcileExample = templates.Examples(`
-		# Reconcile rbac resources from a file
+		# Reconcile RBAC resources from a file
 		kubectl auth reconcile -f my-rbac-rules.yaml`)
 )
 
 // NewReconcileOptions returns a new ReconcileOptions instance
-func NewReconcileOptions(ioStreams genericclioptions.IOStreams) *ReconcileOptions {
+func NewReconcileOptions(ioStreams genericiooptions.IOStreams) *ReconcileOptions {
 	return &ReconcileOptions{
 		FilenameOptions: &resource.FilenameOptions{},
 		PrintFlags:      genericclioptions.NewPrintFlags("reconciled").WithTypeSetter(scheme.Scheme),
@@ -85,13 +86,13 @@ func NewReconcileOptions(ioStreams genericclioptions.IOStreams) *ReconcileOption
 }
 
 // NewCmdReconcile holds the options for 'auth reconcile' sub command
-func NewCmdReconcile(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdReconcile(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	o := NewReconcileOptions(streams)
 
 	cmd := &cobra.Command{
 		Use:                   "reconcile -f FILENAME",
 		DisableFlagsInUseLine: true,
-		Short:                 "Reconciles rules for RBAC Role, RoleBinding, ClusterRole, and ClusterRoleBinding objects",
+		Short:                 "Reconciles rules for RBAC role, role binding, cluster role, and cluster role binding objects",
 		Long:                  reconcileLong,
 		Example:               reconcileExample,
 		Run: func(cmd *cobra.Command, args []string) {

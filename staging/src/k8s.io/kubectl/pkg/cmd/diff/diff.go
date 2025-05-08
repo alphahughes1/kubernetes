@@ -19,7 +19,6 @@ package diff
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,10 +32,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/resource"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/openapi3"
 	"k8s.io/klog/v2"
 	"k8s.io/kubectl/pkg/cmd/apply"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
@@ -44,6 +43,7 @@ import (
 	"k8s.io/kubectl/pkg/util"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/openapi"
+	"k8s.io/kubectl/pkg/util/prune"
 	"k8s.io/kubectl/pkg/util/templates"
 	"k8s.io/utils/exec"
 	"sigs.k8s.io/yaml"
@@ -51,17 +51,17 @@ import (
 
 var (
 	diffLong = templates.LongDesc(i18n.T(`
-		Diff configurations specified by filename or stdin between the current online
+		Diff configurations specified by file name or stdin between the current online
 		configuration, and the configuration as it would be if applied.
 
-		Output is always YAML.
+		The output is always YAML.
 
 		KUBECTL_EXTERNAL_DIFF environment variable can be used to select your own
 		diff command. Users can use external commands with params too, example:
 		KUBECTL_EXTERNAL_DIFF="colordiff -N -u"
 
 		By default, the "diff" command available in your path will be
-		run with "-u" (unified diff) and "-N" (treat absent files as empty) options.
+		run with the "-u" (unified diff) and "-N" (treat absent files as empty) options.
 
 		Exit status:
 		 0
@@ -74,7 +74,7 @@ var (
 		Note: KUBECTL_EXTERNAL_DIFF, if used, is expected to follow that convention.`))
 
 	diffExample = templates.Examples(i18n.T(`
-		# Diff resources included in pod.json.
+		# Diff resources included in pod.json
 		kubectl diff -f pod.json
 
 		# Diff file read from stdin
@@ -103,29 +103,26 @@ func diffError(err error) exec.ExitError {
 type DiffOptions struct {
 	FilenameOptions resource.FilenameOptions
 
-	ServerSideApply bool
-	FieldManager    string
-	ForceConflicts  bool
+	ServerSideApply   bool
+	FieldManager      string
+	ForceConflicts    bool
+	ShowManagedFields bool
 
+	Concurrency      int
 	Selector         string
-	OpenAPISchema    openapi.Resources
-	DiscoveryClient  discovery.DiscoveryInterface
+	OpenAPIGetter    openapi.OpenAPIResourcesGetter
+	OpenAPIV3Root    openapi3.Root
 	DynamicClient    dynamic.Interface
-	DryRunVerifier   *resource.DryRunVerifier
 	CmdNamespace     string
 	EnforceNamespace bool
 	Builder          *resource.Builder
 	Diff             *DiffProgram
+
+	pruner  *pruner
+	tracker *tracker
 }
 
-func validateArgs(cmd *cobra.Command, args []string) error {
-	if len(args) != 0 {
-		return cmdutil.UsageErrorf(cmd, "Unexpected args: %v", args)
-	}
-	return nil
-}
-
-func NewDiffOptions(ioStreams genericclioptions.IOStreams) *DiffOptions {
+func NewDiffOptions(ioStreams genericiooptions.IOStreams) *DiffOptions {
 	return &DiffOptions{
 		Diff: &DiffProgram{
 			Exec:      exec.New(),
@@ -134,17 +131,17 @@ func NewDiffOptions(ioStreams genericclioptions.IOStreams) *DiffOptions {
 	}
 }
 
-func NewCmdDiff(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdDiff(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	options := NewDiffOptions(streams)
 	cmd := &cobra.Command{
 		Use:                   "diff -f FILENAME",
 		DisableFlagsInUseLine: true,
-		Short:                 i18n.T("Diff live version against would-be applied version"),
+		Short:                 i18n.T("Diff the live version against a would-be applied version"),
 		Long:                  diffLong,
 		Example:               diffExample,
 		Run: func(cmd *cobra.Command, args []string) {
-			cmdutil.CheckDiffErr(options.Complete(f, cmd))
-			cmdutil.CheckDiffErr(validateArgs(cmd, args))
+			cmdutil.CheckDiffErr(options.Complete(f, cmd, args))
+			cmdutil.CheckDiffErr(options.Validate())
 			// `kubectl diff` propagates the error code from
 			// diff or `KUBECTL_EXTERNAL_DIFF`. Also, we
 			// don't want to print an error if diff returns
@@ -153,18 +150,30 @@ func NewCmdDiff(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.C
 			// return 1 if there was a problem.
 			if err := options.Run(); err != nil {
 				if exitErr := diffError(err); exitErr != nil {
-					os.Exit(exitErr.ExitStatus())
+					cmdutil.CheckErr(cmdutil.ErrExit)
 				}
 				cmdutil.CheckDiffErr(err)
 			}
 		},
 	}
 
+	// Flag errors exit with code 1, however according to the diff
+	// command it means changes were found.
+	// Thus, it should return status code greater than 1.
+	cmd.SetFlagErrorFunc(func(command *cobra.Command, err error) error {
+		cmdutil.CheckDiffErr(cmdutil.UsageErrorf(cmd, "%s", err.Error()))
+		return nil
+	})
+
 	usage := "contains the configuration to diff"
-	cmd.Flags().StringVarP(&options.Selector, "selector", "l", options.Selector, "Selector (label query) to filter on, supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2)")
+	cmd.Flags().StringArray("prune-allowlist", []string{}, "Overwrite the default allowlist with <group/version/kind> for --prune")
+	cmd.Flags().Bool("prune", false, "Include resources that would be deleted by pruning. Can be used with -l and default shows all resources would be pruned")
+	cmd.Flags().BoolVar(&options.ShowManagedFields, "show-managed-fields", options.ShowManagedFields, "If true, include managed fields in the diff.")
+	cmd.Flags().IntVar(&options.Concurrency, "concurrency", 1, "Number of objects to process in parallel when diffing against the live version. Larger number = faster, but more memory, I/O and CPU over that shorter period of time.")
 	cmdutil.AddFilenameOptionFlags(cmd, &options.FilenameOptions, usage)
 	cmdutil.AddServerSideApplyFlags(cmd)
 	cmdutil.AddFieldManagerFlagVar(cmd, &options.FieldManager, apply.FieldManagerClientSideApply)
+	cmdutil.AddLabelSelectorFlagVar(cmd, &options.Selector)
 
 	return cmd
 }
@@ -174,7 +183,7 @@ func NewCmdDiff(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.C
 // program. By default, `diff(1)` will be used.
 type DiffProgram struct {
 	Exec exec.Interface
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 func (d *DiffProgram) getCommand(args ...string) (string, exec.Cmd) {
@@ -281,7 +290,7 @@ type Directory struct {
 // CreateDirectory does create the actual disk directory, and return a
 // new representation of it.
 func CreateDirectory(prefix string) (*Directory, error) {
-	name, err := ioutil.TempDir("", prefix+"-")
+	name, err := os.MkdirTemp("", prefix+"-")
 	if err != nil {
 		return nil, err
 	}
@@ -316,12 +325,13 @@ type InfoObject struct {
 	LocalObj        runtime.Object
 	Info            *resource.Info
 	Encoder         runtime.Encoder
-	OpenAPI         openapi.Resources
+	OpenAPIGetter   openapi.OpenAPIResourcesGetter
+	OpenAPIV3Root   openapi3.Root
 	Force           bool
 	ServerSideApply bool
 	FieldManager    string
 	ForceConflicts  bool
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 var _ Object = &InfoObject{}
@@ -388,7 +398,8 @@ func (obj InfoObject) Merged() (runtime.Object, error) {
 		Helper:          helper,
 		Overwrite:       true,
 		BackOff:         clockwork.NewRealClock(),
-		OpenapiSchema:   obj.OpenAPI,
+		OpenAPIGetter:   obj.OpenAPIGetter,
+		OpenAPIV3Root:   obj.OpenAPIV3Root,
 		ResourceVersion: resourceVersion,
 	}
 
@@ -552,7 +563,7 @@ func NewDiffer(from, to string) (*Differ, error) {
 }
 
 // Diff diffs to versions of a specific object, and print both versions to directories.
-func (d *Differ) Diff(obj Object, printer Printer) error {
+func (d *Differ) Diff(obj Object, printer Printer, showManagedFields bool) error {
 	from, err := d.From.getObject(obj)
 	if err != nil {
 		return err
@@ -560,6 +571,11 @@ func (d *Differ) Diff(obj Object, printer Printer) error {
 	to, err := d.To.getObject(obj)
 	if err != nil {
 		return err
+	}
+
+	if !showManagedFields {
+		from = omitManagedFields(from)
+		to = omitManagedFields(to)
 	}
 
 	// Mask secret values if object is V1Secret
@@ -580,6 +596,16 @@ func (d *Differ) Diff(obj Object, printer Printer) error {
 	return nil
 }
 
+func omitManagedFields(o runtime.Object) runtime.Object {
+	a, err := meta.Accessor(o)
+	if err != nil {
+		// The object is not a `metav1.Object`, ignore it.
+		return o
+	}
+	a.SetManagedFields(nil)
+	return o
+}
+
 // Run runs the diff program against both directories.
 func (d *Differ) Run(diff *DiffProgram) error {
 	return diff.Run(d.From.Dir.Name, d.To.Dir.Name)
@@ -595,7 +621,11 @@ func isConflict(err error) bool {
 	return err != nil && errors.IsConflict(err)
 }
 
-func (o *DiffOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
+func (o *DiffOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []string) error {
+	if len(args) != 0 {
+		return cmdutil.UsageErrorf(cmd, "Unexpected args: %v", args)
+	}
+
 	var err error
 
 	err = o.FilenameOptions.RequireFilenameOrKustomize()
@@ -611,15 +641,15 @@ func (o *DiffOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
 	}
 
 	if !o.ServerSideApply {
-		o.OpenAPISchema, err = f.OpenAPISchema()
-		if err != nil {
-			return err
+		o.OpenAPIGetter = f
+		if !cmdutil.OpenAPIV3Patch.IsDisabled() {
+			openAPIV3Client, err := f.OpenAPIV3Client()
+			if err == nil {
+				o.OpenAPIV3Root = openapi3.NewRoot(openAPIV3Client)
+			} else {
+				klog.V(4).Infof("warning: OpenAPI V3 Patch is enabled but is unable to be loaded. Will fall back to OpenAPI V2")
+			}
 		}
-	}
-
-	o.DiscoveryClient, err = f.ToDiscoveryClient()
-	if err != nil {
-		return err
 	}
 
 	o.DynamicClient, err = f.DynamicClient()
@@ -627,18 +657,30 @@ func (o *DiffOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
 		return err
 	}
 
-	o.DryRunVerifier = resource.NewDryRunVerifier(o.DynamicClient, f.OpenAPIGetter())
-
 	o.CmdNamespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
 		return err
+	}
+
+	if cmdutil.GetFlagBool(cmd, "prune") {
+		mapper, err := f.ToRESTMapper()
+		if err != nil {
+			return err
+		}
+
+		resources, err := prune.ParseResources(mapper, cmdutil.GetFlagStringArray(cmd, "prune-allowlist"))
+		if err != nil {
+			return err
+		}
+		o.tracker = newTracker()
+		o.pruner = newPruner(o.DynamicClient, mapper, resources, o.Selector)
 	}
 
 	o.Builder = f.NewBuilder()
 	return nil
 }
 
-// RunDiff uses the factory to parse file arguments, find the version to
+// Run uses the factory to parse file arguments, find the version to
 // diff, and find each Info object for each files, and runs against the
 // differ.
 func (o *DiffOptions) Run() error {
@@ -652,6 +694,7 @@ func (o *DiffOptions) Run() error {
 
 	r := o.Builder.
 		Unstructured().
+		VisitorConcurrency(o.Concurrency).
 		NamespaceParam(o.CmdNamespace).DefaultNamespace().
 		FilenameParam(o.EnforceNamespace, &o.FilenameOptions).
 		LabelSelectorParam(o.Selector).
@@ -663,10 +706,6 @@ func (o *DiffOptions) Run() error {
 
 	err = r.Visit(func(info *resource.Info, err error) error {
 		if err != nil {
-			return err
-		}
-
-		if err := o.DryRunVerifier.HasSupport(info.Mapping.GroupVersionKind); err != nil {
 			return err
 		}
 
@@ -691,7 +730,8 @@ func (o *DiffOptions) Run() error {
 				LocalObj:        local,
 				Info:            info,
 				Encoder:         scheme.DefaultJSONEncoder(),
-				OpenAPI:         o.OpenAPISchema,
+				OpenAPIGetter:   o.OpenAPIGetter,
+				OpenAPIV3Root:   o.OpenAPIV3Root,
 				Force:           force,
 				ServerSideApply: o.ServerSideApply,
 				FieldManager:    o.FieldManager,
@@ -699,7 +739,11 @@ func (o *DiffOptions) Run() error {
 				IOStreams:       o.Diff.IOStreams,
 			}
 
-			err = differ.Diff(obj, printer)
+			if o.tracker != nil {
+				o.tracker.MarkVisited(info)
+			}
+
+			err = differ.Diff(obj, printer, o.ShowManagedFields)
 			if !isConflict(err) {
 				break
 			}
@@ -709,9 +753,57 @@ func (o *DiffOptions) Run() error {
 
 		return err
 	})
+
+	if o.pruner != nil {
+		prunedObjs, err := o.pruner.pruneAll(o.tracker, o.CmdNamespace != "")
+		if err != nil {
+			klog.Warningf("pruning failed and could not be evaluated err: %v", err)
+		}
+
+		// Print pruned objects into old file and thus, diff
+		// command will show them as pruned.
+		for _, p := range prunedObjs {
+			name, err := getObjectName(p)
+			if err != nil {
+				klog.Warningf("pruning failed and object name could not be retrieved: %v", err)
+				continue
+			}
+			if err := differ.From.Print(name, p, printer); err != nil {
+				return err
+			}
+		}
+	}
+
 	if err != nil {
 		return err
 	}
 
 	return differ.Run(o.Diff)
+}
+
+// Validate makes sure provided values for DiffOptions are valid
+func (o *DiffOptions) Validate() error {
+	return nil
+}
+
+func getObjectName(obj runtime.Object) (string, error) {
+	gvk := obj.GetObjectKind().GroupVersionKind()
+	metadata, err := meta.Accessor(obj)
+	if err != nil {
+		return "", err
+	}
+	name := metadata.GetName()
+	ns := metadata.GetNamespace()
+
+	group := ""
+	if gvk.Group != "" {
+		group = fmt.Sprintf("%v.", gvk.Group)
+	}
+	return group + fmt.Sprintf(
+		"%v.%v.%v.%v",
+		gvk.Version,
+		gvk.Kind,
+		ns,
+		name,
+	), nil
 }

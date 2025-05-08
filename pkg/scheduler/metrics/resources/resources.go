@@ -29,7 +29,7 @@ import (
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/component-base/metrics"
 
-	v1resource "k8s.io/kubernetes/pkg/api/v1/resource"
+	resourcehelper "k8s.io/component-helpers/resource"
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 )
 
@@ -57,7 +57,7 @@ var podResourceDesc = resourceMetricsDescriptors{
 			"Resources requested by workloads on the cluster, broken down by pod. This shows the resource usage the scheduler and kubelet expect per pod for resources along with the unit for the resource if any.",
 			[]string{"namespace", "pod", "node", "scheduler", "priority", "resource", "unit"},
 			nil,
-			metrics.ALPHA,
+			metrics.STABLE,
 			""),
 	},
 	limits: resourceLifecycleDescriptors{
@@ -65,7 +65,7 @@ var podResourceDesc = resourceMetricsDescriptors{
 			"Resources limit for workloads on the cluster, broken down by pod. This shows the resource usage the scheduler and kubelet expect per pod for resources along with the unit for the resource if any.",
 			[]string{"namespace", "pod", "node", "scheduler", "priority", "resource", "unit"},
 			nil,
-			metrics.ALPHA,
+			metrics.STABLE,
 			""),
 	},
 }
@@ -177,11 +177,11 @@ func recordMetricWithUnit(
 }
 
 // podRequestsAndLimitsByLifecycle returns a dictionary of all defined resources summed up for all
-// containers of the pod. If PodOverhead feature is enabled, pod overhead is added to the
+// containers of the pod. Pod overhead is added to the
 // total container resource requests and to the total container limits which have a
 // non-zero quantity. The caller may avoid allocations of resource lists by passing
 // a requests and limits list to the function, which will be cleared before use.
-// This method is the same as v1resource.PodRequestsAndLimits but avoids allocating in several
+// This method is the same as resourcehelper.PodRequestsAndLimits but avoids allocating in several
 // scenarios for efficiency.
 func podRequestsAndLimitsByLifecycle(pod *v1.Pod, reuseReqs, reuseLimits v1.ResourceList) (reqs, limits v1.ResourceList, terminal bool) {
 	switch {
@@ -196,6 +196,7 @@ func podRequestsAndLimitsByLifecycle(pod *v1.Pod, reuseReqs, reuseLimits v1.Reso
 		return
 	}
 
-	reqs, limits = v1resource.PodRequestsAndLimitsReuse(pod, reuseReqs, reuseLimits)
+	reqs = resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{Reuse: reuseReqs})
+	limits = resourcehelper.PodLimits(pod, resourcehelper.PodResourcesOptions{Reuse: reuseLimits})
 	return
 }

@@ -17,16 +17,22 @@ limitations under the License.
 package validation
 
 import (
-	"io/ioutil"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/pflag"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
-	"k8s.io/kubernetes/cmd/kubeadm/app/features"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 func TestValidateToken(t *testing.T) {
@@ -109,8 +115,9 @@ func TestValidateNodeRegistrationOptions(t *testing.T) {
 		{"valid-nodename", false},   // supported
 		// test cases for criSocket are covered in TestValidateSocketPath
 	}
+	criPath := fmt.Sprintf("%s:///some/path", kubeadmapiv1.DefaultContainerRuntimeURLScheme)
 	for _, rt := range tests {
-		nro := kubeadmapi.NodeRegistrationOptions{Name: rt.nodeName, CRISocket: "/some/path"}
+		nro := kubeadmapi.NodeRegistrationOptions{Name: rt.nodeName, CRISocket: criPath}
 		actual := ValidateNodeRegistrationOptions(&nro, field.NewPath("nodeRegistration"))
 		actualErrors := len(actual) > 0
 		if actualErrors != rt.expectedErrors {
@@ -183,43 +190,58 @@ func TestValidateIPFromString(t *testing.T) {
 	}
 }
 
-func TestValidateIPNetFromString(t *testing.T) {
+func TestValidatePort(t *testing.T) {
 	var tests = []struct {
-		name           string
-		subnet         string
-		minaddrs       int64
-		checkDualStack bool
-		expected       bool
+		name        string
+		port        int32
+		expectedErr bool
 	}{
-		{"invalid missing CIDR", "", 0, false, false},
-		{"invalid  CIDR", "a", 0, false, false},
-		{"invalid CIDR missing decimal points in IPv4 address and / mask", "1234", 0, false, false},
-		{"invalid CIDR use of letters instead of numbers and / mask", "abc", 0, false, false},
-		{"invalid IPv4 address provided instead of CIDR representation", "1.2.3.4", 0, false, false},
-		{"invalid IPv6 address provided instead of CIDR representation", "2001:db8::1", 0, false, false},
-		{"invalid multiple CIDR provided in a single stack cluster", "2001:db8::1/64,1.2.3.4/24", 0, false, false},
-		{"invalid multiple CIDR provided in a single stack cluster and one invalid subnet", "2001:db8::1/64,a", 0, false, false},
-		{"valid, but IPv4 CIDR too small. At least 10 addresses needed", "10.0.0.16/29", 10, false, false},
-		{"valid, but IPv6 CIDR too small. At least 10 addresses needed", "2001:db8::/125", 10, false, false},
-		{"valid IPv4 CIDR", "10.0.0.16/12", 10, false, true},
-		{"valid IPv6 CIDR", "2001:db8::/98", 10, false, true},
-		// dual-stack:
-		{"invalid missing CIDR", "", 0, true, false},
-		{"valid dual-stack enabled but only an IPv4 CIDR specified", "10.0.0.16/12", 10, true, true},
-		{"valid dual-stack enabled but only an IPv6 CIDR specified", "2001:db8::/98", 10, true, true},
-		{"invalid IPv4 address provided instead of CIDR representation", "1.2.3.4,2001:db8::/98", 0, true, false},
-		{"invalid IPv6 address provided instead of CIDR representation", "2001:db8::1,10.0.0.16/12", 0, true, false},
-		{"valid, but IPv4 CIDR too small. At least 10 addresses needed", "10.0.0.16/29,2001:db8::/98", 10, true, false},
-		{"valid, but IPv6 CIDR too small. At least 10 addresses needed", "10.0.0.16/12,2001:db8::/125", 10, true, false},
-		{"valid, but only IPv4 family addresses specified. IPv6 CIDR is necessary.", "10.0.0.16/12,192.168.0.0/16", 10, true, false},
-		{"valid, but only IPv6 family addresses specified. IPv4 CIDR is necessary.", "2001:db8::/98,2005:db8::/98", 10, true, false},
-		{"valid IPv4 and IPv6 CIDR", "10.0.0.16/12,2001:db8::/98", 10, true, true},
-		{"valid IPv6 and IPv4 CIDR", "10.0.0.16/12,2001:db8::/98", 10, true, true},
-		{"invalid IPv6 and IPv4 CIDR with more than 2 subnets", "10.0.0.16/12,2001:db8::/98,192.168.0.0/16", 10, true, false},
-		{"invalid IPv6 and IPv4 CIDR with more than 2 subnets", "10.0.0.16/12,2001:db8::/98,192.168.0.0/16,a.b.c.d/24", 10, true, false},
+		{"negative number port", -1234, true},
+		{"zero number port", 0, true},
+		{"minimum valid value port", 1, false},
+		{"valid value port", 300, false},
+		{"maximum valid value port", 65535, false},
+		{"if port greater than 65535", 65538, true},
 	}
 	for _, rt := range tests {
-		actual := ValidateIPNetFromString(rt.subnet, rt.minaddrs, rt.checkDualStack, nil)
+		t.Run(rt.name, func(t *testing.T) {
+			allErrs := ValidatePort(rt.port, nil)
+			if len(allErrs) > 0 {
+				find := strings.Contains(allErrs[0].Error(), "port number is not valid")
+				if find != rt.expectedErr {
+					t.Errorf(
+						"test case failed :\n\t   err(s): %v\n\t", allErrs[0].Error(),
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateIPNetFromString(t *testing.T) {
+	var tests = []struct {
+		name     string
+		subnet   string
+		minaddrs int64
+		expected bool
+	}{
+		// dual-stack:
+		{"invalid missing CIDR", "", 0, false},
+		{"valid dual-stack enabled but only an IPv4 CIDR specified", "10.0.0.16/12", 10, true},
+		{"valid dual-stack enabled but only an IPv6 CIDR specified", "2001:db8::/98", 10, true},
+		{"invalid IPv4 address provided instead of CIDR representation", "1.2.3.4,2001:db8::/98", 0, false},
+		{"invalid IPv6 address provided instead of CIDR representation", "2001:db8::1,10.0.0.16/12", 0, false},
+		{"valid, but IPv4 CIDR too small. At least 10 addresses needed", "10.0.0.16/29,2001:db8::/98", 10, false},
+		{"valid, but IPv6 CIDR too small. At least 10 addresses needed", "10.0.0.16/12,2001:db8::/125", 10, false},
+		{"valid, but only IPv4 family addresses specified. IPv6 CIDR is necessary.", "10.0.0.16/12,192.168.0.0/16", 10, false},
+		{"valid, but only IPv6 family addresses specified. IPv4 CIDR is necessary.", "2001:db8::/98,2005:db8::/98", 10, false},
+		{"valid IPv4 and IPv6 CIDR", "10.0.0.16/12,2001:db8::/98", 10, true},
+		{"valid IPv6 and IPv4 CIDR", "10.0.0.16/12,2001:db8::/98", 10, true},
+		{"invalid IPv6 and IPv4 CIDR with more than 2 subnets", "10.0.0.16/12,2001:db8::/98,192.168.0.0/16", 10, false},
+		{"invalid IPv6 and IPv4 CIDR with more than 2 subnets", "10.0.0.16/12,2001:db8::/98,192.168.0.0/16,a.b.c.d/24", 10, false},
+	}
+	for _, rt := range tests {
+		actual := ValidateIPNetFromString(rt.subnet, rt.minaddrs, nil)
 		if (len(actual) == 0) != rt.expected {
 			t.Errorf(
 				"%s test case failed :\n\texpected: %t\n\t  actual: %t\n\t  err(s): %v\n\t",
@@ -234,41 +256,31 @@ func TestValidateIPNetFromString(t *testing.T) {
 
 func TestValidatePodSubnetNodeMask(t *testing.T) {
 	var tests = []struct {
-		name           string
-		subnet         string
-		cmExtraArgs    map[string]string
-		checkDualStack bool
-		expected       bool
+		name        string
+		subnet      string
+		cmExtraArgs []kubeadmapi.Arg
+		expected    bool
 	}{
-		{"single IPv4, but mask too small. Default node-mask", "10.0.0.16/29", nil, false, false},
-		{"single IPv4, but mask too small. Configured node-mask", "10.0.0.16/24", map[string]string{"node-cidr-mask-size": "23"}, false, false},
-		{"single IPv6, but mask too small. Default node-mask", "2001:db8::1/112", nil, false, false},
-		{"single IPv6, but mask too small. Configured node-mask", "2001:db8::1/64", map[string]string{"node-cidr-mask-size": "24"}, false, false},
-		{"single IPv6, but mask difference greater than 16. Default node-mask", "2001:db8::1/12", nil, false, false},
-		{"single IPv6, but mask difference greater than 16. Configured node-mask", "2001:db8::1/64", map[string]string{"node-cidr-mask-size": "120"}, false, false},
-		{"single IPv4 CIDR", "10.0.0.16/12", nil, false, true},
-		{"single IPv6 CIDR", "2001:db8::/48", nil, false, true},
 		// dual-stack:
-		{"dual IPv4 only, but mask too small. Default node-mask", "10.0.0.16/29", nil, true, false},
-		{"dual IPv4 only, but mask too small. Configured node-mask", "10.0.0.16/24", map[string]string{"node-cidr-mask-size-ipv4": "23"}, true, false},
-		{"dual IPv6 only, but mask too small. Default node-mask", "2001:db8::1/112", nil, true, false},
-		{"dual IPv6 only, but mask too small. Configured node-mask", "2001:db8::1/64", map[string]string{"node-cidr-mask-size-ipv6": "24"}, true, false},
-		{"dual IPv6 only, but mask difference greater than 16. Default node-mask", "2001:db8::1/12", nil, true, false},
-		{"dual IPv6 only, but mask difference greater than 16. Configured node-mask", "2001:db8::1/64", map[string]string{"node-cidr-mask-size-ipv6": "120"}, true, false},
-		{"dual IPv4 only CIDR", "10.0.0.16/12", nil, true, true},
-		{"dual IPv6 only CIDR", "2001:db8::/48", nil, true, true},
-		{"dual, but IPv4 mask too small. Default node-mask", "10.0.0.16/29,2001:db8::/48", nil, true, false},
-		{"dual, but IPv4 mask too small. Configured node-mask", "10.0.0.16/24,2001:db8::/48", map[string]string{"node-cidr-mask-size-ipv4": "23"}, true, false},
-		{"dual, but IPv6 mask too small. Default node-mask", "2001:db8::1/112,10.0.0.16/16", nil, true, false},
-		{"dual, but IPv6 mask too small. Configured node-mask", "10.0.0.16/16,2001:db8::1/64", map[string]string{"node-cidr-mask-size-ipv6": "24"}, true, false},
-		{"dual, but mask difference greater than 16. Default node-mask", "2001:db8::1/12,10.0.0.16/16", nil, true, false},
-		{"dual, but mask difference greater than 16. Configured node-mask", "10.0.0.16/16,2001:db8::1/64", map[string]string{"node-cidr-mask-size-ipv6": "120"}, true, false},
-		{"dual IPv4 IPv6", "2001:db8::/48,10.0.0.16/12", nil, true, true},
-		{"dual IPv6 IPv4", "2001:db8::/48,10.0.0.16/12", nil, true, true},
+		{"dual IPv4 only, but mask too small. Default node-mask", "10.0.0.16/29", nil, false},
+		{"dual IPv4 only, but mask too small. Configured node-mask", "10.0.0.16/24", []kubeadmapi.Arg{{Name: "node-cidr-mask-size-ipv4", Value: "23"}}, false},
+		{"dual IPv6 only, but mask too small. Default node-mask", "2001:db8::1/112", nil, false},
+		{"dual IPv6 only, but mask too small. Configured node-mask", "2001:db8::1/64", []kubeadmapi.Arg{{Name: "node-cidr-mask-size-ipv6", Value: "24"}}, false},
+		{"dual IPv6 only, but mask difference greater than 16. Default node-mask", "2001:db8::1/12", nil, false},
+		{"dual IPv6 only, but mask difference greater than 16. Configured node-mask", "2001:db8::1/64", []kubeadmapi.Arg{{Name: "node-cidr-mask-size-ipv6", Value: "120"}}, false},
+		{"dual IPv4 only CIDR", "10.0.0.16/12", nil, true},
+		{"dual IPv6 only CIDR", "2001:db8::/48", nil, true},
+		{"dual, but IPv4 mask too small. Default node-mask", "10.0.0.16/29,2001:db8::/48", nil, false},
+		{"dual, but IPv4 mask too small. Configured node-mask", "10.0.0.16/24,2001:db8::/48", []kubeadmapi.Arg{{Name: "node-cidr-mask-size-ipv4", Value: "23"}}, false},
+		{"dual, but IPv6 mask too small. Default node-mask", "2001:db8::1/112,10.0.0.16/16", nil, false},
+		{"dual, but IPv6 mask too small. Configured node-mask", "10.0.0.16/16,2001:db8::1/64", []kubeadmapi.Arg{{Name: "node-cidr-mask-size-ipv6", Value: "24"}}, false},
+		{"dual, but mask difference greater than 16. Default node-mask", "2001:db8::1/12,10.0.0.16/16", nil, false},
+		{"dual, but mask difference greater than 16. Configured node-mask", "10.0.0.16/16,2001:db8::1/64", []kubeadmapi.Arg{{Name: "node-cidr-mask-size-ipv6", Value: "120"}}, false},
+		{"dual IPv4 IPv6", "2001:db8::/48,10.0.0.16/12", nil, true},
+		{"dual IPv6 IPv4", "2001:db8::/48,10.0.0.16/12", nil, true},
 	}
 	for _, rt := range tests {
 		cfg := &kubeadmapi.ClusterConfiguration{
-			FeatureGates: map[string]bool{features.IPv6DualStack: rt.checkDualStack},
 			ControllerManager: kubeadmapi.ControlPlaneComponent{
 				ExtraArgs: rt.cmExtraArgs,
 			},
@@ -447,9 +459,46 @@ func TestValidateAPIEndpoint(t *testing.T) {
 	}
 }
 
-//TODO: Create a separated test for ValidateClusterConfiguration
+func TestValidateCertificateKey(t *testing.T) {
+	var tests = []struct {
+		name           string
+		certificateKey string
+		expected       bool
+	}{
+		{
+			name:           "Valid certificate key",
+			certificateKey: "e6a2eb8581237ab72a4f494f30285ec12a9694d750b9785706a83bfcbbbd2204",
+			expected:       true,
+		},
+		{
+			name:           "Invalid hex encoded string",
+			certificateKey: "z6a2eb8581237ab72a4f494f30285ec12a9694d750b9785706a83bfcbbbd2204",
+			expected:       false,
+		},
+		{
+			name:           "Invalid AES key size",
+			certificateKey: "e6a2",
+			expected:       false,
+		},
+	}
+	for _, rt := range tests {
+		actual := ValidateCertificateKey(rt.certificateKey, nil)
+		t.Log(actual)
+		if (len(actual) == 0) != rt.expected {
+			t.Errorf(
+				"%s test case failed:\n\texpected: %t\n\t  actual: %t",
+				rt.name,
+				rt.expected,
+				(len(actual) == 0),
+			)
+		}
+	}
+}
+
+// TODO: Create a separated test for ValidateClusterConfiguration
 func TestValidateInitConfiguration(t *testing.T) {
 	nodename := "valid-nodename"
+	criPath := fmt.Sprintf("%s:///some/path", kubeadmapiv1.DefaultContainerRuntimeURLScheme)
 	var tests = []struct {
 		name     string
 		s        *kubeadmapi.InitConfiguration
@@ -468,9 +517,10 @@ func TestValidateInitConfiguration(t *testing.T) {
 						ServiceSubnet: "10.96.0.1/12",
 						DNSDomain:     "cluster.local",
 					},
-					CertificatesDir: "/some/cert/dir",
+					CertificatesDir:     "/some/cert/dir",
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmRSA2048,
 				},
-				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: "/some/path"},
+				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: criPath},
 			}, false},
 		{"invalid missing token with IPv6 service subnet",
 			&kubeadmapi.InitConfiguration{
@@ -483,9 +533,10 @@ func TestValidateInitConfiguration(t *testing.T) {
 						ServiceSubnet: "2001:db8::1/98",
 						DNSDomain:     "cluster.local",
 					},
-					CertificatesDir: "/some/cert/dir",
+					CertificatesDir:     "/some/cert/dir",
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmRSA2048,
 				},
-				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: "/some/path"},
+				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: criPath},
 			}, false},
 		{"invalid missing node name",
 			&kubeadmapi.InitConfiguration{
@@ -498,7 +549,8 @@ func TestValidateInitConfiguration(t *testing.T) {
 						ServiceSubnet: "10.96.0.1/12",
 						DNSDomain:     "cluster.local",
 					},
-					CertificatesDir: "/some/other/cert/dir",
+					CertificatesDir:     "/some/other/cert/dir",
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmRSA2048,
 				},
 			}, false},
 		{"valid InitConfiguration with incorrect IPv4 pod subnet",
@@ -513,9 +565,10 @@ func TestValidateInitConfiguration(t *testing.T) {
 						DNSDomain:     "cluster.local",
 						PodSubnet:     "10.0.1.15",
 					},
-					CertificatesDir: "/some/other/cert/dir",
+					CertificatesDir:     "/some/other/cert/dir",
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmRSA2048,
 				},
-				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: "/some/path"},
+				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: criPath},
 			}, false},
 		{"valid InitConfiguration with IPv4 service subnet",
 			&kubeadmapi.InitConfiguration{
@@ -524,6 +577,7 @@ func TestValidateInitConfiguration(t *testing.T) {
 					BindPort:         6443,
 				},
 				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					ImageRepository: "registry.k8s.io",
 					Etcd: kubeadmapi.Etcd{
 						Local: &kubeadmapi.LocalEtcd{
 							DataDir: "/some/path",
@@ -534,9 +588,10 @@ func TestValidateInitConfiguration(t *testing.T) {
 						DNSDomain:     "cluster.local",
 						PodSubnet:     "10.0.1.15/16",
 					},
-					CertificatesDir: "/some/other/cert/dir",
+					CertificatesDir:     "/some/other/cert/dir",
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmRSA2048,
 				},
-				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: "/some/path"},
+				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: criPath},
 			}, true},
 		{"valid InitConfiguration using IPv6 service subnet",
 			&kubeadmapi.InitConfiguration{
@@ -545,6 +600,7 @@ func TestValidateInitConfiguration(t *testing.T) {
 					BindPort:         3446,
 				},
 				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					ImageRepository: "registry.k8s.io",
 					Etcd: kubeadmapi.Etcd{
 						Local: &kubeadmapi.LocalEtcd{
 							DataDir: "/some/path",
@@ -554,9 +610,10 @@ func TestValidateInitConfiguration(t *testing.T) {
 						ServiceSubnet: "2001:db8::1/112",
 						DNSDomain:     "cluster.local",
 					},
-					CertificatesDir: "/some/other/cert/dir",
+					CertificatesDir:     "/some/other/cert/dir",
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmECDSAP256,
 				},
-				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: "/some/path"},
+				NodeRegistration: kubeadmapi.NodeRegistrationOptions{Name: nodename, CRISocket: criPath},
 			}, true},
 	}
 	for _, rt := range tests {
@@ -573,6 +630,7 @@ func TestValidateInitConfiguration(t *testing.T) {
 }
 
 func TestValidateJoinConfiguration(t *testing.T) {
+	criPath := fmt.Sprintf("%s:///var/run/containerd/containerd.sock", kubeadmapiv1.DefaultContainerRuntimeURLScheme)
 	var tests = []struct {
 		s        *kubeadmapi.JoinConfiguration
 		expected bool
@@ -601,7 +659,7 @@ func TestValidateJoinConfiguration(t *testing.T) {
 			},
 			NodeRegistration: kubeadmapi.NodeRegistrationOptions{
 				Name:      "aaa",
-				CRISocket: "/var/run/dockershim.sock",
+				CRISocket: criPath,
 			},
 		}, true},
 		{&kubeadmapi.JoinConfiguration{ // Pass with JoinControlPlane
@@ -616,7 +674,7 @@ func TestValidateJoinConfiguration(t *testing.T) {
 			},
 			NodeRegistration: kubeadmapi.NodeRegistrationOptions{
 				Name:      "aaa",
-				CRISocket: "/var/run/dockershim.sock",
+				CRISocket: criPath,
 			},
 			ControlPlane: &kubeadmapi.JoinControlPlane{
 				LocalAPIEndpoint: kubeadmapi.APIEndpoint{
@@ -637,7 +695,7 @@ func TestValidateJoinConfiguration(t *testing.T) {
 			},
 			NodeRegistration: kubeadmapi.NodeRegistrationOptions{
 				Name:      "aaa",
-				CRISocket: "/var/run/dockershim.sock",
+				CRISocket: criPath,
 			},
 			ControlPlane: &kubeadmapi.JoinControlPlane{
 				LocalAPIEndpoint: kubeadmapi.APIEndpoint{
@@ -658,7 +716,7 @@ func TestValidateJoinConfiguration(t *testing.T) {
 			},
 			NodeRegistration: kubeadmapi.NodeRegistrationOptions{
 				Name:      "aaa",
-				CRISocket: "/var/run/dockershim.sock",
+				CRISocket: criPath,
 			},
 			ControlPlane: &kubeadmapi.JoinControlPlane{
 				LocalAPIEndpoint: kubeadmapi.APIEndpoint{
@@ -689,11 +747,17 @@ func TestValidateMixedArguments(t *testing.T) {
 		{[]string{"--foo=bar"}, true},
 		{[]string{"--config=hello"}, true},
 		{[]string{"--config=hello", "--ignore-preflight-errors=all"}, true},
+		// Expected to succeed, --config is mixed with skip-* flags only or no other flags
 		{[]string{"--config=hello", "--skip-token-print=true"}, true},
 		{[]string{"--config=hello", "--ignore-preflight-errors=baz", "--skip-token-print"}, true},
+		{[]string{"--config=hello", "--yes=true"}, true},
+		{[]string{"--config=hello", "--print-manifest"}, true},
 		// Expected to fail, --config is mixed with the --foo flag
 		{[]string{"--config=hello", "--ignore-preflight-errors=baz", "--foo=bar"}, false},
 		{[]string{"--config=hello", "--foo=bar"}, false},
+		{[]string{"--config=hello", "--yes=true", "--foo=bar"}, false},
+		// Expected to fail, --config is mixed with the upgrade related flag
+		{[]string{"--config=hello", "--allow-experimental-upgrades"}, false},
 	}
 
 	var cfgPath string
@@ -705,7 +769,10 @@ func TestValidateMixedArguments(t *testing.T) {
 		}
 		f.String("foo", "", "flag bound to config object")
 		f.StringSliceVar(&ignorePreflightErrors, "ignore-preflight-errors", ignorePreflightErrors, "flag not bound to config object")
+		f.Bool("allow-experimental-upgrades", true, "upgrade flags for plan and apply command")
 		f.Bool("skip-token-print", false, "flag not bound to config object")
+		f.Bool("yes", false, "flag not bound to config object")
+		f.Bool("print-manifest", false, "flag not bound to config object")
 		f.StringVar(&cfgPath, "config", cfgPath, "Path to kubeadm config file")
 		if err := f.Parse(rt.args); err != nil {
 			t.Fatal(err)
@@ -749,68 +816,80 @@ func TestValidateIgnorePreflightErrors(t *testing.T) {
 	var tests = []struct {
 		ignorePreflightErrorsFromCLI        []string
 		ignorePreflightErrorsFromConfigFile []string
-		expectedSet                         sets.String
+		expectedSet                         sets.Set[string]
 		expectedError                       bool
 	}{
 		{ // empty lists in CLI and config file
 			[]string{},
 			[]string{},
-			sets.NewString(),
+			sets.New[string](),
 			false,
 		},
 		{ // empty list in CLI only
 			[]string{},
 			[]string{"a"},
-			sets.NewString("a"),
+			sets.New("a"),
 			false,
 		},
 		{ // empty list in config file only
 			[]string{"a"},
 			[]string{},
-			sets.NewString("a"),
+			sets.New("a"),
 			false,
 		},
 		{ // no duplicates, no overlap
 			[]string{"a", "b"},
 			[]string{"c", "d"},
-			sets.NewString("a", "b", "c", "d"),
+			sets.New("a", "b", "c", "d"),
 			false,
 		},
 		{ // some duplicates, with some overlapping duplicates
 			[]string{"a", "b", "a"},
 			[]string{"c", "b"},
-			sets.NewString("a", "b", "c"),
+			sets.New("a", "b", "c"),
+			false,
+		},
+		{ // empty list in CLI, but 'all' present in config file
+			[]string{},
+			[]string{"all"},
+			sets.New("all"),
+			false,
+		},
+		{ // empty list in config file, but 'all' present in CLI
+			[]string{"all"},
+			[]string{},
+			sets.New("all"),
+			false,
+		},
+		{ // some duplicates, only 'all' present in CLI and config file
+			[]string{"all"},
+			[]string{"all"},
+			sets.New("all"),
 			false,
 		},
 		{ // non-duplicate, but 'all' present together with individual checks in CLI
 			[]string{"a", "b", "all"},
 			[]string{},
-			sets.NewString(),
+			sets.New[string](),
 			true,
 		},
-		{ // empty list in CLI, but 'all' present in config file, which is forbidden
+		{ // non-duplicate, but 'all' present together with individual checks in config file
 			[]string{},
-			[]string{"all"},
-			sets.NewString(),
+			[]string{"a", "b", "all"},
+			sets.New[string](),
 			true,
 		},
-		{ // non-duplicate, but 'all' present in config file, which is forbidden
+		{ // non-duplicate, but 'all' present in config file, while values are in CLI, which is forbidden
 			[]string{"a", "b"},
 			[]string{"all"},
-			sets.NewString(),
+			sets.New[string](),
 			true,
 		},
 		{ // non-duplicate, but 'all' present in CLI, while values are in config file, which is forbidden
 			[]string{"all"},
 			[]string{"a", "b"},
-			sets.NewString(),
+			sets.New[string](),
 			true,
-		},
-		{ // skip all checks
-			[]string{"all"},
-			[]string{},
-			sets.NewString("all"),
-			false,
 		},
 	}
 	for _, rt := range tests {
@@ -948,7 +1027,7 @@ func TestValidateDiscoveryTokenAPIServer(t *testing.T) {
 }
 
 func TestValidateDiscoveryKubeConfigPath(t *testing.T) {
-	tmpfile, err := ioutil.TempFile("/tmp", "test_discovery_file")
+	tmpfile, err := os.CreateTemp("/tmp", "test_discovery_file")
 	if err != nil {
 		t.Errorf("Error creating temporary file: %v", err)
 	}
@@ -985,12 +1064,11 @@ func TestValidateSocketPath(t *testing.T) {
 		criSocket      string
 		expectedErrors bool
 	}{
-		{name: "valid path", criSocket: "/some/path", expectedErrors: false},
-		{name: "valid socket url", criSocket: kubeadmapiv1.DefaultUrlScheme + "://" + "/some/path", expectedErrors: false},
-		{name: "unsupported url scheme", criSocket: "bla:///some/path", expectedErrors: true},
-		{name: "unparseable url", criSocket: ":::", expectedErrors: true},
-		{name: "invalid CRISocket (path is not absolute)", criSocket: "some/path", expectedErrors: true},
-		{name: "empty CRISocket (path is not absolute)", criSocket: "", expectedErrors: true},
+		{name: "valid socket URL", criSocket: kubeadmapiv1.DefaultContainerRuntimeURLScheme + "://" + "/some/path", expectedErrors: false},
+		{name: "unsupported URL scheme", criSocket: "bla:///some/path", expectedErrors: true},
+		{name: "missing URL scheme", criSocket: "/some/path", expectedErrors: true},
+		{name: "unparsable URL", criSocket: ":::", expectedErrors: true},
+		{name: "empty CRISocket", criSocket: "", expectedErrors: true},
 	}
 	for _, tc := range tests {
 		actual := ValidateSocketPath(tc.criSocket, field.NewPath("criSocket"))
@@ -1119,10 +1197,33 @@ func TestValidateEtcd(t *testing.T) {
 		actual := ValidateEtcd(tc.etcd, field.NewPath("etcd"))
 		actualErrors := len(actual) > 0
 		if actualErrors != tc.expectedErrors {
-			t.Errorf("Error: \n\texpected: %t\n\t  actual: %t",
+			t.Errorf("Error: \n\texpected: %t\n\t  actual: %t\n\t  encountered errors: %v",
 				tc.expectedErrors,
 				actualErrors,
+				actual,
 			)
+		}
+	}
+}
+
+func TestValidateEncryptionAlgorithm(t *testing.T) {
+	var tests = []struct {
+		name           string
+		algo           kubeadmapi.EncryptionAlgorithmType
+		expectedErrors bool
+	}{
+		{name: "valid RSA-2048", algo: kubeadmapi.EncryptionAlgorithmRSA2048, expectedErrors: false},
+		{name: "valid RSA-3072", algo: kubeadmapi.EncryptionAlgorithmRSA3072, expectedErrors: false},
+		{name: "valid RSA-4096", algo: kubeadmapi.EncryptionAlgorithmRSA4096, expectedErrors: false},
+		{name: "valid ECDSA-P256", algo: kubeadmapi.EncryptionAlgorithmECDSAP256, expectedErrors: false},
+		{name: "invalid algorithm", algo: "foo", expectedErrors: true},
+		{name: "empty algorithm returns an error", algo: "", expectedErrors: true},
+	}
+	for _, tc := range tests {
+		actual := ValidateEncryptionAlgorithm(tc.algo, field.NewPath("encryptionAlgorithm"))
+		actualErrors := len(actual) > 0
+		if actualErrors != tc.expectedErrors {
+			t.Errorf("error: validate public key algorithm: %q\n\texpected: %t\n\t  actual: %t", tc.algo, tc.expectedErrors, actualErrors)
 		}
 	}
 }
@@ -1136,87 +1237,37 @@ func TestGetClusterNodeMask(t *testing.T) {
 		expectedError bool
 	}{
 		{
-			name: "ipv4 default mask",
-			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: false},
-			},
-			isIPv6:       false,
-			expectedMask: 24,
-		},
-		{
-			name: "ipv4 custom mask",
-			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: false},
-				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size": "23"},
-				},
-			},
-			isIPv6:       false,
-			expectedMask: 23,
-		},
-		{
-			name: "ipv4 wrong mask",
-			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: false},
-				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size": "aa23"},
-				},
-			},
-			isIPv6:        false,
-			expectedError: true,
-		},
-		{
-			name: "ipv6 default mask",
-			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: false},
-			},
-			isIPv6:       true,
-			expectedMask: 64,
-		},
-		{
-			name: "ipv6 custom mask",
-			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: false},
-				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size": "83"},
-				},
-			},
-			isIPv6:       true,
-			expectedMask: 83,
-		},
-		{
-			name: "dual ipv4 default mask",
-			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: true},
-			},
+			name:         "dual ipv4 default mask",
+			cfg:          &kubeadmapi.ClusterConfiguration{},
 			isIPv6:       false,
 			expectedMask: 24,
 		},
 		{
 			name: "dual ipv4 custom mask",
 			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: true},
 				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size": "21", "node-cidr-mask-size-ipv4": "23"},
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "node-cidr-mask-size", Value: "21"},
+						{Name: "node-cidr-mask-size-ipv4", Value: "23"},
+					},
 				},
 			},
 			isIPv6:       false,
 			expectedMask: 23,
 		},
 		{
-			name: "dual ipv6 default mask",
-			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: true},
-			},
+			name:         "dual ipv6 default mask",
+			cfg:          &kubeadmapi.ClusterConfiguration{},
 			isIPv6:       true,
 			expectedMask: 64,
 		},
 		{
 			name: "dual ipv6 custom mask",
 			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: true},
 				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size-ipv6": "83"},
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "node-cidr-mask-size-ipv6", Value: "83"},
+					},
 				},
 			},
 			isIPv6:       true,
@@ -1225,9 +1276,10 @@ func TestGetClusterNodeMask(t *testing.T) {
 		{
 			name: "dual ipv4 custom mask",
 			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: true},
 				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size-ipv4": "23"},
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "node-cidr-mask-size-ipv4", Value: "23"},
+					},
 				},
 			},
 			isIPv6:       false,
@@ -1236,9 +1288,10 @@ func TestGetClusterNodeMask(t *testing.T) {
 		{
 			name: "dual ipv4 wrong mask",
 			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: true},
 				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size-ipv4": "aa"},
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "node-cidr-mask-size-ipv4", Value: "aa"},
+					},
 				},
 			},
 			isIPv6:        false,
@@ -1247,9 +1300,10 @@ func TestGetClusterNodeMask(t *testing.T) {
 		{
 			name: "dual ipv6 default mask and legacy flag",
 			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: true},
 				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size": "23"},
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "node-cidr-mask-size", Value: "23"},
+					},
 				},
 			},
 			isIPv6:       true,
@@ -1258,9 +1312,11 @@ func TestGetClusterNodeMask(t *testing.T) {
 		{
 			name: "dual ipv6 custom mask and legacy flag",
 			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: true},
 				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size": "23", "node-cidr-mask-size-ipv6": "83"},
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "node-cidr-mask-size", Value: "23"},
+						{Name: "node-cidr-mask-size-ipv6", Value: "83"},
+					},
 				},
 			},
 			isIPv6:       true,
@@ -1269,9 +1325,11 @@ func TestGetClusterNodeMask(t *testing.T) {
 		{
 			name: "dual ipv6 custom mask and wrong flag",
 			cfg: &kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{features.IPv6DualStack: true},
 				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{"node-cidr-mask-size": "23", "node-cidr-mask-size-ipv6": "a83"},
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "node-cidr-mask-size", Value: "23"},
+						{Name: "node-cidr-mask-size-ipv6", Value: "a83"},
+					},
 				},
 			},
 			isIPv6:        true,
@@ -1286,6 +1344,355 @@ func TestGetClusterNodeMask(t *testing.T) {
 			}
 			if mask != test.expectedMask {
 				t.Errorf("expected mask: %d, got %d", test.expectedMask, mask)
+			}
+		})
+	}
+}
+
+func TestValidateImageRepository(t *testing.T) {
+	var tests = []struct {
+		imageRepository string
+		expectedErrors  bool
+	}{
+		{
+			imageRepository: "a",
+			expectedErrors:  false,
+		},
+		{
+			imageRepository: "a.b.c",
+			expectedErrors:  false,
+		},
+		{
+			imageRepository: "a.b.c/repo",
+			expectedErrors:  false,
+		},
+		{
+			imageRepository: "a:5000",
+			expectedErrors:  false,
+		},
+		{
+			imageRepository: "a.b.c:5000",
+			expectedErrors:  false,
+		},
+		{
+			imageRepository: "a.b.c:5000/repo",
+			expectedErrors:  false,
+		},
+		{
+			imageRepository: "a/b/c",
+			expectedErrors:  false,
+		},
+		{
+			imageRepository: "127.0.0.1:5000/repo",
+			expectedErrors:  false,
+		},
+		{
+			imageRepository: "",
+			expectedErrors:  true,
+		},
+		{
+			imageRepository: `a.b/c
+			s`,
+			expectedErrors: true,
+		},
+		{
+			imageRepository: " a.b.c",
+			expectedErrors:  true,
+		},
+		{
+			imageRepository: "a.b c",
+			expectedErrors:  true,
+		},
+		{
+			imageRepository: "a.b.c:5000/",
+			expectedErrors:  true,
+		},
+		{
+			imageRepository: "https://a.b.c:5000",
+			expectedErrors:  true,
+		},
+		{
+			imageRepository: "a//b/c",
+			expectedErrors:  true,
+		},
+		{
+			imageRepository: "a.b.c:5000/test:1.0",
+			expectedErrors:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		actual := ValidateImageRepository(tc.imageRepository, nil)
+		actualErrors := len(actual) > 0
+		if actualErrors != tc.expectedErrors {
+			t.Errorf("case %q error:\n\t expected: %t\n\t actual: %t", tc.imageRepository, tc.expectedErrors, actualErrors)
+		}
+	}
+}
+
+func TestValidateAbsolutePath(t *testing.T) {
+	var tests = []struct {
+		name           string
+		path           string
+		expectedErrors bool
+	}{
+		{name: "valid absolute path", path: "/etc/cert/dir", expectedErrors: false},
+		{name: "relative path", path: "./tmp", expectedErrors: true},
+		{name: "invalid path", path: "foo..", expectedErrors: true},
+	}
+	for _, tc := range tests {
+		actual := ValidateAbsolutePath(tc.path, field.NewPath("certificatesDir"))
+		actualErrors := len(actual) > 0
+		if actualErrors != tc.expectedErrors {
+			t.Errorf("error: validate absolute path: %q\n\texpected: %t\n\t  actual: %t", tc.path, tc.expectedErrors, actualErrors)
+		}
+	}
+}
+
+func TestValidateExtraArgs(t *testing.T) {
+	var tests = []struct {
+		name           string
+		args           []kubeadmapi.Arg
+		expectedErrors int
+	}{
+		{
+			name:           "valid argument",
+			args:           []kubeadmapi.Arg{{Name: "foo", Value: "bar"}},
+			expectedErrors: 0,
+		},
+		{
+			name:           "invalid one argument",
+			args:           []kubeadmapi.Arg{{Name: "", Value: "bar"}},
+			expectedErrors: 1,
+		},
+		{
+			name:           "invalid two arguments",
+			args:           []kubeadmapi.Arg{{Name: "", Value: "foo"}, {Name: "", Value: "bar"}},
+			expectedErrors: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		actual := ValidateExtraArgs(tc.args, nil)
+		if len(actual) != tc.expectedErrors {
+			t.Errorf("case %q:\n\t expected errors: %v\n\t got: %v\n\t errors: %v", tc.name, tc.expectedErrors, len(actual), actual)
+		}
+	}
+}
+
+func TestValidateUnmountFlags(t *testing.T) {
+	var tests = []struct {
+		name           string
+		flags          []string
+		expectedErrors int
+	}{
+		{
+			name:           "nil input",
+			flags:          nil,
+			expectedErrors: 0,
+		},
+		{
+			name: "all valid flags",
+			flags: []string{
+				kubeadmapi.UnmountFlagMNTForce,
+				kubeadmapi.UnmountFlagMNTDetach,
+				kubeadmapi.UnmountFlagMNTExpire,
+				kubeadmapi.UnmountFlagUmountNoFollow,
+			},
+			expectedErrors: 0,
+		},
+		{
+			name: "invalid two flags",
+			flags: []string{
+				"foo",
+				"bar",
+			},
+			expectedErrors: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		actual := ValidateUnmountFlags(tc.flags, nil)
+		if len(actual) != tc.expectedErrors {
+			t.Errorf("case %q:\n\t expected errors: %v\n\t got: %v\n\t errors: %v", tc.name, tc.expectedErrors, len(actual), actual)
+		}
+	}
+}
+
+func TestPullPolicy(t *testing.T) {
+	var tests = []struct {
+		name           string
+		policy         string
+		expectedErrors int
+	}{
+		{
+			name:           "empty policy causes no errors", // gets defaulted
+			policy:         "",
+			expectedErrors: 0,
+		},
+		{
+			name:           "invalid policy",
+			policy:         "foo",
+			expectedErrors: 1,
+		},
+		{
+			name:           "valid policy",
+			policy:         "IfNotPresent",
+			expectedErrors: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		actual := ValidateImagePullPolicy(corev1.PullPolicy(tc.policy), nil)
+		if len(actual) != tc.expectedErrors {
+			t.Errorf("case %q:\n\t expected errors: %v\n\t got: %v\n\t errors: %v", tc.name, tc.expectedErrors, len(actual), actual)
+		}
+	}
+}
+
+func TestValidateCertValidity(t *testing.T) {
+	var tests = []struct {
+		name           string
+		cfg            *kubeadmapi.ClusterConfiguration
+		expectedErrors int
+	}{
+		{
+			name: "no errors from nil values",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				CertificateValidityPeriod:   nil,
+				CACertificateValidityPeriod: nil,
+			},
+			expectedErrors: 0,
+		},
+		{
+			name: "no errors from defaults",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				CertificateValidityPeriod: &metav1.Duration{
+					Duration: constants.CertificateValidityPeriod,
+				},
+				CACertificateValidityPeriod: &metav1.Duration{
+					Duration: constants.CACertificateValidityPeriod,
+				},
+			},
+			expectedErrors: 0,
+		},
+		{
+			name: "two errors from long durations",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				CertificateValidityPeriod: &metav1.Duration{
+					Duration: constants.CertificateValidityPeriod * 2,
+				},
+				CACertificateValidityPeriod: &metav1.Duration{
+					Duration: constants.CACertificateValidityPeriod * 2,
+				},
+			},
+			expectedErrors: 2,
+		},
+		{
+			name: "one error from mismatched durations (CertificateValidityPeriod > CACertificateValidityPeriod) ",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				CertificateValidityPeriod: &metav1.Duration{
+					Duration: time.Hour * 2,
+				},
+				CACertificateValidityPeriod: &metav1.Duration{
+					Duration: time.Hour,
+				},
+			},
+			expectedErrors: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		actual := ValidateCertValidity(tc.cfg)
+		if len(actual) != tc.expectedErrors {
+			t.Errorf("case %q:\n\t expected errors: %v\n\t got: %v\n\t errors: %v", tc.name, tc.expectedErrors, len(actual), actual)
+		}
+	}
+}
+
+func TestValidateResetConfiguration(t *testing.T) {
+	var tests = []struct {
+		name           string
+		cfg            *kubeadmapi.ResetConfiguration
+		expectedErrors int
+	}{
+		{
+			name: "expect 3 errors",
+			cfg: &kubeadmapi.ResetConfiguration{
+				CRISocket:       "foo",
+				CertificatesDir: "bar",
+				UnmountFlags:    []string{"baz"},
+			},
+			expectedErrors: 3,
+		},
+		{
+			name: "expect 0 errors",
+			cfg: &kubeadmapi.ResetConfiguration{
+				CRISocket:       fmt.Sprintf("%s:///var/run/containerd/containerd.sock", kubeadmapiv1.DefaultContainerRuntimeURLScheme),
+				CertificatesDir: "/foo/bar", // this is work on Windows too because of the local isAbs()
+				UnmountFlags:    []string{kubeadmapi.UnmountFlagMNTForce},
+			},
+			expectedErrors: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := ValidateResetConfiguration(tc.cfg)
+			if len(actual) != tc.expectedErrors {
+				t.Errorf("expected errors: %d, got: %+v", tc.expectedErrors, actual)
+			}
+		})
+	}
+}
+
+func TestValidateUpgradeConfiguration(t *testing.T) {
+	var tests = []struct {
+		name           string
+		cfg            *kubeadmapi.UpgradeConfiguration
+		expectedErrors int
+	}{
+		{
+			name: "expect 4 errors",
+			cfg: &kubeadmapi.UpgradeConfiguration{
+				Apply: kubeadmapi.UpgradeApplyConfiguration{
+					Patches: &kubeadmapi.Patches{
+						Directory: "foo",
+					},
+					ImagePullPolicy: "bar",
+				},
+				Node: kubeadmapi.UpgradeNodeConfiguration{
+					Patches: &kubeadmapi.Patches{
+						Directory: "foo",
+					},
+					ImagePullPolicy: "bar",
+				},
+			},
+			expectedErrors: 4,
+		},
+		{
+			name: "expect 0 errors",
+			cfg: &kubeadmapi.UpgradeConfiguration{
+				Apply: kubeadmapi.UpgradeApplyConfiguration{
+					Patches: &kubeadmapi.Patches{
+						Directory: "/foo/bar",
+					},
+					ImagePullPolicy: corev1.PullAlways,
+				},
+				Node: kubeadmapi.UpgradeNodeConfiguration{
+					Patches: &kubeadmapi.Patches{
+						Directory: "/foo/bar",
+					},
+					ImagePullPolicy: corev1.PullAlways,
+				},
+			},
+			expectedErrors: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := ValidateUpgradeConfiguration(tc.cfg)
+			if len(actual) != tc.expectedErrors {
+				t.Errorf("expected errors: %d, got: %+v", tc.expectedErrors, actual)
 			}
 		})
 	}

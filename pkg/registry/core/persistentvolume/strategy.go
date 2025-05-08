@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -65,19 +66,23 @@ func (persistentvolumeStrategy) GetResetFields() map[fieldpath.APIVersion]*field
 func (persistentvolumeStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	pv := obj.(*api.PersistentVolume)
 	pv.Status = api.PersistentVolumeStatus{}
+	pvutil.DropDisabledSpecFields(&pv.Spec, nil)
 
-	pvutil.DropDisabledFields(&pv.Spec, nil)
+	pv.Status.Phase = api.VolumePending
+	now := NowFunc()
+	pv.Status.LastPhaseTransitionTime = &now
 }
 
 func (persistentvolumeStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	persistentvolume := obj.(*api.PersistentVolume)
-	errorList := validation.ValidatePersistentVolume(persistentvolume)
+	opts := validation.ValidationOptionsForPersistentVolume(persistentvolume, nil)
+	errorList := validation.ValidatePersistentVolume(persistentvolume, opts)
 	return append(errorList, volumevalidation.ValidatePersistentVolume(persistentvolume)...)
 }
 
 // WarningsOnCreate returns warnings for the creation of the given object.
 func (persistentvolumeStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
-	return nil
+	return pvutil.GetWarningsForPersistentVolume(obj.(*api.PersistentVolume))
 }
 
 // Canonicalize normalizes the object after validation.
@@ -93,20 +98,21 @@ func (persistentvolumeStrategy) PrepareForUpdate(ctx context.Context, obj, old r
 	newPv := obj.(*api.PersistentVolume)
 	oldPv := old.(*api.PersistentVolume)
 	newPv.Status = oldPv.Status
-
-	pvutil.DropDisabledFields(&newPv.Spec, &oldPv.Spec)
+	pvutil.DropDisabledSpecFields(&newPv.Spec, &oldPv.Spec)
 }
 
 func (persistentvolumeStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newPv := obj.(*api.PersistentVolume)
-	errorList := validation.ValidatePersistentVolume(newPv)
+	oldPv := old.(*api.PersistentVolume)
+	opts := validation.ValidationOptionsForPersistentVolume(newPv, oldPv)
+	errorList := validation.ValidatePersistentVolume(newPv, opts)
 	errorList = append(errorList, volumevalidation.ValidatePersistentVolume(newPv)...)
-	return append(errorList, validation.ValidatePersistentVolumeUpdate(newPv, old.(*api.PersistentVolume))...)
+	return append(errorList, validation.ValidatePersistentVolumeUpdate(newPv, oldPv, opts)...)
 }
 
 // WarningsOnUpdate returns warnings for the given update.
 func (persistentvolumeStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
-	return nil
+	return pvutil.GetWarningsForPersistentVolume(obj.(*api.PersistentVolume))
 }
 
 func (persistentvolumeStrategy) AllowUnconditionalUpdate() bool {
@@ -131,11 +137,25 @@ func (persistentvolumeStatusStrategy) GetResetFields() map[fieldpath.APIVersion]
 	return fields
 }
 
+var NowFunc = metav1.Now
+
 // PrepareForUpdate sets the Spec field which is not allowed to be changed when updating a PV's Status
 func (persistentvolumeStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newPv := obj.(*api.PersistentVolume)
 	oldPv := old.(*api.PersistentVolume)
 	newPv.Spec = oldPv.Spec
+
+	switch {
+	case oldPv.Status.Phase == newPv.Status.Phase && newPv.Status.LastPhaseTransitionTime == nil:
+		// phase didn't change, preserve the existing transition time if set
+		newPv.Status.LastPhaseTransitionTime = oldPv.Status.LastPhaseTransitionTime
+
+	case oldPv.Status.Phase != newPv.Status.Phase && (newPv.Status.LastPhaseTransitionTime == nil || newPv.Status.LastPhaseTransitionTime.Equal(oldPv.Status.LastPhaseTransitionTime)):
+		// phase changed and client didn't set or didn't change the transition time
+		now := NowFunc()
+		newPv.Status.LastPhaseTransitionTime = &now
+	}
+
 }
 
 func (persistentvolumeStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {

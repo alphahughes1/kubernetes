@@ -280,6 +280,7 @@ func TestStructInput(t *testing.T) {
 
 	missingKeyTests := []jsonpathTest{
 		{"nonexistent field", "{.hello}", storeData, "", false},
+		{"nonexistent field 2", "before-{.hello}after", storeData, "before-after", false},
 	}
 	testJSONPath(missingKeyTests, true, t)
 
@@ -300,7 +301,8 @@ func TestJSONInput(t *testing.T) {
 		{"id": "i3", "x":  8, "y":  3 },
 		{"id": "i4", "x": -6, "y": -1 },
 		{"id": "i5", "x":  0, "y":  2, "z": 1 },
-		{"id": "i6", "x":  1, "y":  4 }
+		{"id": "i6", "x":  1, "y":  4 },
+		{"id": "i7", "x":  null, "y":  4 }
 	]`)
 	var pointsData interface{}
 	err := json.Unmarshal(pointsJSON, &pointsData)
@@ -310,6 +312,7 @@ func TestJSONInput(t *testing.T) {
 	pointsTests := []jsonpathTest{
 		{"exists filter", "{[?(@.z)].id}", pointsData, "i2 i5", false},
 		{"bracket key", "{[0]['id']}", pointsData, "i1", false},
+		{"nil value", "{[-1]['x']}", pointsData, "null", false},
 	}
 	testJSONPath(pointsTests, false, t)
 }
@@ -792,8 +795,7 @@ func TestRunningPodsJSONPathOutput(t *testing.T) {
 				}
 			},
            		{
-				"resourceVersion": "",
-				"selfLink": ""
+				"resourceVersion": ""
 			}
 		]
 	}`)
@@ -806,8 +808,8 @@ func TestRunningPodsJSONPathOutput(t *testing.T) {
 	testJSONPath(
 		[]jsonpathTest{
 			{
-				"when range is used in a certain way in script, additional line is printed",
-				`{range .items[?(.status.phase=="Running")]}{.metadata.name}{" is Running\n"}`,
+				"range over pods without selecting the last one",
+				`{range .items[?(.status.phase=="Running")]}{.metadata.name}{" is Running\n"}{end}`,
 				data,
 				"pod1 is Running\npod2 is Running\npod3 is Running\n",
 				false, // expect no error

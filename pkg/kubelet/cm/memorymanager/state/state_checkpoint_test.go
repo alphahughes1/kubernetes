@@ -17,7 +17,6 @@ limitations under the License.
 package state
 
 import (
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -111,7 +110,7 @@ func TestCheckpointStateRestore(t *testing.T) {
 	}
 
 	// create temp dir
-	testingDir, err := ioutil.TempDir("", "memorymanager_state_test")
+	testingDir, err := os.MkdirTemp("", "memorymanager_state_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +134,7 @@ func TestCheckpointStateRestore(t *testing.T) {
 			restoredState, err := NewCheckpointState(testingDir, testingCheckpoint, "static")
 			if strings.TrimSpace(tc.expectedError) != "" {
 				assert.Error(t, err)
-				assert.Contains(t, err.Error(), "could not restore state from checkpoint: "+tc.expectedError)
+				assert.ErrorContains(t, err, "could not restore state from checkpoint: "+tc.expectedError)
 			} else {
 				assert.NoError(t, err, "unexpected error while creating checkpointState")
 				// compare state after restoration with the one expected
@@ -174,7 +173,7 @@ func TestCheckpointStateStore(t *testing.T) {
 	}
 
 	// create temp dir
-	testingDir, err := ioutil.TempDir("", "memorymanager_state_test")
+	testingDir, err := os.MkdirTemp("", "memorymanager_state_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +292,7 @@ func TestCheckpointStateHelpers(t *testing.T) {
 	}
 
 	// create temp dir
-	testingDir, err := ioutil.TempDir("", "memorymanager_state_test")
+	testingDir, err := os.MkdirTemp("", "memorymanager_state_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +361,7 @@ func TestCheckpointStateClear(t *testing.T) {
 	}
 
 	// create temp dir
-	testingDir, err := ioutil.TempDir("", "memorymanager_state_test")
+	testingDir, err := os.MkdirTemp("", "memorymanager_state_test")
 	if err != nil {
 		t.Fatal(err)
 	}

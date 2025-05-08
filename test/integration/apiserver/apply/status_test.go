@@ -18,7 +18,6 @@ package apiserver
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -28,16 +27,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
-	genericfeatures "k8s.io/apiserver/pkg/features"
+	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apiserver/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/dynamic"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/etcd"
 	"k8s.io/kubernetes/test/integration/framework"
-	"sigs.k8s.io/yaml"
 )
 
 // namespace used for all tests, do not change this
@@ -51,12 +52,20 @@ var statusData = map[schema.GroupVersionResource]string{
 	gvr("networking.k8s.io", "v1beta1", "ingresses"):                `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
 	gvr("networking.k8s.io", "v1", "ingresses"):                     `{"status": {"loadBalancer": {"ingress": [{"ip": "127.0.0.1"}]}}}`,
 	gvr("autoscaling", "v1", "horizontalpodautoscalers"):            `{"status": {"currentReplicas": 5}}`,
+	gvr("autoscaling", "v2", "horizontalpodautoscalers"):            `{"status": {"currentReplicas": 5}}`,
 	gvr("batch", "v1", "cronjobs"):                                  `{"status": {"lastScheduleTime": null}}`,
 	gvr("batch", "v1beta1", "cronjobs"):                             `{"status": {"lastScheduleTime": null}}`,
 	gvr("storage.k8s.io", "v1", "volumeattachments"):                `{"status": {"attached": true}}`,
 	gvr("policy", "v1", "poddisruptionbudgets"):                     `{"status": {"currentHealthy": 5}}`,
 	gvr("policy", "v1beta1", "poddisruptionbudgets"):                `{"status": {"currentHealthy": 5}}`,
+	gvr("resource.k8s.io", "v1alpha3", "resourceclaims"):            `{"status": {"allocation": {"nodeSelector": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "some-label", "operator": "In", "values": ["some-value"]}] }]}}}}`,
+	gvr("resource.k8s.io", "v1beta1", "resourceclaims"):             `{"status": {"allocation": {"nodeSelector": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "some-label", "operator": "In", "values": ["some-value"]}] }]}}}}`,
+	gvr("resource.k8s.io", "v1beta2", "resourceclaims"):             `{"status": {"allocation": {"nodeSelector": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "some-label", "operator": "In", "values": ["some-value"]}] }]}}}}`,
 	gvr("internal.apiserver.k8s.io", "v1alpha1", "storageversions"): `{"status": {"commonEncodingVersion":"v1","storageVersions":[{"apiServerID":"1","decodableVersions":["v1","v2"],"encodingVersion":"v1"}],"conditions":[{"type":"AllEncodingVersionsEqual","status":"True","lastTransitionTime":"2020-01-01T00:00:00Z","reason":"allEncodingVersionsEqual","message":"all encoding versions are set to v1"}]}}`,
+	// standard for []metav1.Condition
+	gvr("admissionregistration.k8s.io", "v1alpha1", "validatingadmissionpolicies"): `{"status": {"conditions":[{"type":"Accepted","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z","reason":"RuleApplied","message":"Rule was applied"}]}}`,
+	gvr("admissionregistration.k8s.io", "v1beta1", "validatingadmissionpolicies"):  `{"status": {"conditions":[{"type":"Accepted","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z","reason":"RuleApplied","message":"Rule was applied"}]}}`,
+	gvr("admissionregistration.k8s.io", "v1", "validatingadmissionpolicies"):       `{"status": {"conditions":[{"type":"Accepted","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z","reason":"RuleApplied","message":"Rule was applied"}]}}`,
 }
 
 const statusDefault = `{"status": {"conditions": [{"type": "MyStatus", "status":"True"}]}}`
@@ -91,7 +100,20 @@ func createMapping(groupVersion string, resource metav1.APIResource) (*meta.REST
 
 // TestApplyStatus makes sure that applying the status works for all known types.
 func TestApplyStatus(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+	testApplyStatus(t, func(testing.TB, *rest.Config) {})
+}
+
+// TestApplyStatus makes sure that applying the status works for all known types.
+func TestApplyStatusWithCBOR(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CBORServingAndStorage, true)
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ClientsAllowCBOR, true)
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ClientsPreferCBOR, true)
+	testApplyStatus(t, func(t testing.TB, config *rest.Config) {
+		config.Wrap(framework.AssertRequestResponseAsCBOR(t))
+	})
+}
+
+func testApplyStatus(t *testing.T, reconfigureClient func(testing.TB, *rest.Config)) {
 	server, err := apiservertesting.StartTestServer(t, apiservertesting.NewDefaultTestServerOptions(), []string{"--disable-admission-plugins", "ServiceAccount,TaintNodesByCondition"}, framework.SharedEtcd())
 	if err != nil {
 		t.Fatal(err)
@@ -99,10 +121,6 @@ func TestApplyStatus(t *testing.T) {
 	defer server.TearDownFn()
 
 	client, err := kubernetes.NewForConfig(server.ClientConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dynamicClient, err := dynamic.NewForConfig(server.ClientConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +152,7 @@ func TestApplyStatus(t *testing.T) {
 				// both spec and status get wiped for CSRs,
 				// nothing is expected to be managed for it, skip it
 				if mapping.Resource.Resource == "certificatesigningrequests" {
-					t.Skip()
+					t.SkipNow()
 				}
 
 				status, ok := statusData[mapping.Resource]
@@ -158,14 +176,17 @@ func TestApplyStatus(t *testing.T) {
 
 				// etcd test stub data doesn't contain apiVersion/kind (!), but apply requires it
 				newObj.SetGroupVersionKind(mapping.GroupVersionKind)
-				createData, err := json.Marshal(newObj.Object)
+
+				dynamicClientConfig := rest.CopyConfig(server.ClientConfig)
+				reconfigureClient(t, dynamicClientConfig)
+				dynamicClient, err := dynamic.NewForConfig(dynamicClientConfig)
 				if err != nil {
 					t.Fatal(err)
 				}
 
 				rsc := dynamicClient.Resource(mapping.Resource).Namespace(namespace)
 				// apply to create
-				_, err = rsc.Patch(context.TODO(), name, types.ApplyPatchType, []byte(createData), metav1.PatchOptions{FieldManager: "create_test"})
+				_, err = rsc.Apply(context.TODO(), name, &newObj, metav1.ApplyOptions{FieldManager: "create_test"})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -177,16 +198,11 @@ func TestApplyStatus(t *testing.T) {
 				statusObj.SetAPIVersion(mapping.GroupVersionKind.GroupVersion().String())
 				statusObj.SetKind(mapping.GroupVersionKind.Kind)
 				statusObj.SetName(name)
-				statusYAML, err := yaml.Marshal(statusObj.Object)
-				if err != nil {
-					t.Fatal(err)
-				}
 
-				True := true
 				obj, err := dynamicClient.
 					Resource(mapping.Resource).
 					Namespace(namespace).
-					Patch(context.TODO(), name, types.ApplyPatchType, statusYAML, metav1.PatchOptions{FieldManager: "apply_status_test", Force: &True}, "status")
+					ApplyStatus(context.TODO(), name, &statusObj, metav1.ApplyOptions{FieldManager: "apply_status_test", Force: true})
 				if err != nil {
 					t.Fatalf("Failed to apply: %v", err)
 				}

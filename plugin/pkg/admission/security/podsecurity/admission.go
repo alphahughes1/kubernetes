@@ -27,13 +27,15 @@ import (
 	_ "k8s.io/kubernetes/pkg/apis/apps/install"
 	_ "k8s.io/kubernetes/pkg/apis/batch/install"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
+	"k8s.io/kubernetes/pkg/features"
 
+	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/admission"
 	genericadmissioninit "k8s.io/apiserver/pkg/admission/initializer"
 	"k8s.io/apiserver/pkg/audit"
@@ -42,14 +44,15 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/component-base/featuregate"
+	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	"k8s.io/kubernetes/pkg/apis/batch"
 	"k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/features"
 	podsecurityadmission "k8s.io/pod-security-admission/admission"
 	podsecurityconfigloader "k8s.io/pod-security-admission/admission/api/load"
 	podsecurityadmissionapi "k8s.io/pod-security-admission/api"
+	"k8s.io/pod-security-admission/metrics"
 	"k8s.io/pod-security-admission/policy"
 )
 
@@ -67,7 +70,6 @@ func Register(plugins *admission.Plugins) {
 type Plugin struct {
 	*admission.Handler
 
-	enabled               bool
 	inspectedFeatureGates bool
 
 	client          kubernetes.Interface
@@ -80,6 +82,20 @@ type Plugin struct {
 var _ admission.ValidationInterface = &Plugin{}
 var _ genericadmissioninit.WantsExternalKubeInformerFactory = &Plugin{}
 var _ genericadmissioninit.WantsExternalKubeClientSet = &Plugin{}
+
+var (
+	defaultRecorder     *metrics.PrometheusRecorder
+	defaultRecorderInit sync.Once
+)
+
+func getDefaultRecorder() metrics.Recorder {
+	// initialize and register to legacy metrics once
+	defaultRecorderInit.Do(func() {
+		defaultRecorder = metrics.NewPrometheusRecorder(podsecurityadmissionapi.GetAPIVersion())
+		defaultRecorder.MustRegister(legacyregistry.MustRegister)
+	})
+	return defaultRecorder
+}
 
 // newPlugin creates a new admission plugin.
 func newPlugin(reader io.Reader) (*Plugin, error) {
@@ -98,7 +114,7 @@ func newPlugin(reader io.Reader) (*Plugin, error) {
 		delegate: &podsecurityadmission.Admission{
 			Configuration:    config,
 			Evaluator:        evaluator,
-			Metrics:          nil, // TODO: wire to default prometheus metrics
+			Metrics:          getDefaultRecorder(),
 			PodSpecExtractor: podsecurityadmission.DefaultPodSpecExtractor{},
 		},
 	}, nil
@@ -135,8 +151,8 @@ func (p *Plugin) updateDelegate() {
 }
 
 func (c *Plugin) InspectFeatureGates(featureGates featuregate.FeatureGate) {
-	c.enabled = featureGates.Enabled(features.PodSecurity)
 	c.inspectedFeatureGates = true
+	policy.RelaxPolicyForUserNamespacePods(featureGates.Enabled(features.UserNamespacesPodSecurityStandards))
 }
 
 // ValidateInitialization ensures all required options are set
@@ -161,29 +177,43 @@ var (
 )
 
 func (p *Plugin) Validate(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
-	if !p.enabled {
-		return nil
-	}
 	gr := a.GetResource().GroupResource()
 	if !applicableResources[gr] && !p.delegate.PodSpecExtractor.HasPodSpec(gr) {
 		return nil
 	}
 
-	a = &lazyConvertingAttributes{Attributes: a}
-
-	result := p.delegate.Validate(ctx, a)
+	result := p.delegate.Validate(ctx, &lazyConvertingAttributes{Attributes: a})
 	for _, w := range result.Warnings {
 		warning.AddWarning(ctx, "", w)
 	}
-	for k, v := range result.AuditAnnotations {
-		audit.AddAuditAnnotation(ctx, podsecurityadmissionapi.AuditAnnotationPrefix+k, v)
+	if len(result.AuditAnnotations) > 0 {
+		annotations := make([]string, len(result.AuditAnnotations)*2)
+		i := 0
+		for k, v := range result.AuditAnnotations {
+			annotations[i], annotations[i+1] = podsecurityadmissionapi.AuditAnnotationPrefix+k, v
+			i += 2
+		}
+		audit.AddAuditAnnotations(ctx, annotations...)
 	}
 	if !result.Allowed {
-		if result.Result != nil && len(result.Result.Message) > 0 {
-			// TODO: use code/reason/etc from status
-			return admission.NewForbidden(a, errors.New(result.Result.Message))
+		// start with a generic forbidden error
+		retval := admission.NewForbidden(a, errors.New("Not allowed by PodSecurity")).(*apierrors.StatusError)
+		// use message/reason/details/code from admission library if populated
+		if result.Result != nil {
+			if len(result.Result.Message) > 0 {
+				retval.ErrStatus.Message = result.Result.Message
+			}
+			if len(result.Result.Reason) > 0 {
+				retval.ErrStatus.Reason = result.Result.Reason
+			}
+			if result.Result.Details != nil {
+				retval.ErrStatus.Details = result.Result.Details
+			}
+			if result.Result.Code != 0 {
+				retval.ErrStatus.Code = result.Result.Code
+			}
 		}
-		return admission.NewForbidden(a, errors.New("Not allowed by PodSecurity"))
+		return retval
 	}
 	return nil
 }
@@ -191,32 +221,35 @@ func (p *Plugin) Validate(ctx context.Context, a admission.Attributes, o admissi
 type lazyConvertingAttributes struct {
 	admission.Attributes
 
-	convertObjectOnce sync.Once
-	convertedObject   runtime.Object
+	convertObjectOnce    sync.Once
+	convertedObject      runtime.Object
+	convertedObjectError error
 
-	convertOldObjectOnce sync.Once
-	convertedOldObject   runtime.Object
+	convertOldObjectOnce    sync.Once
+	convertedOldObject      runtime.Object
+	convertedOldObjectError error
 }
 
-func (l *lazyConvertingAttributes) GetObject() runtime.Object {
+func (l *lazyConvertingAttributes) GetObject() (runtime.Object, error) {
 	l.convertObjectOnce.Do(func() {
-		obj, err := convert(l.Attributes.GetObject())
-		if err != nil {
-			utilruntime.HandleError(err)
-		}
-		l.convertedObject = obj
+		l.convertedObject, l.convertedObjectError = convert(l.Attributes.GetObject())
 	})
-	return l.convertedObject
+	return l.convertedObject, l.convertedObjectError
 }
-func (l *lazyConvertingAttributes) GetOldObject() runtime.Object {
+
+func (l *lazyConvertingAttributes) GetOldObject() (runtime.Object, error) {
 	l.convertOldObjectOnce.Do(func() {
-		obj, err := convert(l.Attributes.GetOldObject())
-		if err != nil {
-			utilruntime.HandleError(err)
-		}
-		l.convertedOldObject = obj
+		l.convertedOldObject, l.convertedOldObjectError = convert(l.Attributes.GetOldObject())
 	})
-	return l.convertedOldObject
+	return l.convertedOldObject, l.convertedOldObjectError
+}
+
+func (l *lazyConvertingAttributes) GetOperation() admissionv1.Operation {
+	return admissionv1.Operation(l.Attributes.GetOperation())
+}
+
+func (l *lazyConvertingAttributes) GetUserName() string {
+	return l.GetUserInfo().GetName()
 }
 
 func convert(in runtime.Object) (runtime.Object, error) {

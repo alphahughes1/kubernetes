@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"k8s.io/apimachinery/pkg/util/clock"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func expectEntry(t *testing.T, c *LRUExpireCache, key interface{}, value interface{}) {
@@ -67,8 +67,22 @@ func TestSimpleRemove(t *testing.T) {
 	expectNotEntry(t, c, "long-lived")
 }
 
+func TestSimpleRemoveAll(t *testing.T) {
+	c := NewLRUExpireCache(10)
+	c.Add("long-lived", "12345", 10*time.Hour)
+	c.Add("other-long-lived", "12345", 10*time.Hour)
+	c.RemoveAll(func(k any) bool {
+		return k.(string) == "long-lived"
+	})
+
+	assertKeys(t, c.Keys(), []any{"other-long-lived"})
+
+	expectNotEntry(t, c, "long-lived")
+	expectEntry(t, c, "other-long-lived", "12345")
+}
+
 func TestExpiredGet(t *testing.T) {
-	fakeClock := clock.NewFakeClock(time.Now())
+	fakeClock := testingclock.NewFakeClock(time.Now())
 	c := NewLRUExpireCacheWithClock(10, fakeClock)
 	c.Add("short-lived", "12345", 1*time.Millisecond)
 	// ensure the entry expired

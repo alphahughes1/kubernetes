@@ -7,12 +7,12 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/pkg/errors"
 	"k8s.io/kube-openapi/pkg/validation/spec"
-	"sigs.k8s.io/kustomize/api/filesys"
 	"sigs.k8s.io/kustomize/api/ifc"
 	"sigs.k8s.io/kustomize/api/internal/plugins/builtinconfig"
 	"sigs.k8s.io/kustomize/api/types"
+	"sigs.k8s.io/kustomize/kyaml/errors"
+	"sigs.k8s.io/kustomize/kyaml/filesys"
 	"sigs.k8s.io/kustomize/kyaml/resid"
 	"sigs.k8s.io/yaml"
 )
@@ -39,7 +39,7 @@ func LoadConfigFromCRDs(
 		}
 		m, err := makeNameToApiMap(content)
 		if err != nil {
-			return nil, errors.Wrapf(err, "unable to parse open API definition from '%s'", path)
+			return nil, errors.WrapPrefixf(err, "unable to parse open API definition from '%s'", path)
 		}
 		otherTc, err := makeConfigFromApiMap(m)
 		if err != nil {
@@ -144,7 +144,7 @@ func loadCrdIntoConfig(
 		}
 		_, label := property.Extensions.GetString(xLabelSelector)
 		if label {
-			err = theConfig.AddLabelFieldSpec(
+			err = theConfig.AddCommonLabelsFieldSpec(
 				makeFs(theGvk, append(path, propName)))
 			if err != nil {
 				return
@@ -178,9 +178,12 @@ func loadCrdIntoConfig(
 			}
 		}
 		if property.Ref.GetURL() != nil {
-			loadCrdIntoConfig(
+			err = loadCrdIntoConfig(
 				theConfig, theGvk, theMap,
 				property.Ref.String(), append(path, propName))
+			if err != nil {
+				return
+			}
 		}
 	}
 	return nil

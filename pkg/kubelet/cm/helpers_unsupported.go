@@ -1,3 +1,4 @@
+//go:build !linux
 // +build !linux
 
 /*
@@ -19,16 +20,20 @@ limitations under the License.
 package cm
 
 import (
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
-	MinShares     = 0
+	MinShares = 0
+	MaxShares = 0
+
 	SharesPerCPU  = 0
 	MilliCPUToCPU = 0
 
-	MinQuotaPeriod = 0
+	QuotaPeriod      = 0
+	MinQuotaPeriod   = 0
+	MinMilliCPULimit = 0
 )
 
 // MilliCPUToQuota converts milliCPU and period to CFS quota values.
@@ -37,12 +42,12 @@ func MilliCPUToQuota(milliCPU, period int64) int64 {
 }
 
 // MilliCPUToShares converts the milliCPU to CFS shares.
-func MilliCPUToShares(milliCPU int64) int64 {
+func MilliCPUToShares(milliCPU int64) uint64 {
 	return 0
 }
 
 // ResourceConfigForPod takes the input pod and outputs the cgroup resource config.
-func ResourceConfigForPod(pod *v1.Pod, enforceCPULimit bool, cpuPeriod uint64) *ResourceConfig {
+func ResourceConfigForPod(pod *v1.Pod, enforceCPULimit bool, cpuPeriod uint64, enforceMemoryQoS bool) *ResourceConfig {
 	return nil
 }
 
@@ -67,10 +72,5 @@ func NodeAllocatableRoot(cgroupRoot string, cgroupsPerQOS bool, cgroupDriver str
 
 // GetKubeletContainer returns the cgroup the kubelet will use
 func GetKubeletContainer(kubeletCgroups string) (string, error) {
-	return "", nil
-}
-
-// GetRuntimeContainer returns the cgroup used by the container runtime
-func GetRuntimeContainer(containerRuntime, runtimeCgroups string) (string, error) {
 	return "", nil
 }

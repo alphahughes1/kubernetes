@@ -1,3 +1,4 @@
+//go:build libipmctl && cgo
 // +build libipmctl,cgo
 
 // Copyright 2020 Google Inc. All Rights Reserved.
@@ -21,8 +22,9 @@ package nvm
 import "C"
 import (
 	"fmt"
-	info "github.com/google/cadvisor/info/v1"
 	"sync"
+
+	info "github.com/google/cadvisor/info/v1"
 
 	"k8s.io/klog/v2"
 )
@@ -46,7 +48,7 @@ func init() {
 }
 
 // getAvgPowerBudget retrieves configured power budget
-// (in watts) for NVM devices. When libipmct is not available
+// (in watts) for NVM devices. When libipmctl is not available
 // zero is returned.
 func getAvgPowerBudget() (uint, error) {
 	// Get number of devices on the platform
@@ -59,7 +61,7 @@ func getAvgPowerBudget() (uint, error) {
 	}
 
 	if count == 0 {
-		klog.Warningf("There are no NVM devices!")
+		klog.V(4).Infof("There are no NVM devices.")
 		return uint(0), nil
 	}
 

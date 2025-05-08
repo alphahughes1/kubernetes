@@ -61,7 +61,7 @@ type quotaEvaluator struct {
 	// The technique is valuable for rollup activities to avoid fanout and reduce resource contention.
 	// We could move this into a library if another component needed it.
 	// queue is indexed by namespace, so that we bundle up on a per-namespace basis
-	queue      *workqueue.Type
+	queue      *workqueue.Typed[string]
 	workLock   sync.Mutex
 	work       map[string][]*admissionWaiter
 	dirtyWork  map[string][]*admissionWaiter
@@ -115,14 +115,14 @@ func NewQuotaEvaluator(quotaAccessor QuotaAccessor, ignoredResources map[schema.
 		config = &resourcequotaapi.Configuration{}
 	}
 
-	return &quotaEvaluator{
+	evaluator := &quotaEvaluator{
 		quotaAccessor:       quotaAccessor,
 		lockAcquisitionFunc: lockAcquisitionFunc,
 
 		ignoredResources: ignoredResources,
 		registry:         quotaRegistry,
 
-		queue:      workqueue.NewNamed("admission_quota_controller"),
+		queue:      workqueue.NewTypedWithConfig(workqueue.TypedQueueConfig[string]{Name: "admission_quota_controller"}),
 		work:       map[string][]*admissionWaiter{},
 		dirtyWork:  map[string][]*admissionWaiter{},
 		inProgress: sets.String{},
@@ -131,15 +131,28 @@ func NewQuotaEvaluator(quotaAccessor QuotaAccessor, ignoredResources map[schema.
 		stopCh:  stopCh,
 		config:  config,
 	}
+
+	// The queue underneath is starting a goroutine for metrics
+	// exportint that is only stopped on calling ShutDown.
+	// Given that QuotaEvaluator is created for each layer of apiserver
+	// and often not started for some of those (e.g. aggregated apiserver)
+	// we explicitly shut it down on stopCh signal even if it wasn't
+	// effectively started.
+	go evaluator.shutdownOnStop()
+
+	return evaluator
 }
 
-// Run begins watching and syncing.
-func (e *quotaEvaluator) run() {
+// start begins watching and syncing.
+func (e *quotaEvaluator) start() {
 	defer utilruntime.HandleCrash()
 
 	for i := 0; i < e.workers; i++ {
 		go wait.Until(e.doWork, time.Second, e.stopCh)
 	}
+}
+
+func (e *quotaEvaluator) shutdownOnStop() {
 	<-e.stopCh
 	klog.Infof("Shutting down quota evaluator")
 	e.queue.ShutDown()
@@ -202,16 +215,16 @@ func (e *quotaEvaluator) checkAttributes(ns string, admissionAttributes []*admis
 
 // checkQuotas checks the admission attributes against the passed quotas.  If a quota applies, it will attempt to update it
 // AFTER it has checked all the admissionAttributes.  The method breaks down into phase like this:
-// 0. make a copy of the quotas to act as a "running" quota so we know what we need to update and can still compare against the
-//    originals
-// 1. check each admission attribute to see if it fits within *all* the quotas.  If it doesn't fit, mark the waiter as failed
-//    and the running quota don't change.  If it did fit, check to see if any quota was changed.  It there was no quota change
-//    mark the waiter as succeeded.  If some quota did change, update the running quotas
-// 2. If no running quota was changed, return now since no updates are needed.
-// 3. for each quota that has changed, attempt an update.  If all updates succeeded, update all unset waiters to success status and return.  If the some
-//    updates failed on conflict errors and we have retries left, re-get the failed quota from our cache for the latest version
-//    and recurse into this method with the subset.  It's safe for us to evaluate ONLY the subset, because the other quota
-//    documents for these waiters have already been evaluated.  Step 1, will mark all the ones that should already have succeeded.
+//  0. make a copy of the quotas to act as a "running" quota so we know what we need to update and can still compare against the
+//     originals
+//  1. check each admission attribute to see if it fits within *all* the quotas.  If it didn't fit, mark the waiter as failed
+//     and the running quota doesn't change.  If it did fit, check to see if any quota was changed.  If there was no quota change
+//     mark the waiter as succeeded.  If some quota did change, update the running quotas
+//  2. If no running quota was changed, return now since no updates are needed.
+//  3. for each quota that has changed, attempt an update.  If all updates succeeded, update all unset waiters to success status and return.  If the some
+//     updates failed on conflict errors and we have retries left, re-get the failed quota from our cache for the latest version
+//     and recurse into this method with the subset.  It's safe for us to evaluate ONLY the subset, because the other quota
+//     documents for these waiters have already been evaluated.  Step 1, will mark all the ones that should already have succeeded.
 func (e *quotaEvaluator) checkQuotas(quotas []corev1.ResourceQuota, admissionAttributes []*admissionWaiter, remainingRetries int) {
 	// yet another copy to compare against originals to see if we actually have deltas
 	originalQuotas, err := copyQuotas(quotas)
@@ -380,9 +393,7 @@ func getMatchedLimitedScopes(evaluator quota.Evaluator, inputObject runtime.Obje
 			klog.ErrorS(err, "Error while matching limited Scopes")
 			return []corev1.ScopedResourceSelectorRequirement{}, err
 		}
-		for _, scope := range matched {
-			scopes = append(scopes, scope)
-		}
+		scopes = append(scopes, matched...)
 	}
 	return scopes, nil
 }
@@ -442,13 +453,10 @@ func CheckRequest(quotas []corev1.ResourceQuota, a admission.Attributes, evaluat
 		if err != nil {
 			return nil, fmt.Errorf("error matching scopes of quota %s, err: %v", resourceQuota.Name, err)
 		}
-		for _, scope := range localRestrictedScopes {
-			restrictedScopes = append(restrictedScopes, scope)
-		}
+		restrictedScopes = append(restrictedScopes, localRestrictedScopes...)
 
 		match, err := evaluator.Matches(&resourceQuota, inputObject)
 		if err != nil {
-			klog.Errorf("Error occurred while matching resource quota, %v, against input object. Err: %v", resourceQuota, err)
 			klog.ErrorS(err, "Error occurred while matching resource quota against input object",
 				"resourceQuota", resourceQuota)
 			return quotas, err
@@ -484,14 +492,24 @@ func CheckRequest(quotas []corev1.ResourceQuota, a admission.Attributes, evaluat
 	// as a result, we need to measure the usage of this object for quota
 	// on updates, we need to subtract the previous measured usage
 	// if usage shows no change, just return since it has no impact on quota
-	deltaUsage, err := evaluator.Usage(inputObject)
+	inputUsage, err := evaluator.Usage(inputObject)
 	if err != nil {
 		return quotas, err
 	}
 
 	// ensure that usage for input object is never negative (this would mean a resource made a negative resource requirement)
-	if negativeUsage := quota.IsNegative(deltaUsage); len(negativeUsage) > 0 {
+	if negativeUsage := quota.IsNegative(inputUsage); len(negativeUsage) > 0 {
 		return nil, admission.NewForbidden(a, fmt.Errorf("quota usage is negative for resource(s): %s", prettyPrintResourceNames(negativeUsage)))
+	}
+
+	// initialize a map of delta usage for each interesting quota index.
+	deltaUsageIndexMap := make(map[int]corev1.ResourceList, len(interestingQuotaIndexes))
+	for _, index := range interestingQuotaIndexes {
+		deltaUsageIndexMap[index] = inputUsage
+	}
+	var deltaUsageWhenNoInterestingQuota corev1.ResourceList
+	if admission.Create == a.GetOperation() && len(interestingQuotaIndexes) == 0 {
+		deltaUsageWhenNoInterestingQuota = inputUsage
 	}
 
 	if admission.Update == a.GetOperation() {
@@ -503,20 +521,55 @@ func CheckRequest(quotas []corev1.ResourceQuota, a admission.Attributes, evaluat
 		// if we can definitively determine that this is not a case of "create on update",
 		// then charge based on the delta.  Otherwise, bill the maximum
 		metadata, err := meta.Accessor(prevItem)
-		if err == nil && len(metadata.GetResourceVersion()) > 0 {
-			prevUsage, innerErr := evaluator.Usage(prevItem)
-			if innerErr != nil {
-				return quotas, innerErr
+		if err == nil {
+			if len(metadata.GetResourceVersion()) > 0 {
+				prevUsage, innerErr := evaluator.Usage(prevItem)
+				if innerErr != nil {
+					return quotas, innerErr
+				}
+
+				deltaUsage := quota.SubtractWithNonNegativeResult(inputUsage, prevUsage)
+				if len(interestingQuotaIndexes) == 0 {
+					deltaUsageWhenNoInterestingQuota = deltaUsage
+				}
+
+				for _, index := range interestingQuotaIndexes {
+					resourceQuota := quotas[index]
+					match, err := evaluator.Matches(&resourceQuota, prevItem)
+					if err != nil {
+						klog.ErrorS(err, "Error occurred while matching resource quota against the existing object",
+							"resourceQuota", resourceQuota)
+						return quotas, err
+					}
+					if match {
+						deltaUsageIndexMap[index] = deltaUsage
+					}
+				}
+			} else if len(interestingQuotaIndexes) == 0 {
+				deltaUsageWhenNoInterestingQuota = inputUsage
 			}
-			deltaUsage = quota.SubtractWithNonNegativeResult(deltaUsage, prevUsage)
 		}
 	}
 
-	// ignore items in deltaUsage with zero usage
-	deltaUsage = quota.RemoveZeros(deltaUsage)
+	// ignore items in deltaUsageIndexMap with zero usage,
+	// as they will not impact the quota.
+	for index := range deltaUsageIndexMap {
+		deltaUsageIndexMap[index] = quota.RemoveZeros(deltaUsageIndexMap[index])
+		if len(deltaUsageIndexMap[index]) == 0 {
+			delete(deltaUsageIndexMap, index)
+		}
+	}
+
 	// if there is no remaining non-zero usage, short-circuit and return
-	if len(deltaUsage) == 0 {
-		return quotas, nil
+	if len(interestingQuotaIndexes) != 0 {
+		if len(deltaUsageIndexMap) == 0 {
+			return quotas, nil
+		}
+	} else {
+		deltaUsage := quota.RemoveZeros(deltaUsageWhenNoInterestingQuota)
+		if len(deltaUsage) == 0 {
+			return quotas, nil
+		}
 	}
 
 	// verify that for every resource that had limited by default consumption
@@ -549,22 +602,29 @@ func CheckRequest(quotas []corev1.ResourceQuota, a admission.Attributes, evaluat
 
 	for _, index := range interestingQuotaIndexes {
 		resourceQuota := outQuotas[index]
+		deltaUsage, ok := deltaUsageIndexMap[index]
+		if !ok {
+			continue
+		}
 
 		hardResources := quota.ResourceNames(resourceQuota.Status.Hard)
 		requestedUsage := quota.Mask(deltaUsage, hardResources)
 		newUsage := quota.Add(resourceQuota.Status.Used, requestedUsage)
-		maskedNewUsage := quota.Mask(newUsage, quota.ResourceNames(requestedUsage))
 
-		if allowed, exceeded := quota.LessThanOrEqual(maskedNewUsage, resourceQuota.Status.Hard); !allowed {
-			failedRequestedUsage := quota.Mask(requestedUsage, exceeded)
-			failedUsed := quota.Mask(resourceQuota.Status.Used, exceeded)
-			failedHard := quota.Mask(resourceQuota.Status.Hard, exceeded)
-			return nil, admission.NewForbidden(a,
-				fmt.Errorf("exceeded quota: %s, requested: %s, used: %s, limited: %s",
-					resourceQuota.Name,
-					prettyPrint(failedRequestedUsage),
-					prettyPrint(failedUsed),
-					prettyPrint(failedHard)))
+		if a.GetSubresource() != "status" {
+			maskedNewUsage := quota.Mask(newUsage, quota.ResourceNames(requestedUsage))
+
+			if allowed, exceeded := quota.LessThanOrEqual(maskedNewUsage, resourceQuota.Status.Hard); !allowed {
+				failedRequestedUsage := quota.Mask(requestedUsage, exceeded)
+				failedUsed := quota.Mask(resourceQuota.Status.Used, exceeded)
+				failedHard := quota.Mask(resourceQuota.Status.Hard, exceeded)
+				return nil, admission.NewForbidden(a,
+					fmt.Errorf("exceeded quota: %s, requested: %s, used: %s, limited: %s",
+						resourceQuota.Name,
+						prettyPrint(failedRequestedUsage),
+						prettyPrint(failedUsed),
+						prettyPrint(failedHard)))
+			}
 		}
 
 		// update to the new usage number
@@ -582,17 +642,13 @@ func getScopeSelectorsFromQuota(quota corev1.ResourceQuota) []corev1.ScopedResou
 			Operator:  corev1.ScopeSelectorOpExists})
 	}
 	if quota.Spec.ScopeSelector != nil {
-		for _, scopeSelector := range quota.Spec.ScopeSelector.MatchExpressions {
-			selectors = append(selectors, scopeSelector)
-		}
+		selectors = append(selectors, quota.Spec.ScopeSelector.MatchExpressions...)
 	}
 	return selectors
 }
 
 func (e *quotaEvaluator) Evaluate(a admission.Attributes) error {
-	e.init.Do(func() {
-		go e.run()
-	})
+	e.init.Do(e.start)
 
 	// is this resource ignored?
 	gvr := a.GetResource()
@@ -662,11 +718,10 @@ func (e *quotaEvaluator) completeWork(ns string) {
 // returned namespace (regardless of whether the work item list is
 // empty).
 func (e *quotaEvaluator) getWork() (string, []*admissionWaiter, bool) {
-	uncastNS, shutdown := e.queue.Get()
+	ns, shutdown := e.queue.Get()
 	if shutdown {
 		return "", []*admissionWaiter{}, shutdown
 	}
-	ns := uncastNS.(string)
 
 	e.workLock.Lock()
 	defer e.workLock.Unlock()

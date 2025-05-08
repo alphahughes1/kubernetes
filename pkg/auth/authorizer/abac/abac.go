@@ -164,6 +164,7 @@ func subjectMatches(p abac.Policy, user user.Info) bool {
 			for _, group := range groups {
 				if p.Spec.Group == group {
 					matched = true
+					break
 				}
 			}
 			if !matched {
@@ -238,7 +239,7 @@ func (pl PolicyList) Authorize(ctx context.Context, a authorizer.Attributes) (au
 }
 
 // RulesFor returns rules for the given user and namespace.
-func (pl PolicyList) RulesFor(user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
+func (pl PolicyList) RulesFor(ctx context.Context, user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
 	var (
 		resourceRules    []authorizer.ResourceRuleInfo
 		nonResourceRules []authorizer.NonResourceRuleInfo

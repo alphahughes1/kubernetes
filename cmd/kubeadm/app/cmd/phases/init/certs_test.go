@@ -17,10 +17,10 @@ limitations under the License.
 package phases
 
 import (
-	"os"
 	"testing"
 
 	"github.com/spf13/cobra"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	certstestutil "k8s.io/kubernetes/cmd/kubeadm/app/util/certs"
@@ -43,8 +43,7 @@ func TestCreateSparseCerts(t *testing.T) {
 		t.Run(test.Name, func(t *testing.T) {
 			pkiutiltesting.Reset()
 
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 
 			certstestutil.WritePKIFiles(t, tmpdir, test.Files)
 

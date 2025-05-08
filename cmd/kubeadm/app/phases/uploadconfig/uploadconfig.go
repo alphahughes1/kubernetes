@@ -23,7 +23,9 @@ import (
 	rbac "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
@@ -46,13 +48,18 @@ func UploadConfiguration(cfg *kubeadmapi.InitConfiguration, client clientset.Int
 	clusterConfigurationToUpload := cfg.ClusterConfiguration.DeepCopy()
 	clusterConfigurationToUpload.ComponentConfigs = kubeadmapi.ComponentConfigMap{}
 
+	// restore the resolved Kubernetes version as CI Kubernetes version if needed
+	if len(clusterConfigurationToUpload.CIKubernetesVersion) > 0 {
+		clusterConfigurationToUpload.KubernetesVersion = clusterConfigurationToUpload.CIKubernetesVersion
+	}
+
 	// Marshal the ClusterConfiguration into YAML
-	clusterConfigurationYaml, err := configutil.MarshalKubeadmConfigObject(clusterConfigurationToUpload)
+	clusterConfigurationYaml, err := configutil.MarshalKubeadmConfigObject(clusterConfigurationToUpload, kubeadmapiv1.SchemeGroupVersion)
 	if err != nil {
 		return err
 	}
 
-	err = apiclient.CreateOrMutateConfigMap(client, &v1.ConfigMap{
+	err = apiclient.CreateOrMutate(client.CoreV1().ConfigMaps(metav1.NamespaceSystem), &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      kubeadmconstants.KubeadmConfigConfigMap,
 			Namespace: metav1.NamespaceSystem,
@@ -71,7 +78,7 @@ func UploadConfiguration(cfg *kubeadmapi.InitConfiguration, client clientset.Int
 	}
 
 	// Ensure that the NodesKubeadmConfigClusterRoleName exists
-	err = apiclient.CreateOrUpdateRole(client, &rbac.Role{
+	err = apiclient.CreateOrUpdate(client.RbacV1().Roles(metav1.NamespaceSystem), &rbac.Role{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      NodesKubeadmConfigClusterRoleName,
 			Namespace: metav1.NamespaceSystem,
@@ -92,7 +99,7 @@ func UploadConfiguration(cfg *kubeadmapi.InitConfiguration, client clientset.Int
 	// Binds the NodesKubeadmConfigClusterRoleName to all the bootstrap tokens
 	// that are members of the system:bootstrappers:kubeadm:default-node-token group
 	// and to all nodes
-	return apiclient.CreateOrUpdateRoleBinding(client, &rbac.RoleBinding{
+	return apiclient.CreateOrUpdate(client.RbacV1().RoleBindings(metav1.NamespaceSystem), &rbac.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      NodesKubeadmConfigClusterRoleName,
 			Namespace: metav1.NamespaceSystem,

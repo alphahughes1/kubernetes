@@ -17,14 +17,13 @@ limitations under the License.
 package phases
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/lithammer/dedent"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
 )
 
 const (
@@ -63,10 +62,11 @@ func TestGetEtcdDataDir(t *testing.T) {
 		writeManifest bool
 		validConfig   bool
 	}{
-		"non-existent file returns error": {
-			expectErr:     true,
+		"non-existent file returns default data dir": {
+			expectErr:     false,
 			writeManifest: false,
 			validConfig:   true,
+			dataDir:       "/var/lib/etcd",
 		},
 		"return etcd data dir": {
 			dataDir:       "/path/to/etcd",
@@ -98,12 +98,11 @@ func TestGetEtcdDataDir(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 
 			manifestPath := filepath.Join(tmpdir, "etcd.yaml")
 			if test.writeManifest {
-				err := ioutil.WriteFile(manifestPath, []byte(test.podYaml), 0644)
+				err := os.WriteFile(manifestPath, []byte(test.podYaml), 0644)
 				if err != nil {
 					t.Fatalf(dedent.Dedent("failed to write pod manifest\n%s\n\tfatal error: %v"), name, err)
 				}

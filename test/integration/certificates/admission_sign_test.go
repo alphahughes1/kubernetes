@@ -26,8 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
-
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	"k8s.io/kubernetes/test/integration/authutil"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
@@ -59,6 +59,11 @@ func TestCSRSignerNameSigningPlugin(t *testing.T) {
 			s := kubeapiservertesting.StartTestServerOrDie(t, kubeapiservertesting.NewDefaultTestServerOptions(), []string{"--authorization-mode=RBAC"}, framework.SharedEtcd())
 			defer s.TearDownFn()
 			client := clientset.NewForConfigOrDie(s.ClientConfig)
+
+			// Drop the default RBAC superuser permissions to rely on the internal superuser authorizer
+			if err := client.RbacV1().ClusterRoleBindings().Delete(context.TODO(), "cluster-admin", metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
 
 			// Grant 'test-user' permission to sign CertificateSigningRequests with the specified signerName.
 			const username = "test-user"
@@ -100,6 +105,12 @@ dgA7Fe4tMAoGCCqGSM49BAMCA0gAMEUCIQCTT1YWQZaAqfQ2oBxzOkJE2BqLFxhz
 -----END CERTIFICATE-----
 Trailing non-PEM content
 `)
+
+			// superuser should always have permission to sign; dry-run so we don't actually modify the CSR so the non-superuser can attempt as well
+			if _, err := client.CertificatesV1().CertificateSigningRequests().UpdateStatus(context.TODO(), csr, metav1.UpdateOptions{DryRun: []string{metav1.DryRunAll}}); err != nil {
+				t.Errorf("expected no superuser error but got: %v", err)
+			}
+
 			_, err := testuserClient.CertificatesV1().CertificateSigningRequests().UpdateStatus(context.TODO(), csr, metav1.UpdateOptions{})
 			if err != nil && test.error != err.Error() {
 				t.Errorf("expected error %q but got: %v", test.error, err)
@@ -123,8 +134,8 @@ func grantUserPermissionToSignFor(t *testing.T, client clientset.Interface, user
 	}
 	signRule := cr.Rules[0]
 	statusRule := cr.Rules[1]
-	waitForNamedAuthorizationUpdate(t, client.AuthorizationV1(), username, "", signRule.Verbs[0], signRule.ResourceNames[0], schema.GroupResource{Group: signRule.APIGroups[0], Resource: signRule.Resources[0]}, true)
-	waitForNamedAuthorizationUpdate(t, client.AuthorizationV1(), username, "", statusRule.Verbs[0], "", schema.GroupResource{Group: statusRule.APIGroups[0], Resource: statusRule.Resources[0]}, true)
+	authutil.WaitForNamedAuthorizationUpdate(t, context.TODO(), client.AuthorizationV1(), username, "", signRule.Verbs[0], signRule.ResourceNames[0], schema.GroupResource{Group: signRule.APIGroups[0], Resource: signRule.Resources[0]}, true)
+	authutil.WaitForNamedAuthorizationUpdate(t, context.TODO(), client.AuthorizationV1(), username, "", statusRule.Verbs[0], "", schema.GroupResource{Group: statusRule.APIGroups[0], Resource: statusRule.Resources[0]}, true)
 }
 
 func buildSigningClusterRoleForSigners(name string, signerNames ...string) *rbacv1.ClusterRole {

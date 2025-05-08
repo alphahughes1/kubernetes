@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -30,8 +31,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/component-base/featuregate"
 	"k8s.io/pod-security-admission/api"
 	"k8s.io/pod-security-admission/policy"
+)
+
+const (
+	newestMinorVersionToTest            = 32
+	podOSBasedRestrictionEnabledVersion = 29
 )
 
 // Options hold configuration for running integration tests against an existing server.
@@ -40,6 +47,11 @@ type Options struct {
 	// namespaces, pods, and pod-template-containing objects.
 	// Required.
 	ClientConfig *rest.Config
+
+	// Features optionally provides information about which feature gates are enabled.
+	// This is used to skip failure cases for negative tests of data in alpha/beta fields.
+	// If unset, all testcases are run.
+	Features featuregate.FeatureGate
 
 	// CreateNamespace is an optional stub for creating a namespace with the given name and labels.
 	// Returning an error fails the test.
@@ -66,8 +78,8 @@ func toJSON(pod *corev1.Pod) string {
 // checksForLevelAndVersion returns the set of check IDs that apply when evaluating the given level and version.
 // checks are assumed to be well-formed and valid to pass to policy.NewEvaluator().
 // level must be api.LevelRestricted or api.LevelBaseline
-func checksForLevelAndVersion(checks []policy.Check, level api.Level, version api.Version) ([]string, error) {
-	retval := []string{}
+func checksForLevelAndVersion(checks []policy.Check, level api.Level, version api.Version) ([]policy.CheckID, error) {
+	retval := []policy.CheckID{}
 	for _, check := range checks {
 		if !version.Older(check.Versions[0].MinimumVersion) && (level == check.Level || level == api.LevelRestricted) {
 			retval = append(retval, check.ID)
@@ -76,22 +88,74 @@ func checksForLevelAndVersion(checks []policy.Check, level api.Level, version ap
 	return retval, nil
 }
 
-// maxMinorVersionToTest returns the maximum minor version to exercise for a given set of checks.
-// checks are assumed to be well-formed and valid to pass to policy.NewEvaluator().
-func maxMinorVersionToTest(checks []policy.Check) (int, error) {
-	// start with the release under development (1.22 at time of writing).
-	// this can be incremented to the current version whenever is convenient.
-	maxTestMinor := 22
+// computeVersionsToTest returns all the versions that have distinct checks defined,
+// all the versions that have distinct minimal valid pod fixtures defined, and
+// any hard-coded versions that should always be tested.
+//
+// This lets us sparsely test all versions with distinct fixture or policy changes
+// without needing to exercise every intermediate version that had no changes.
+func computeVersionsToTest(t *testing.T, checks []policy.Check) []api.Version {
+	seenVersions := map[api.Version]bool{}
+
+	// include all versions we have registered distinct checks for
 	for _, check := range checks {
-		lastCheckVersion := check.Versions[len(check.Versions)-1].MinimumVersion
-		if lastCheckVersion.Major() != 1 {
-			return 0, fmt.Errorf("expected major version 1, got %d", lastCheckVersion.Major())
-		}
-		if lastCheckVersion.Minor() > maxTestMinor {
-			maxTestMinor = lastCheckVersion.Minor()
+		for _, checkVersion := range check.Versions {
+			if checkVersion.MinimumVersion.Major() != 1 {
+				t.Fatalf("expected major version 1, got %d", checkVersion.MinimumVersion.Major())
+			}
+			seenVersions[checkVersion.MinimumVersion] = true
 		}
 	}
-	return maxTestMinor, nil
+	if len(seenVersions) == 0 {
+		t.Fatal("no versions defined for checks")
+	}
+
+	// include all versions we have registered distinct fixtures for
+	for _, versionsForLevel := range minimalValidPods {
+		for version := range versionsForLevel {
+			if version.Major() != 1 {
+				t.Fatalf("expected major version 1, got %d", version.Major())
+			}
+			seenVersions[version] = true
+		}
+	}
+
+	for _, versionsForLevel := range minimalValidLinuxPods {
+		for version := range versionsForLevel {
+			if version.Major() != 1 {
+				t.Fatalf("expected major version 1, got %d", version.Major())
+			}
+			seenVersions[version] = true
+		}
+	}
+
+	for _, versionsForLevel := range minimalValidWindowsPods {
+		for version := range versionsForLevel {
+			if version.Major() != 1 {
+				t.Fatalf("expected major version 1, got %d", version.Major())
+			}
+			seenVersions[version] = true
+		}
+	}
+
+	alwaysIncludeVersions := []api.Version{
+		// include the oldest version by default
+		api.MajorMinorVersion(1, 0),
+		api.MajorMinorVersion(1, newestMinorVersionToTest),
+	}
+	for _, version := range alwaysIncludeVersions {
+		seenVersions[version] = true
+	}
+
+	versions := []api.Version{}
+	for version := range seenVersions {
+		versions = append(versions, version)
+	}
+	sort.Slice(versions, func(i, j int) bool { return versions[i].Older(versions[j]) })
+
+	// TODO: consider exposing an option to test all versions instead of sparse ones
+
+	return versions
 }
 
 type testWarningHandler struct {
@@ -104,6 +168,7 @@ func (t *testWarningHandler) HandleWarningHeader(code int, agent string, warning
 	defer t.lock.Unlock()
 	t.warnings = append(t.warnings, warning)
 }
+
 func (t *testWarningHandler) FlushWarnings() []string {
 	t.lock.Lock()
 	defer t.lock.Unlock()
@@ -133,15 +198,12 @@ func Run(t *testing.T, opts Options) {
 	if err != nil {
 		t.Fatalf("invalid checks: %v", err)
 	}
-	maxMinor, err := maxMinorVersionToTest(opts.Checks)
-	if err != nil {
-		t.Fatalf("invalid checks: %v", err)
-	}
+
+	versionsToTest := computeVersionsToTest(t, opts.Checks)
 
 	for _, level := range []api.Level{api.LevelBaseline, api.LevelRestricted} {
-		for minor := 0; minor <= maxMinor; minor++ {
-			version := api.MajorMinorVersion(1, minor)
-
+		for _, version := range versionsToTest {
+			minor := version.Minor()
 			// create test name
 			ns := fmt.Sprintf("podsecurity-%s-1-%d", level, minor)
 
@@ -245,18 +307,45 @@ func Run(t *testing.T, opts Options) {
 						return
 					}
 				}
+
 				if expectSuccess && len(warningText) > 0 {
-					t.Errorf("%d: unexpected warning creating %s: %v", i, toJSON(pod), warningText)
+					if (len(expectErrorSubstring) > 0 && strings.Contains(warningText, expectErrorSubstring)) ||
+						strings.Contains(warningText, policy.UnknownForbiddenReason) {
+						t.Errorf("%d: unexpected warning creating %s: %v", i, toJSON(pod), warningText)
+					}
 				}
 			}
 
-			minimalValidPod, err := getMinimalValidPod(level, version)
+			minimalValidOSNeutralPod, err := GetMinimalValidPod(level, version)
 			if err != nil {
 				t.Fatal(err)
 			}
+			var minimalValidLinuxPod, minimalValidWindowsPod *corev1.Pod
+			if level == api.LevelRestricted && version.Minor() >= podOSBasedRestrictionEnabledVersion {
+				minimalValidLinuxPod, err = GetMinimalValidLinuxPod(level, version)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				minimalValidWindowsPod, err = GetMinimalValidWindowsPod(level, version)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
 			t.Run(ns+"_pass_base", func(t *testing.T) {
-				createPod(t, 0, minimalValidPod.DeepCopy(), true, "")
-				createController(t, 0, minimalValidPod.DeepCopy(), true, "")
+				createPod(t, 0, minimalValidOSNeutralPod.DeepCopy(), true, "")
+				createController(t, 0, minimalValidOSNeutralPod.DeepCopy(), true, "")
+				if minimalValidLinuxPod != nil && minimalValidWindowsPod != nil {
+					// Linux specific pods
+					createPod(t, 0, minimalValidLinuxPod.DeepCopy(), true, "")
+					createController(t, 0, minimalValidLinuxPod.DeepCopy(), true, "")
+
+					// Windows specific pods
+					createPod(t, 0, minimalValidWindowsPod.DeepCopy(), true, "")
+					createController(t, 0, minimalValidWindowsPod.DeepCopy(), true, "")
+				}
+
 			})
 
 			checkIDs, err := checksForLevelAndVersion(opts.Checks, level, version)
@@ -272,13 +361,24 @@ func Run(t *testing.T, opts Options) {
 					t.Fatal(err)
 				}
 
-				t.Run(ns+"_pass_"+checkID, func(t *testing.T) {
+				t.Run(ns+"_pass_"+string(checkID), func(t *testing.T) {
 					for i, pod := range checkData.pass {
 						createPod(t, i, pod, true, "")
 						createController(t, i, pod, true, "")
 					}
 				})
-				t.Run(ns+"_fail_"+checkID, func(t *testing.T) {
+
+				// see if any features required for failure cases are disabled
+				var disabledRequiredFeatures []featuregate.Feature
+				for _, f := range checkData.failRequiresFeatures {
+					if opts.Features != nil && !opts.Features.Enabled(f) {
+						disabledRequiredFeatures = append(disabledRequiredFeatures, f)
+					}
+				}
+				t.Run(ns+"_fail_"+string(checkID), func(t *testing.T) {
+					if len(disabledRequiredFeatures) > 0 {
+						t.Skipf("features required for failure cases are disabled: %v", disabledRequiredFeatures)
+					}
 					for i, pod := range checkData.fail {
 						createPod(t, i, pod, false, checkData.expectErrorSubstring)
 						createController(t, i, pod, false, checkData.expectErrorSubstring)

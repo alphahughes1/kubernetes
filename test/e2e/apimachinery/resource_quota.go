@@ -18,27 +18,47 @@ package apimachinery
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1beta1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
+	quota "k8s.io/apiserver/pkg/quota/v1"
 	clientset "k8s.io/client-go/kubernetes"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
+	watchtools "k8s.io/client-go/tools/watch"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/quota/v1/evaluator/core"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 	"k8s.io/kubernetes/test/utils/crd"
 	imageutils "k8s.io/kubernetes/test/utils/image"
+	admissionapi "k8s.io/pod-security-admission/api"
 	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 const (
@@ -48,31 +68,33 @@ const (
 )
 
 var classGold = "gold"
+var classSilver = "silver"
 var extendedResourceName = "example.com/dongle"
 
 var _ = SIGDescribe("ResourceQuota", func() {
 	f := framework.NewDefaultFramework("resourcequota")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 
 	/*
 		Release: v1.16
 		Testname: ResourceQuota, object count quota, resourcequotas
 		Description: Create a ResourceQuota. Creation MUST be successful and its ResourceQuotaStatus MUST match to expected used and total allowed resource quota count within namespace.
 	*/
-	framework.ConformanceIt("should create a ResourceQuota and ensure its status is promptly calculated.", func() {
+	framework.ConformanceIt("should create a ResourceQuota and ensure its status is promptly calculated.", func(ctx context.Context) {
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName := "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -83,56 +105,56 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Create a Service. Its creation MUST be successful and resource usage count against the Service object and resourceQuota object MUST be captured in ResourceQuotaStatus of the ResourceQuota.
 		Delete the Service. Deletion MUST succeed and resource usage count against the Service object MUST be released from ResourceQuotaStatus of the ResourceQuota.
 	*/
-	framework.ConformanceIt("should create a ResourceQuota and capture the life of a service.", func() {
+	framework.ConformanceIt("should create a ResourceQuota and capture the life of a service.", func(ctx context.Context) {
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName := "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a Service")
 		service := newTestServiceForQuota("test-service", v1.ServiceTypeClusterIP, false)
-		service, err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(context.TODO(), service, metav1.CreateOptions{})
+		service, err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(ctx, service, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a NodePort Service")
 		nodeport := newTestServiceForQuota("test-service-np", v1.ServiceTypeNodePort, false)
-		nodeport, err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(context.TODO(), nodeport, metav1.CreateOptions{})
+		nodeport, err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(ctx, nodeport, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Not allowing a LoadBalancer Service with NodePort to be created that exceeds remaining quota")
-		loadbalancer := newTestServiceForQuota("test-service-lb", v1.ServiceTypeLoadBalancer, false)
-		_, err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(context.TODO(), loadbalancer, metav1.CreateOptions{})
-		framework.ExpectError(err)
+		loadbalancer := newTestServiceForQuota("test-service-lb", v1.ServiceTypeLoadBalancer, true)
+		_, err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(ctx, loadbalancer, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.HaveOccurred())
 
 		ginkgo.By("Ensuring resource quota status captures service creation")
 		usedResources = v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
 		usedResources[v1.ResourceServices] = resource.MustParse("2")
 		usedResources[v1.ResourceServicesNodePorts] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting Services")
-		err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Delete(context.TODO(), service.Name, metav1.DeleteOptions{})
+		err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Delete(ctx, service.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
-		err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Delete(context.TODO(), nodeport.Name, metav1.DeleteOptions{})
+		err = f.ClientSet.CoreV1().Services(f.Namespace.Name).Delete(ctx, nodeport.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released usage")
 		usedResources[v1.ResourceServices] = resource.MustParse("0")
 		usedResources[v1.ResourceServicesNodePorts] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -143,13 +165,13 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Create a Secret. Its creation MUST be successful and resource usage count against the Secret object and resourceQuota object MUST be captured in ResourceQuotaStatus of the ResourceQuota.
 		Delete the Secret. Deletion MUST succeed and resource usage count against the Secret object MUST be released from ResourceQuotaStatus of the ResourceQuota.
 	*/
-	framework.ConformanceIt("should create a ResourceQuota and capture the life of a secret.", func() {
+	framework.ConformanceIt("should create a ResourceQuota and capture the life of a secret.", func(ctx context.Context) {
 		ginkgo.By("Discovering how many secrets are in namespace by default")
 		found, unchanged := 0, 0
 		// On contended servers the service account controller can slow down, leading to the count changing during a run.
 		// Wait up to 5s for the count to stabilize, assuming that updates come at a consistent rate, and are not held indefinitely.
-		wait.Poll(1*time.Second, 30*time.Second, func() (bool, error) {
-			secrets, err := f.ClientSet.CoreV1().Secrets(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{})
+		err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, false, func(ctx context.Context) (bool, error) {
+			secrets, err := f.ClientSet.CoreV1().Secrets(f.Namespace.Name).List(ctx, metav1.ListOptions{})
 			framework.ExpectNoError(err)
 			if len(secrets.Items) == found {
 				// loop until the number of secrets has stabilized for 5 seconds
@@ -160,30 +182,31 @@ var _ = SIGDescribe("ResourceQuota", func() {
 			found = len(secrets.Items)
 			return false, nil
 		})
+		framework.ExpectNoError(err)
 		defaultSecrets := fmt.Sprintf("%d", found)
 		hardSecrets := fmt.Sprintf("%d", found+1)
 
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName := "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
 		resourceQuota.Spec.Hard[v1.ResourceSecrets] = resource.MustParse(hardSecrets)
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
 		usedResources[v1.ResourceSecrets] = resource.MustParse(defaultSecrets)
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a Secret")
 		secret := newTestSecretForQuota("test-secret")
-		secret, err = f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Create(context.TODO(), secret, metav1.CreateOptions{})
+		secret, err = f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Create(ctx, secret, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status captures secret creation")
@@ -191,16 +214,16 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceSecrets] = resource.MustParse(hardSecrets)
 		// we expect there to be two secrets because each namespace will receive
 		// a service account token secret by default
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting a secret")
-		err = f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{})
+		err = f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(ctx, secret.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released usage")
 		usedResources[v1.ResourceSecrets] = resource.MustParse(defaultSecrets)
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -213,21 +236,21 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Update the successfully created pod's resource requests. Updation MUST fail as a Pod can not dynamically update its resource requirements.
 		Delete the successfully created Pod. Pod Deletion MUST be scuccessful and it MUST release the allocated resource counts from ResourceQuotaStatus of the ResourceQuota.
 	*/
-	framework.ConformanceIt("should create a ResourceQuota and capture the life of a pod.", func() {
+	framework.ConformanceIt("should create a ResourceQuota and capture the life of a pod.", func(ctx context.Context) {
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName := "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a Pod that fits quota")
@@ -240,7 +263,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		requests[v1.ResourceName(extendedResourceName)] = resource.MustParse("2")
 		limits[v1.ResourceName(extendedResourceName)] = resource.MustParse("2")
 		pod := newTestPodForQuota(f, podName, requests, limits)
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 		podToUpdate := pod
 
@@ -251,7 +274,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceMemory] = requests[v1.ResourceMemory]
 		usedResources[v1.ResourceEphemeralStorage] = requests[v1.ResourceEphemeralStorage]
 		usedResources[v1.ResourceName(v1.DefaultResourceRequestsPrefix+extendedResourceName)] = requests[v1.ResourceName(extendedResourceName)]
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Not allowing a pod to be created that exceeds remaining quota")
@@ -259,8 +282,8 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		requests[v1.ResourceCPU] = resource.MustParse("600m")
 		requests[v1.ResourceMemory] = resource.MustParse("100Mi")
 		pod = newTestPodForQuota(f, "fail-pod", requests, v1.ResourceList{})
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
-		framework.ExpectError(err)
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.HaveOccurred())
 
 		ginkgo.By("Not allowing a pod to be created that exceeds remaining quota(validation on extended resources)")
 		requests = v1.ResourceList{}
@@ -271,8 +294,8 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		requests[v1.ResourceName(extendedResourceName)] = resource.MustParse("2")
 		limits[v1.ResourceName(extendedResourceName)] = resource.MustParse("2")
 		pod = newTestPodForQuota(f, "fail-pod-for-extended-resource", requests, limits)
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
-		framework.ExpectError(err)
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.HaveOccurred())
 
 		ginkgo.By("Ensuring a pod cannot update its resource requirements")
 		// a pod cannot dynamically update its resource requirements.
@@ -281,15 +304,15 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		requests[v1.ResourceMemory] = resource.MustParse("100Mi")
 		requests[v1.ResourceEphemeralStorage] = resource.MustParse("10Gi")
 		podToUpdate.Spec.Containers[0].Resources.Requests = requests
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Update(context.TODO(), podToUpdate, metav1.UpdateOptions{})
-		framework.ExpectError(err)
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Update(ctx, podToUpdate, metav1.UpdateOptions{})
+		gomega.Expect(err).To(gomega.HaveOccurred())
 
 		ginkgo.By("Ensuring attempts to update pod resource requirements did not change quota usage")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), podName, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podName, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
@@ -299,7 +322,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceMemory] = resource.MustParse("0")
 		usedResources[v1.ResourceEphemeralStorage] = resource.MustParse("0")
 		usedResources[v1.ResourceName(v1.DefaultResourceRequestsPrefix+extendedResourceName)] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 	/*
@@ -309,12 +332,12 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Create a ConfigMap. Its creation MUST be successful and resource usage count against the ConfigMap object MUST be captured in ResourceQuotaStatus of the ResourceQuota.
 		Delete the ConfigMap. Deletion MUST succeed and resource usage count against the ConfigMap object MUST be released from ResourceQuotaStatus of the ResourceQuota.
 	*/
-	framework.ConformanceIt("should create a ResourceQuota and capture the life of a configMap.", func() {
+	framework.ConformanceIt("should create a ResourceQuota and capture the life of a configMap.", func(ctx context.Context) {
 		found, unchanged := 0, 0
 		// On contended servers the service account controller can slow down, leading to the count changing during a run.
 		// Wait up to 15s for the count to stabilize, assuming that updates come at a consistent rate, and are not held indefinitely.
-		wait.Poll(1*time.Second, time.Minute, func() (bool, error) {
-			configmaps, err := f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{})
+		err := wait.PollUntilContextTimeout(ctx, 1*time.Second, time.Minute, false, func(ctx context.Context) (bool, error) {
+			configmaps, err := f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).List(ctx, metav1.ListOptions{})
 			framework.ExpectNoError(err)
 			if len(configmaps.Items) == found {
 				// loop until the number of configmaps has stabilized for 15 seconds
@@ -325,46 +348,47 @@ var _ = SIGDescribe("ResourceQuota", func() {
 			found = len(configmaps.Items)
 			return false, nil
 		})
+		framework.ExpectNoError(err)
 		defaultConfigMaps := fmt.Sprintf("%d", found)
 		hardConfigMaps := fmt.Sprintf("%d", found+1)
 
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName := "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
 		resourceQuota.Spec.Hard[v1.ResourceConfigMaps] = resource.MustParse(hardConfigMaps)
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
 		usedResources[v1.ResourceConfigMaps] = resource.MustParse(defaultConfigMaps)
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ConfigMap")
 		configMap := newTestConfigMapForQuota("test-configmap")
-		configMap, err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(context.TODO(), configMap, metav1.CreateOptions{})
+		configMap, err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(ctx, configMap, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status captures configMap creation")
 		usedResources = v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
 		usedResources[v1.ResourceConfigMaps] = resource.MustParse(hardConfigMaps)
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting a ConfigMap")
-		err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Delete(context.TODO(), configMap.Name, metav1.DeleteOptions{})
+		err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Delete(ctx, configMap.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released usage")
 		usedResources[v1.ResourceConfigMaps] = resource.MustParse(defaultConfigMaps)
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -375,33 +399,33 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Create a ReplicationController. Its creation MUST be successful and resource usage count against the ReplicationController object MUST be captured in ResourceQuotaStatus of the ResourceQuota.
 		Delete the ReplicationController. Deletion MUST succeed and resource usage count against the ReplicationController object MUST be released from ResourceQuotaStatus of the ResourceQuota.
 	*/
-	framework.ConformanceIt("should create a ResourceQuota and capture the life of a replication controller.", func() {
+	framework.ConformanceIt("should create a ResourceQuota and capture the life of a replication controller.", func(ctx context.Context) {
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName := "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
 		usedResources[v1.ResourceReplicationControllers] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ReplicationController")
 		replicationController := newTestReplicationControllerForQuota("test-rc", "nginx", 0)
-		replicationController, err = f.ClientSet.CoreV1().ReplicationControllers(f.Namespace.Name).Create(context.TODO(), replicationController, metav1.CreateOptions{})
+		replicationController, err = f.ClientSet.CoreV1().ReplicationControllers(f.Namespace.Name).Create(ctx, replicationController, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status captures replication controller creation")
 		usedResources = v1.ResourceList{}
 		usedResources[v1.ResourceReplicationControllers] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting a ReplicationController")
@@ -410,7 +434,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		// detached. ReplicationControllers default to "orphan", which
 		// is different from most resources. (Why? To preserve a common
 		// workflow from prior to the GC's introduction.)
-		err = f.ClientSet.CoreV1().ReplicationControllers(f.Namespace.Name).Delete(context.TODO(), replicationController.Name, metav1.DeleteOptions{
+		err = f.ClientSet.CoreV1().ReplicationControllers(f.Namespace.Name).Delete(ctx, replicationController.Name, metav1.DeleteOptions{
 			PropagationPolicy: func() *metav1.DeletionPropagation {
 				p := metav1.DeletePropagationBackground
 				return &p
@@ -420,7 +444,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 
 		ginkgo.By("Ensuring resource quota status released usage")
 		usedResources[v1.ResourceReplicationControllers] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -431,42 +455,92 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Create a ReplicaSet. Its creation MUST be successful and resource usage count against the ReplicaSet object MUST be captured in ResourceQuotaStatus of the ResourceQuota.
 		Delete the ReplicaSet. Deletion MUST succeed and resource usage count against the ReplicaSet object MUST be released from ResourceQuotaStatus of the ResourceQuota.
 	*/
-	framework.ConformanceIt("should create a ResourceQuota and capture the life of a replica set.", func() {
+	framework.ConformanceIt("should create a ResourceQuota and capture the life of a replica set.", func(ctx context.Context) {
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName := "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
 		usedResources[v1.ResourceName("count/replicasets.apps")] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ReplicaSet")
 		replicaSet := newTestReplicaSetForQuota("test-rs", "nginx", 0)
-		replicaSet, err = f.ClientSet.AppsV1().ReplicaSets(f.Namespace.Name).Create(context.TODO(), replicaSet, metav1.CreateOptions{})
+		replicaSet, err = f.ClientSet.AppsV1().ReplicaSets(f.Namespace.Name).Create(ctx, replicaSet, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status captures replicaset creation")
 		usedResources = v1.ResourceList{}
 		usedResources[v1.ResourceName("count/replicasets.apps")] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting a ReplicaSet")
-		err = f.ClientSet.AppsV1().ReplicaSets(f.Namespace.Name).Delete(context.TODO(), replicaSet.Name, metav1.DeleteOptions{})
+		err = f.ClientSet.AppsV1().ReplicaSets(f.Namespace.Name).Delete(ctx, replicaSet.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released usage")
 		usedResources[v1.ResourceName("count/replicasets.apps")] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		framework.ExpectNoError(err)
+	})
+
+	/*
+		Release: v1.31
+		Testname: ResourceQuota, object count quota, ResourceClaim
+		Description: Create a ResourceQuota. Creation MUST be successful and its ResourceQuotaStatus MUST match to expected used and total allowed resource quota count within namespace.
+		Create ResourceClaim. Creation MUST be successful and resource usage count against the ResourceClaim object MUST be captured in ResourceQuotaStatus of the ResourceQuota.
+		Delete the ResourceClaim. Deletion MUST succeed and resource usage count against the ResourceClaim object MUST be released from ResourceQuotaStatus of the ResourceQuota.
+		[NotConformancePromotable] alpha feature
+	*/
+	f.It("should create a ResourceQuota and capture the life of a ResourceClaim", feature.DynamicResourceAllocation, func(ctx context.Context) {
+		ginkgo.By("Counting existing ResourceQuota")
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Creating a ResourceQuota")
+		quotaName := "test-quota"
+		resourceQuota := newTestResourceQuotaDRA(quotaName)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota status is calculated")
+		usedResources := v1.ResourceList{}
+		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
+		usedResources[core.ClaimObjectCountName] = resource.MustParse("0")
+		usedResources[core.V1ResourceByDeviceClass(classGold)] = resource.MustParse("0")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Creating a ResourceClaim")
+		claim := newTestResourceClaimForQuota("test-claim")
+		claim, err = f.ClientSet.ResourceV1beta1().ResourceClaims(f.Namespace.Name).Create(ctx, claim, metav1.CreateOptions{})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota status captures resource claim creation")
+		usedResources = v1.ResourceList{}
+		usedResources[core.ClaimObjectCountName] = resource.MustParse("1")
+		usedResources[core.V1ResourceByDeviceClass(classGold)] = resource.MustParse("1")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Deleting a ResourceClaim")
+		err = f.ClientSet.ResourceV1beta1().ResourceClaims(f.Namespace.Name).Delete(ctx, claim.Name, metav1.DeleteOptions{})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota status released usage")
+		usedResources[core.ClaimObjectCountName] = resource.MustParse("0")
+		usedResources[core.V1ResourceByDeviceClass(classGold)] = resource.MustParse("0")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -478,15 +552,15 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Delete the PVC. Deletion MUST succeed and resource usage count against its PVC and storage object MUST be released from ResourceQuotaStatus of the ResourceQuota.
 		[NotConformancePromotable] as test suite do not have any e2e at this moment which are explicitly verifying PV and PVC behaviour.
 	*/
-	ginkgo.It("should create a ResourceQuota and capture the life of a persistent volume claim", func() {
+	ginkgo.It("should create a ResourceQuota and capture the life of a persistent volume claim", func(ctx context.Context) {
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName := "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
@@ -494,29 +568,29 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
 		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("0")
 		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a PersistentVolumeClaim")
 		pvc := newTestPersistentVolumeClaimForQuota("test-claim")
-		pvc, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Create(context.TODO(), pvc, metav1.CreateOptions{})
+		pvc, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Create(ctx, pvc, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status captures persistent volume claim creation")
 		usedResources = v1.ResourceList{}
 		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("1")
 		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("1Gi")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting a PersistentVolumeClaim")
-		err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Delete(context.TODO(), pvc.Name, metav1.DeleteOptions{})
+		err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Delete(ctx, pvc.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released usage")
 		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("0")
 		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -528,15 +602,15 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Delete the PVC. Deletion MUST succeed and resource usage count against  PVC, storageClass and storage object MUST be released from ResourceQuotaStatus of the ResourceQuota.
 		[NotConformancePromotable] as test suite do not have any e2e at this moment which are explicitly verifying PV and PVC behaviour.
 	*/
-	ginkgo.It("should create a ResourceQuota and capture the life of a persistent volume claim with a storage class", func() {
+	ginkgo.It("should create a ResourceQuota and capture the life of a persistent volume claim with a storage class", func(ctx context.Context) {
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName := "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
@@ -547,13 +621,13 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[core.V1ResourceByStorageClass(classGold, v1.ResourcePersistentVolumeClaims)] = resource.MustParse("0")
 		usedResources[core.V1ResourceByStorageClass(classGold, v1.ResourceRequestsStorage)] = resource.MustParse("0")
 
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a PersistentVolumeClaim with storage class")
 		pvc := newTestPersistentVolumeClaimForQuota("test-claim")
 		pvc.Spec.StorageClassName = &classGold
-		pvc, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Create(context.TODO(), pvc, metav1.CreateOptions{})
+		pvc, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Create(ctx, pvc, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status captures persistent volume claim creation")
@@ -563,11 +637,11 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[core.V1ResourceByStorageClass(classGold, v1.ResourcePersistentVolumeClaims)] = resource.MustParse("1")
 		usedResources[core.V1ResourceByStorageClass(classGold, v1.ResourceRequestsStorage)] = resource.MustParse("1Gi")
 
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting a PersistentVolumeClaim")
-		err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Delete(context.TODO(), pvc.Name, metav1.DeleteOptions{})
+		err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Delete(ctx, pvc.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released usage")
@@ -576,21 +650,21 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[core.V1ResourceByStorageClass(classGold, v1.ResourcePersistentVolumeClaims)] = resource.MustParse("0")
 		usedResources[core.V1ResourceByStorageClass(classGold, v1.ResourceRequestsStorage)] = resource.MustParse("0")
 
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 
-	ginkgo.It("should create a ResourceQuota and capture the life of a custom resource.", func() {
+	ginkgo.It("should create a ResourceQuota and capture the life of a custom resource.", func(ctx context.Context) {
 		ginkgo.By("Creating a Custom Resource Definition")
 		testcrd, err := crd.CreateTestCRD(f)
 		framework.ExpectNoError(err)
-		defer testcrd.CleanUp()
+		ginkgo.DeferCleanup(testcrd.CleanUp)
 		countResourceName := "count/" + testcrd.Crd.Spec.Names.Plural + "." + testcrd.Crd.Spec.Group
 		// resourcequota controller needs to take 30 seconds at most to detect the new custom resource.
 		// in order to make sure the resourcequota controller knows this resource, we create one test
 		// resourcequota object, and triggering updates on it until the status is updated.
 		quotaName := "quota-for-" + testcrd.Crd.Spec.Names.Plural
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, &v1.ResourceQuota{
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, &v1.ResourceQuota{
 			ObjectMeta: metav1.ObjectMeta{Name: quotaName},
 			Spec: v1.ResourceQuotaSpec{
 				Hard: v1.ResourceList{
@@ -599,32 +673,32 @@ var _ = SIGDescribe("ResourceQuota", func() {
 			},
 		})
 		framework.ExpectNoError(err)
-		err = updateResourceQuotaUntilUsageAppears(f.ClientSet, f.Namespace.Name, quotaName, v1.ResourceName(countResourceName))
+		err = updateResourceQuotaUntilUsageAppears(ctx, f.ClientSet, f.Namespace.Name, quotaName, v1.ResourceName(countResourceName))
 		framework.ExpectNoError(err)
-		err = f.ClientSet.CoreV1().ResourceQuotas(f.Namespace.Name).Delete(context.TODO(), quotaName, metav1.DeleteOptions{})
+		err = f.ClientSet.CoreV1().ResourceQuotas(f.Namespace.Name).Delete(ctx, quotaName, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Counting existing ResourceQuota")
-		c, err := countResourceQuota(f.ClientSet, f.Namespace.Name)
+		c, err := countResourceQuota(ctx, f.ClientSet, f.Namespace.Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota")
 		quotaName = "test-quota"
 		resourceQuota := newTestResourceQuota(quotaName)
 		resourceQuota.Spec.Hard[v1.ResourceName(countResourceName)] = resource.MustParse("1")
-		_, err = createResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuota)
+		_, err = createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourceQuotas] = resource.MustParse(strconv.Itoa(c + 1))
 		usedResources[v1.ResourceName(countResourceName)] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a custom resource")
 		resourceClient := testcrd.DynamicClients["v1"]
-		testcr, err := instantiateCustomResource(&unstructured.Unstructured{
+		testcr, err := instantiateCustomResource(ctx, &unstructured.Unstructured{
 			Object: map[string]interface{}{
 				"apiVersion": testcrd.Crd.Spec.Group + "/" + testcrd.Crd.Spec.Versions[0].Name,
 				"kind":       testcrd.Crd.Spec.Names.Kind,
@@ -638,11 +712,11 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		ginkgo.By("Ensuring resource quota status captures custom resource creation")
 		usedResources = v1.ResourceList{}
 		usedResources[v1.ResourceName(countResourceName)] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a second custom resource")
-		_, err = instantiateCustomResource(&unstructured.Unstructured{
+		_, err = instantiateCustomResource(ctx, &unstructured.Unstructured{
 			Object: map[string]interface{}{
 				"apiVersion": testcrd.Crd.Spec.Group + "/" + testcrd.Crd.Spec.Versions[0].Name,
 				"kind":       testcrd.Crd.Spec.Names.Kind,
@@ -652,15 +726,15 @@ var _ = SIGDescribe("ResourceQuota", func() {
 			},
 		}, resourceClient, testcrd.Crd)
 		// since we only give one quota, this creation should fail.
-		framework.ExpectError(err)
+		gomega.Expect(err).To(gomega.HaveOccurred())
 
 		ginkgo.By("Deleting a custom resource")
-		err = deleteCustomResource(resourceClient, testcr.GetName())
+		err = deleteCustomResource(ctx, resourceClient, testcr.GetName())
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released usage")
 		usedResources[v1.ResourceName(countResourceName)] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quotaName, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaName, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -673,25 +747,25 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Create a pod with specified activeDeadlineSeconds and resourceRequirements for CPU and Memory fall within quota limits. Pod creation MUST be successful and usage count MUST be captured in ResourceQuotaStatus of 'Terminating' scoped ResourceQuota but MUST NOT in 'NotTerminating' scoped ResourceQuota.
 		Delete the Pod. Pod deletion MUST succeed and Pod resource usage count MUST be released from ResourceQuotaStatus of 'Terminating' scoped ResourceQuota.
 	*/
-	framework.ConformanceIt("should verify ResourceQuota with terminating scopes.", func() {
+	framework.ConformanceIt("should verify ResourceQuota with terminating scopes.", func(ctx context.Context) {
 		ginkgo.By("Creating a ResourceQuota with terminating scope")
 		quotaTerminatingName := "quota-terminating"
-		resourceQuotaTerminating, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScope(quotaTerminatingName, v1.ResourceQuotaScopeTerminating))
+		resourceQuotaTerminating, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScope(quotaTerminatingName, v1.ResourceQuotaScopeTerminating))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota with not terminating scope")
 		quotaNotTerminatingName := "quota-not-terminating"
-		resourceQuotaNotTerminating, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScope(quotaNotTerminatingName, v1.ResourceQuotaScopeNotTerminating))
+		resourceQuotaNotTerminating, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScope(quotaNotTerminatingName, v1.ResourceQuotaScopeNotTerminating))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a long running pod")
@@ -703,7 +777,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		limits[v1.ResourceCPU] = resource.MustParse("1")
 		limits[v1.ResourceMemory] = resource.MustParse("400Mi")
 		pod := newTestPodForQuota(f, podName, requests, limits)
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with not terminating scope captures the pod usage")
@@ -712,7 +786,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceRequestsMemory] = requests[v1.ResourceMemory]
 		usedResources[v1.ResourceLimitsCPU] = limits[v1.ResourceCPU]
 		usedResources[v1.ResourceLimitsMemory] = limits[v1.ResourceMemory]
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with terminating scope ignored the pod usage")
@@ -721,11 +795,11 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), podName, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podName, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
@@ -734,7 +808,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a terminating pod")
@@ -742,7 +816,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		pod = newTestPodForQuota(f, podName, requests, limits)
 		activeDeadlineSeconds := int64(3600)
 		pod.Spec.ActiveDeadlineSeconds = &activeDeadlineSeconds
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with terminating scope captures the pod usage")
@@ -751,7 +825,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceRequestsMemory] = requests[v1.ResourceMemory]
 		usedResources[v1.ResourceLimitsCPU] = limits[v1.ResourceCPU]
 		usedResources[v1.ResourceLimitsMemory] = limits[v1.ResourceMemory]
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with not terminating scope ignored the pod usage")
@@ -760,11 +834,11 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), podName, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podName, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
@@ -773,7 +847,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -786,47 +860,47 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		Create a 'NotBestEffort' Pod by explicitly specifying resource limits and requests. Pod creation MUST be successful and usage count MUST be captured in ResourceQuotaStatus of 'NotBestEffort' scoped ResourceQuota but MUST NOT in 'BestEffort' scoped ResourceQuota.
 		Delete the Pod. Pod deletion MUST succeed and Pod resource usage count MUST be released from ResourceQuotaStatus of 'NotBestEffort' scoped ResourceQuota.
 	*/
-	framework.ConformanceIt("should verify ResourceQuota with best effort scope.", func() {
+	framework.ConformanceIt("should verify ResourceQuota with best effort scope.", func(ctx context.Context) {
 		ginkgo.By("Creating a ResourceQuota with best effort scope")
-		resourceQuotaBestEffort, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScope("quota-besteffort", v1.ResourceQuotaScopeBestEffort))
+		resourceQuotaBestEffort, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScope("quota-besteffort", v1.ResourceQuotaScopeBestEffort))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota with not best effort scope")
-		resourceQuotaNotBestEffort, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScope("quota-not-besteffort", v1.ResourceQuotaScopeNotBestEffort))
+		resourceQuotaNotBestEffort, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScope("quota-not-besteffort", v1.ResourceQuotaScopeNotBestEffort))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a best-effort pod")
 		pod := newTestPodForQuota(f, podName, v1.ResourceList{}, v1.ResourceList{})
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with best effort scope captures the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with not best effort ignored the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a not best-effort pod")
@@ -837,26 +911,26 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		limits[v1.ResourceCPU] = resource.MustParse("1")
 		limits[v1.ResourceMemory] = resource.MustParse("400Mi")
 		pod = newTestPodForQuota(f, "burstable-pod", requests, limits)
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with not best effort scope captures the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with best effort scope ignored the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -867,7 +941,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		When ResourceQuota is updated to modify CPU and Memory quota limits, update MUST succeed with updated values for CPU and Memory limits.
 		When ResourceQuota is deleted, it MUST not be available in the namespace.
 	*/
-	framework.ConformanceIt("should be able to update and delete ResourceQuota.", func() {
+	framework.ConformanceIt("should be able to update and delete ResourceQuota.", func(ctx context.Context) {
 		client := f.ClientSet
 		ns := f.Namespace.Name
 
@@ -881,82 +955,519 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		resourceQuota.ObjectMeta.Name = quotaName
 		resourceQuota.Spec.Hard[v1.ResourceCPU] = resource.MustParse("1")
 		resourceQuota.Spec.Hard[v1.ResourceMemory] = resource.MustParse("500Mi")
-		_, err := createResourceQuota(client, ns, resourceQuota)
+		_, err := createResourceQuota(ctx, client, ns, resourceQuota)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Getting a ResourceQuota")
-		resourceQuotaResult, err := client.CoreV1().ResourceQuotas(ns).Get(context.TODO(), quotaName, metav1.GetOptions{})
+		resourceQuotaResult, err := client.CoreV1().ResourceQuotas(ns).Get(ctx, quotaName, metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(resourceQuotaResult.Spec.Hard[v1.ResourceCPU], resource.MustParse("1"))
-		framework.ExpectEqual(resourceQuotaResult.Spec.Hard[v1.ResourceMemory], resource.MustParse("500Mi"))
+		gomega.Expect(resourceQuotaResult.Spec.Hard).To(gomega.HaveKeyWithValue(v1.ResourceCPU, resource.MustParse("1")))
+		gomega.Expect(resourceQuotaResult.Spec.Hard).To(gomega.HaveKeyWithValue(v1.ResourceMemory, resource.MustParse("500Mi")))
 
 		ginkgo.By("Updating a ResourceQuota")
 		resourceQuota.Spec.Hard[v1.ResourceCPU] = resource.MustParse("2")
 		resourceQuota.Spec.Hard[v1.ResourceMemory] = resource.MustParse("1Gi")
-		resourceQuotaResult, err = client.CoreV1().ResourceQuotas(ns).Update(context.TODO(), resourceQuota, metav1.UpdateOptions{})
+		resourceQuotaResult, err = client.CoreV1().ResourceQuotas(ns).Update(ctx, resourceQuota, metav1.UpdateOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(resourceQuotaResult.Spec.Hard[v1.ResourceCPU], resource.MustParse("2"))
-		framework.ExpectEqual(resourceQuotaResult.Spec.Hard[v1.ResourceMemory], resource.MustParse("1Gi"))
+		gomega.Expect(resourceQuotaResult.Spec.Hard).To(gomega.HaveKeyWithValue(v1.ResourceCPU, resource.MustParse("2")))
+		gomega.Expect(resourceQuotaResult.Spec.Hard).To(gomega.HaveKeyWithValue(v1.ResourceMemory, resource.MustParse("1Gi")))
 
 		ginkgo.By("Verifying a ResourceQuota was modified")
-		resourceQuotaResult, err = client.CoreV1().ResourceQuotas(ns).Get(context.TODO(), quotaName, metav1.GetOptions{})
+		resourceQuotaResult, err = client.CoreV1().ResourceQuotas(ns).Get(ctx, quotaName, metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(resourceQuotaResult.Spec.Hard[v1.ResourceCPU], resource.MustParse("2"))
-		framework.ExpectEqual(resourceQuotaResult.Spec.Hard[v1.ResourceMemory], resource.MustParse("1Gi"))
+		gomega.Expect(resourceQuotaResult.Spec.Hard).To(gomega.HaveKeyWithValue(v1.ResourceCPU, resource.MustParse("2")))
+		gomega.Expect(resourceQuotaResult.Spec.Hard).To(gomega.HaveKeyWithValue(v1.ResourceMemory, resource.MustParse("1Gi")))
 
 		ginkgo.By("Deleting a ResourceQuota")
-		err = deleteResourceQuota(client, ns, quotaName)
+		err = deleteResourceQuota(ctx, client, ns, quotaName)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Verifying the deleted ResourceQuota")
-		_, err = client.CoreV1().ResourceQuotas(ns).Get(context.TODO(), quotaName, metav1.GetOptions{})
-		framework.ExpectEqual(apierrors.IsNotFound(err), true)
+		_, err = client.CoreV1().ResourceQuotas(ns).Get(ctx, quotaName, metav1.GetOptions{})
+		if !apierrors.IsNotFound(err) {
+			framework.Failf("Expected `not found` error, got: %v", err)
+		}
+	})
+
+	/*
+		Release: v1.25
+		Testname: ResourceQuota, manage lifecycle of a ResourceQuota
+		Description: Attempt to create a ResourceQuota for CPU and Memory
+		quota limits. Creation MUST be successful. Attempt to list all
+		namespaces with a label selector which MUST succeed. One list
+		MUST be found. The ResourceQuota when patched MUST succeed.
+		Given the patching of the ResourceQuota, the fields MUST equal
+		the new values. It MUST succeed at deleting a collection of
+		ResourceQuota via a label selector.
+	*/
+	framework.ConformanceIt("should manage the lifecycle of a ResourceQuota", func(ctx context.Context) {
+		client := f.ClientSet
+		ns := f.Namespace.Name
+
+		rqName := "e2e-quota-" + utilrand.String(5)
+		label := map[string]string{"e2e-rq-label": rqName}
+		labelSelector := labels.SelectorFromSet(label).String()
+
+		ginkgo.By("Creating a ResourceQuota")
+		resourceQuota := &v1.ResourceQuota{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   rqName,
+				Labels: label,
+			},
+			Spec: v1.ResourceQuotaSpec{
+				Hard: v1.ResourceList{},
+			},
+		}
+		resourceQuota.Spec.Hard[v1.ResourceCPU] = resource.MustParse("1")
+		resourceQuota.Spec.Hard[v1.ResourceMemory] = resource.MustParse("500Mi")
+		_, err := createResourceQuota(ctx, client, ns, resourceQuota)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Getting a ResourceQuota")
+		resourceQuotaResult, err := client.CoreV1().ResourceQuotas(ns).Get(ctx, rqName, metav1.GetOptions{})
+		framework.ExpectNoError(err)
+		gomega.Expect(resourceQuotaResult.Spec.Hard[v1.ResourceCPU]).To(gomega.Equal(resource.MustParse("1")))
+		gomega.Expect(resourceQuotaResult.Spec.Hard[v1.ResourceMemory]).To(gomega.Equal(resource.MustParse("500Mi")))
+
+		ginkgo.By("Listing all ResourceQuotas with LabelSelector")
+		rq, err := client.CoreV1().ResourceQuotas("").List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+		framework.ExpectNoError(err, "Failed to list job. %v", err)
+		gomega.Expect(rq.Items).To(gomega.HaveLen(1), "Failed to find ResourceQuotes %v", rqName)
+
+		ginkgo.By("Patching the ResourceQuota")
+		payload := "{\"metadata\":{\"labels\":{\"" + rqName + "\":\"patched\"}},\"spec\":{\"hard\":{ \"memory\":\"750Mi\"}}}"
+		patchedResourceQuota, err := client.CoreV1().ResourceQuotas(ns).Patch(ctx, rqName, types.StrategicMergePatchType, []byte(payload), metav1.PatchOptions{})
+		framework.ExpectNoError(err, "failed to patch ResourceQuota %s in namespace %s", rqName, ns)
+		gomega.Expect(patchedResourceQuota.Labels[rqName]).To(gomega.Equal("patched"), "Failed to find the label for this ResourceQuota. Current labels: %v", patchedResourceQuota.Labels)
+		gomega.Expect(*patchedResourceQuota.Spec.Hard.Memory()).To(gomega.Equal(resource.MustParse("750Mi")), "Hard memory value for ResourceQuota %q is %s not 750Mi.", patchedResourceQuota.ObjectMeta.Name, patchedResourceQuota.Spec.Hard.Memory().String())
+
+		ginkgo.By("Deleting a Collection of ResourceQuotas")
+		err = client.CoreV1().ResourceQuotas(ns).DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: labelSelector})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Verifying the deleted ResourceQuota")
+		_, err = client.CoreV1().ResourceQuotas(ns).Get(ctx, rqName, metav1.GetOptions{})
+		if !apierrors.IsNotFound(err) {
+			framework.Failf("Expected `not found` error, got: %v", err)
+		}
+	})
+
+	/*
+		Release: v1.26
+		Testname: ResourceQuota, apply changes to a ResourceQuota status
+		Description: Attempt to create a ResourceQuota for CPU and Memory
+		quota limits. Creation MUST be successful. Updating the hard
+		status values MUST succeed and the new values MUST be found. The
+		reported hard status values MUST equal the spec hard values.
+		Patching the spec hard values MUST succeed and the new values MUST
+		be found. Patching the hard status values MUST succeed. The
+		reported hard status values MUST equal the new spec hard values.
+		Getting the /status MUST succeed and the reported hard status
+		values MUST equal the spec hard values. Repatching the hard status
+		values MUST succeed. The spec MUST NOT be changed when
+		patching /status.
+	*/
+	framework.ConformanceIt("should apply changes to a resourcequota status", func(ctx context.Context) {
+		ns := f.Namespace.Name
+		rqClient := f.ClientSet.CoreV1().ResourceQuotas(ns)
+		rqName := "e2e-rq-status-" + utilrand.String(5)
+		label := map[string]string{"e2e-rq-label": rqName}
+		labelSelector := labels.SelectorFromSet(label).String()
+
+		w := &cache.ListWatch{
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				options.LabelSelector = labelSelector
+				return rqClient.Watch(ctx, options)
+			},
+		}
+
+		rqList, err := f.ClientSet.CoreV1().ResourceQuotas("").List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+		framework.ExpectNoError(err, "failed to list Services")
+
+		ginkgo.By(fmt.Sprintf("Creating resourceQuota %q", rqName))
+		resourceQuota := &v1.ResourceQuota{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   rqName,
+				Labels: label,
+			},
+			Spec: v1.ResourceQuotaSpec{
+				Hard: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("500m"),
+					v1.ResourceMemory: resource.MustParse("500Mi"),
+				},
+			},
+		}
+		_, err = createResourceQuota(ctx, f.ClientSet, ns, resourceQuota)
+		framework.ExpectNoError(err)
+
+		initialResourceQuota, err := rqClient.Get(ctx, rqName, metav1.GetOptions{})
+		framework.ExpectNoError(err)
+		gomega.Expect(*initialResourceQuota.Spec.Hard.Cpu()).To(gomega.Equal(resource.MustParse("500m")), "Hard cpu value for ResourceQuota %q is %s not 500m.", initialResourceQuota.Name, initialResourceQuota.Spec.Hard.Cpu().String())
+		framework.Logf("Resource quota %q reports spec: hard cpu limit of %s", rqName, initialResourceQuota.Spec.Hard.Cpu())
+		gomega.Expect(*initialResourceQuota.Spec.Hard.Memory()).To(gomega.Equal(resource.MustParse("500Mi")), "Hard memory value for ResourceQuota %q is %s not 500Mi.", initialResourceQuota.Name, initialResourceQuota.Spec.Hard.Memory().String())
+		framework.Logf("Resource quota %q reports spec: hard memory limit of %s", rqName, initialResourceQuota.Spec.Hard.Memory())
+
+		ginkgo.By(fmt.Sprintf("Updating resourceQuota %q /status", rqName))
+		var updatedResourceQuota *v1.ResourceQuota
+		hardLimits := quota.Add(v1.ResourceList{}, initialResourceQuota.Spec.Hard)
+
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			updateStatus, err := rqClient.Get(ctx, rqName, metav1.GetOptions{})
+			framework.ExpectNoError(err, "Unable to get ResourceQuota %q", rqName)
+			updateStatus.Status = v1.ResourceQuotaStatus{
+				Hard: hardLimits,
+			}
+			updatedResourceQuota, err = rqClient.UpdateStatus(ctx, updateStatus, metav1.UpdateOptions{})
+			return err
+		})
+		framework.ExpectNoError(err, "Failed to update resourceQuota")
+
+		ginkgo.By(fmt.Sprintf("Confirm /status for %q resourceQuota via watch", rqName))
+		ctxUntil, cancel := context.WithTimeout(ctx, f.Timeouts.PodStartShort)
+		defer cancel()
+
+		_, err = watchtools.Until(ctxUntil, rqList.ResourceVersion, w, func(event watch.Event) (bool, error) {
+			if rq, ok := event.Object.(*v1.ResourceQuota); ok {
+				found := rq.Name == updatedResourceQuota.Name &&
+					rq.Namespace == ns &&
+					apiequality.Semantic.DeepEqual(rq.Status.Hard, updatedResourceQuota.Spec.Hard)
+				if !found {
+					framework.Logf("observed resourceQuota %q in namespace %q with hard status: %#v", rq.Name, rq.Namespace, rq.Status.Hard)
+					return false, nil
+				}
+				framework.Logf("Found resourceQuota %q in namespace %q with hard status: %#v", rq.Name, rq.Namespace, rq.Status.Hard)
+				return found, nil
+			}
+			framework.Logf("Observed event: %+v", event.Object)
+			return false, nil
+		})
+		framework.ExpectNoError(err, "failed to locate ResourceQuota %q in namespace %q", updatedResourceQuota.Name, ns)
+		framework.Logf("ResourceQuota %q /status was updated", updatedResourceQuota.Name)
+
+		// Sync resourceQuota list before patching /status
+		rqList, err = f.ClientSet.CoreV1().ResourceQuotas("").List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+		framework.ExpectNoError(err, "failed to list Services")
+
+		ginkgo.By("Patching hard spec values for cpu & memory")
+		xResourceQuota, err := rqClient.Patch(ctx, updatedResourceQuota.Name, types.StrategicMergePatchType,
+			[]byte(`{"spec":{"hard":{"cpu":"1","memory":"1Gi"}}}`),
+			metav1.PatchOptions{})
+		framework.ExpectNoError(err, "Could not patch resourcequota %q. Error: %v", xResourceQuota.Name, err)
+		framework.Logf("Resource quota %q reports spec: hard cpu limit of %s", rqName, xResourceQuota.Spec.Hard.Cpu())
+		framework.Logf("Resource quota %q reports spec: hard memory limit of %s", rqName, xResourceQuota.Spec.Hard.Memory())
+
+		ginkgo.By(fmt.Sprintf("Patching %q /status", rqName))
+		hardLimits = quota.Add(v1.ResourceList{}, xResourceQuota.Spec.Hard)
+
+		rqStatusJSON, err := json.Marshal(hardLimits)
+		framework.ExpectNoError(err)
+		patchedResourceQuota, err := rqClient.Patch(ctx, rqName, types.StrategicMergePatchType,
+			[]byte(`{"status": {"hard": `+string(rqStatusJSON)+`}}`),
+			metav1.PatchOptions{}, "status")
+		framework.ExpectNoError(err)
+
+		ginkgo.By(fmt.Sprintf("Confirm /status for %q resourceQuota via watch", rqName))
+		ctxUntil, cancel = context.WithTimeout(ctx, f.Timeouts.PodStartShort)
+		defer cancel()
+
+		_, err = watchtools.Until(ctxUntil, rqList.ResourceVersion, w, func(event watch.Event) (bool, error) {
+			if rq, ok := event.Object.(*v1.ResourceQuota); ok {
+				found := rq.Name == patchedResourceQuota.Name &&
+					rq.Namespace == ns &&
+					apiequality.Semantic.DeepEqual(rq.Status.Hard, patchedResourceQuota.Spec.Hard)
+				if !found {
+					framework.Logf("observed resourceQuota %q in namespace %q with hard status: %#v", rq.Name, rq.Namespace, rq.Status.Hard)
+					return false, nil
+				}
+				framework.Logf("Found resourceQuota %q in namespace %q with hard status: %#v", rq.Name, rq.Namespace, rq.Status.Hard)
+				return found, nil
+			}
+			framework.Logf("Observed event: %+v", event.Object)
+			return false, nil
+		})
+		framework.ExpectNoError(err, "failed to locate ResourceQuota %q in namespace %q", patchedResourceQuota.Name, ns)
+		framework.Logf("ResourceQuota %q /status was patched", patchedResourceQuota.Name)
+
+		ginkgo.By(fmt.Sprintf("Get %q /status", rqName))
+		rqResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "resourcequotas"}
+		unstruct, err := f.DynamicClient.Resource(rqResource).Namespace(ns).Get(ctx, resourceQuota.Name, metav1.GetOptions{}, "status")
+		framework.ExpectNoError(err)
+
+		rq, err := unstructuredToResourceQuota(unstruct)
+		framework.ExpectNoError(err, "Getting the status of the resource quota %q", rq.Name)
+
+		gomega.Expect(*rq.Status.Hard.Cpu()).To(gomega.Equal(resource.MustParse("1")), "Hard cpu value for ResourceQuota %q is %s not 1.", rq.Name, rq.Status.Hard.Cpu().String())
+		framework.Logf("Resourcequota %q reports status: hard cpu of %s", rqName, rq.Status.Hard.Cpu())
+		gomega.Expect(*rq.Status.Hard.Memory()).To(gomega.Equal(resource.MustParse("1Gi")), "Hard memory value for ResourceQuota %q is %s not 1Gi.", rq.Name, rq.Status.Hard.Memory().String())
+		framework.Logf("Resourcequota %q reports status: hard memory of %s", rqName, rq.Status.Hard.Memory())
+
+		// Sync resourceQuota list before repatching /status
+		rqList, err = f.ClientSet.CoreV1().ResourceQuotas("").List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+		framework.ExpectNoError(err, "failed to list Services")
+
+		ginkgo.By(fmt.Sprintf("Repatching %q /status before checking Spec is unchanged", rqName))
+		newHardLimits := v1.ResourceList{
+			v1.ResourceCPU:    resource.MustParse("2"),
+			v1.ResourceMemory: resource.MustParse("2Gi"),
+		}
+		rqStatusJSON, err = json.Marshal(newHardLimits)
+		framework.ExpectNoError(err)
+
+		repatchedResourceQuota, err := rqClient.Patch(ctx, rqName, types.StrategicMergePatchType,
+			[]byte(`{"status": {"hard": `+string(rqStatusJSON)+`}}`),
+			metav1.PatchOptions{}, "status")
+		framework.ExpectNoError(err)
+
+		gomega.Expect(*repatchedResourceQuota.Status.Hard.Cpu()).To(gomega.Equal(resource.MustParse("2")), "Hard cpu value for ResourceQuota %q is %s not 2.", repatchedResourceQuota.Name, repatchedResourceQuota.Status.Hard.Cpu().String())
+		framework.Logf("Resourcequota %q reports status: hard cpu of %s", repatchedResourceQuota.Name, repatchedResourceQuota.Status.Hard.Cpu())
+		gomega.Expect(*repatchedResourceQuota.Status.Hard.Memory()).To(gomega.Equal(resource.MustParse("2Gi")), "Hard memory value for ResourceQuota %q is %s not 2Gi.", repatchedResourceQuota.Name, repatchedResourceQuota.Status.Hard.Memory().String())
+		framework.Logf("Resourcequota %q reports status: hard memory of %s", repatchedResourceQuota.Name, repatchedResourceQuota.Status.Hard.Memory())
+
+		_, err = watchtools.Until(ctxUntil, rqList.ResourceVersion, w, func(event watch.Event) (bool, error) {
+			if rq, ok := event.Object.(*v1.ResourceQuota); ok {
+				found := rq.Name == patchedResourceQuota.Name &&
+					rq.Namespace == ns &&
+					*rq.Status.Hard.Cpu() == resource.MustParse("2") &&
+					*rq.Status.Hard.Memory() == resource.MustParse("2Gi")
+				if !found {
+					framework.Logf("observed resourceQuota %q in namespace %q with hard status: %#v", rq.Name, rq.Namespace, rq.Status.Hard)
+					return false, nil
+				}
+				framework.Logf("Found resourceQuota %q in namespace %q with hard status: %#v", rq.Name, rq.Namespace, rq.Status.Hard)
+				return found, nil
+			}
+			framework.Logf("Observed event: %+v", event.Object)
+			return false, nil
+		})
+		framework.ExpectNoError(err, "failed to locate ResourceQuota %q in namespace %q", patchedResourceQuota.Name, ns)
+
+		// the resource_quota_controller ignores changes to the status so we have to wait for a full resync of the controller
+		// to reconcile the status again, this full resync is set every 5 minutes by default so we need to poll at least one
+		// minute more just in case we we start to poll just after the full resync has happened and he have to wait until
+		// next full resync.
+		// Ref: https://issues.k8s.io/121911
+		err = wait.PollUntilContextTimeout(ctx, 5*time.Second, 6*time.Minute, true, func(ctx context.Context) (bool, error) {
+			resourceQuotaResult, err := rqClient.Get(ctx, rqName, metav1.GetOptions{})
+			if err != nil {
+				return false, nil
+			}
+
+			if *resourceQuotaResult.Spec.Hard.Cpu() == *resourceQuotaResult.Status.Hard.Cpu() {
+				if *resourceQuotaResult.Status.Hard.Cpu() != resource.MustParse("1") {
+					framework.Logf("Hard cpu status value for ResourceQuota %q is %s not 1.", repatchedResourceQuota.Name, resourceQuotaResult.Status.Hard.Cpu().String())
+					return false, nil
+				}
+				if *resourceQuotaResult.Status.Hard.Memory() != resource.MustParse("1Gi") {
+					framework.Logf("Hard memory status value for ResourceQuota %q is %s not 1Gi.", repatchedResourceQuota.Name, resourceQuotaResult.Status.Hard.Memory().String())
+					return false, nil
+				}
+				framework.Logf("ResourceQuota %q Spec was unchanged and /status reset", resourceQuotaResult.Name)
+				return true, nil
+			}
+			framework.Logf("ResourceQuota %q Spec and Status does not match: %#v", resourceQuotaResult.Name, resourceQuotaResult)
+			return false, nil
+		})
+		if err != nil {
+			framework.Failf("Error waiting for ResourceQuota %q to reset its Status: %v", patchedResourceQuota.Name, err)
+		}
+
 	})
 })
 
-var _ = SIGDescribe("ResourceQuota [Feature:ScopeSelectors]", func() {
+var _ = SIGDescribe("ResourceQuota", framework.WithFeatureGate(features.VolumeAttributesClass), func() {
+	f := framework.NewDefaultFramework("resourcequota-volumeattributesclass")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
+
+	ginkgo.It("should verify ResourceQuota's volume attributes class scope (quota set to pvc count: 1) against 2 pvcs with same volume attributes class.", func(ctx context.Context) {
+		hard := v1.ResourceList{}
+		hard[v1.ResourceRequestsStorage] = resource.MustParse("5Gi")
+		hard[v1.ResourcePersistentVolumeClaims] = resource.MustParse("1")
+
+		ginkgo.By("Creating a ResourceQuota with volume attributes class scope")
+		quota, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForVolumeAttributesClass("quota-volumeattributesclass", hard, v1.ScopeSelectorOpIn, []string{classGold}))
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring ResourceQuota status is calculated")
+		usedResources := v1.ResourceList{}
+		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("0")
+		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("0")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quota.Name, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Creating a pvc with volume attributes class")
+		pvc1 := newTestPersistentVolumeClaimForQuota("test-claim-1")
+		pvc1.Spec.StorageClassName = ptr.To("")
+		pvc1.Spec.VolumeAttributesClassName = &classGold
+		pvc1, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Create(ctx, pvc1, metav1.CreateOptions{})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota with volume attributes class scope captures the pvc usage")
+		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("1Gi")
+		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("1")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quota.Name, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Creating 2nd pod with priority class should fail")
+		pvc2 := newTestPersistentVolumeClaimForQuota("test-claim-2")
+		pvc2.Spec.StorageClassName = ptr.To("")
+		pvc2.Spec.VolumeAttributesClassName = &classGold
+		_, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Create(ctx, pvc2, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.MatchError(apierrors.IsForbidden, "expect a forbidden error when creating a PVC that exceeds quota"))
+
+		ginkgo.By("Deleting first pvc")
+		err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Delete(ctx, pvc1.Name, metav1.DeleteOptions{})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota status released the pvc usage")
+		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("0")
+		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("0")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quota.Name, usedResources)
+		framework.ExpectNoError(err)
+	})
+
+	ginkgo.It("should verify ResourceQuota's volume attributes class scope (quota set to pvc count: 1) against a pvc with different volume attributes class.", func(ctx context.Context) {
+		hard := v1.ResourceList{}
+		hard[v1.ResourceRequestsStorage] = resource.MustParse("5Gi")
+		hard[v1.ResourcePersistentVolumeClaims] = resource.MustParse("1")
+
+		ginkgo.By("Creating 2 ResourceQuotas with volume attributes class scope")
+		quotaGold, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForVolumeAttributesClass("quota-volumeattributesclass-gold", hard, v1.ScopeSelectorOpIn, []string{classGold}))
+		framework.ExpectNoError(err)
+		quotaSilver, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForVolumeAttributesClass("quota-volumeattributesclass-silver", hard, v1.ScopeSelectorOpIn, []string{classSilver}))
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring all ResourceQuotas status is calculated")
+		usedResources := v1.ResourceList{}
+		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("0")
+		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("0")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaGold.Name, usedResources)
+		framework.ExpectNoError(err)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaSilver.Name, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Creating a pvc with volume attributes class gold")
+		pvcName := "test-claim"
+		pvc, pv := newTestPersistentVolumeClaimWithFakeCSIVolumeForQuota(f.Namespace.Name, pvcName, &classGold)
+		_, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Create(ctx, pvc, metav1.CreateOptions{})
+		framework.ExpectNoError(err)
+		_, err = f.ClientSet.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+		framework.ExpectNoError(err)
+		ginkgo.DeferCleanup(framework.IgnoreNotFound(f.ClientSet.CoreV1().PersistentVolumes().Delete), pv.Name, metav1.DeleteOptions{})
+
+		ginkgo.By("Waiting for the PVC to be bound")
+		pvs, err := e2epv.WaitForPVClaimBoundPhase(ctx, f.ClientSet, []*v1.PersistentVolumeClaim{pvc}, framework.ClaimProvisionTimeout)
+		framework.ExpectNoError(err)
+		gomega.Expect(pvs).To(gomega.HaveLen(1))
+		gomega.Expect(pvs[0].Name).To(gomega.Equal(pv.Name), "Expected PV %q to be bound to PVC %q", pv.Name, pvc.Name)
+
+		ginkgo.By("Ensuring resource quota with volume attributes class scope captures the pvc usage")
+		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("1Gi")
+		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("1")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaGold.Name, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Updating the desired volume attributes class of the pvc to silver")
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			gotPVC, err := f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Get(ctx, pvcName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			gotPVC.Spec.VolumeAttributesClassName = &classSilver
+			_, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Update(ctx, gotPVC, metav1.UpdateOptions{})
+			return err
+		})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota with volume attributes class scope captures the pvc usage")
+		// the pvc references two different classes, one is in the spec which represents the desired class
+		// and another is in the status which represents the current class. so the actual usage is 1 for each quota.
+		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("1Gi")
+		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("1")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaSilver.Name, usedResources)
+		framework.ExpectNoError(err)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaGold.Name, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Update the pv to have the volume attributes class silver")
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			gotPV, err := f.ClientSet.CoreV1().PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			gotPV.Spec.VolumeAttributesClassName = &classSilver
+			_, err = f.ClientSet.CoreV1().PersistentVolumes().Update(ctx, gotPV, metav1.UpdateOptions{})
+			return err
+		})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Update the current volume attributes class of the pvc to silver")
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error { // no real driver, so we have to simulate the driver behavior
+			gotPVC, err := f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).Get(ctx, pvcName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			gotPVC.Status.CurrentVolumeAttributesClassName = &classSilver
+			_, err = f.ClientSet.CoreV1().PersistentVolumeClaims(f.Namespace.Name).UpdateStatus(ctx, gotPVC, metav1.UpdateOptions{})
+			return err
+		})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota with volume attributes class scope captures the pvc usage")
+		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("0")
+		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("0")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaGold.Name, usedResources)
+		framework.ExpectNoError(err)
+		usedResources[v1.ResourceRequestsStorage] = resource.MustParse("1Gi")
+		usedResources[v1.ResourcePersistentVolumeClaims] = resource.MustParse("1")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quotaSilver.Name, usedResources)
+		framework.ExpectNoError(err)
+	})
+})
+
+var _ = SIGDescribe("ResourceQuota", func() {
 	f := framework.NewDefaultFramework("scope-selectors")
-	ginkgo.It("should verify ResourceQuota with best effort scope using scope-selectors.", func() {
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
+	ginkgo.It("should verify ResourceQuota with best effort scope using scope-selectors.", func(ctx context.Context) {
 		ginkgo.By("Creating a ResourceQuota with best effort scope")
-		resourceQuotaBestEffort, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector("quota-besteffort", v1.ResourceQuotaScopeBestEffort))
+		resourceQuotaBestEffort, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector("quota-besteffort", v1.ResourceQuotaScopeBestEffort))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota with not best effort scope")
-		resourceQuotaNotBestEffort, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector("quota-not-besteffort", v1.ResourceQuotaScopeNotBestEffort))
+		resourceQuotaNotBestEffort, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector("quota-not-besteffort", v1.ResourceQuotaScopeNotBestEffort))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a best-effort pod")
 		pod := newTestPodForQuota(f, podName, v1.ResourceList{}, v1.ResourceList{})
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with best effort scope captures the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with not best effort ignored the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a not best-effort pod")
@@ -967,59 +1478,66 @@ var _ = SIGDescribe("ResourceQuota [Feature:ScopeSelectors]", func() {
 		limits[v1.ResourceCPU] = resource.MustParse("1")
 		limits[v1.ResourceMemory] = resource.MustParse("400Mi")
 		pod = newTestPodForQuota(f, "burstable-pod", requests, limits)
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with not best effort scope captures the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with best effort scope ignored the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotBestEffort.Name, usedResources)
 		framework.ExpectNoError(err)
 	})
-	ginkgo.It("should verify ResourceQuota with terminating scopes through scope selectors.", func() {
+	ginkgo.It("should verify ResourceQuota with terminating scopes through scope selectors.", func(ctx context.Context) {
 		ginkgo.By("Creating a ResourceQuota with terminating scope")
 		quotaTerminatingName := "quota-terminating"
-		resourceQuotaTerminating, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector(quotaTerminatingName, v1.ResourceQuotaScopeTerminating))
+		resourceQuotaTerminating, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector(quotaTerminatingName, v1.ResourceQuotaScopeTerminating))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a ResourceQuota with not terminating scope")
 		quotaNotTerminatingName := "quota-not-terminating"
-		resourceQuotaNotTerminating, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector(quotaNotTerminatingName, v1.ResourceQuotaScopeNotTerminating))
+		resourceQuotaNotTerminating, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector(quotaNotTerminatingName, v1.ResourceQuotaScopeNotTerminating))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
-		ginkgo.By("Creating a long running pod")
-		podName := "test-pod"
 		requests := v1.ResourceList{}
 		requests[v1.ResourceCPU] = resource.MustParse("500m")
 		requests[v1.ResourceMemory] = resource.MustParse("200Mi")
 		limits := v1.ResourceList{}
 		limits[v1.ResourceCPU] = resource.MustParse("1")
 		limits[v1.ResourceMemory] = resource.MustParse("400Mi")
-		pod := newTestPodForQuota(f, podName, requests, limits)
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+
+		podName1 := "test-pod"
+		pod1 := newTestPodForQuota(f, podName1, requests, limits)
+
+		podName2 := "terminating-pod"
+		pod2 := newTestPodForQuota(f, podName2, requests, limits)
+		activeDeadlineSeconds := int64(3600)
+		pod2.Spec.ActiveDeadlineSeconds = &activeDeadlineSeconds
+
+		ginkgo.By("Creating a long running pod")
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod1, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with not terminating scope captures the pod usage")
@@ -1028,7 +1546,7 @@ var _ = SIGDescribe("ResourceQuota [Feature:ScopeSelectors]", func() {
 		usedResources[v1.ResourceRequestsMemory] = requests[v1.ResourceMemory]
 		usedResources[v1.ResourceLimitsCPU] = limits[v1.ResourceCPU]
 		usedResources[v1.ResourceLimitsMemory] = limits[v1.ResourceMemory]
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with terminating scope ignored the pod usage")
@@ -1037,29 +1555,24 @@ var _ = SIGDescribe("ResourceQuota [Feature:ScopeSelectors]", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
-		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), podName, *metav1.NewDeleteOptions(0))
+		ginkgo.By("Updating the pod to have an active deadline")
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			gotPod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, podName1, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			gotPod.Spec.ActiveDeadlineSeconds = &activeDeadlineSeconds
+			_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Update(ctx, gotPod, metav1.UpdateOptions{})
+			return err
+		})
 		framework.ExpectNoError(err)
 
-		ginkgo.By("Ensuring resource quota status released the pod usage")
-		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		usedResources[v1.ResourceRequestsCPU] = resource.MustParse("0")
-		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
-		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
-		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
-		framework.ExpectNoError(err)
-
-		ginkgo.By("Creating a terminating pod")
-		podName = "terminating-pod"
-		pod = newTestPodForQuota(f, podName, requests, limits)
-		activeDeadlineSeconds := int64(3600)
-		pod.Spec.ActiveDeadlineSeconds = &activeDeadlineSeconds
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
-		framework.ExpectNoError(err)
+		ginkgo.By("Creating second terminating pod")
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod2, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.MatchError(apierrors.IsForbidden, "expect a forbidden error when creating a Pod that exceeds quota"))
 
 		ginkgo.By("Ensuring resource quota with terminating scope captures the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("1")
@@ -1067,7 +1580,7 @@ var _ = SIGDescribe("ResourceQuota [Feature:ScopeSelectors]", func() {
 		usedResources[v1.ResourceRequestsMemory] = requests[v1.ResourceMemory]
 		usedResources[v1.ResourceLimitsCPU] = limits[v1.ResourceCPU]
 		usedResources[v1.ResourceLimitsMemory] = limits[v1.ResourceMemory]
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with not terminating scope ignored the pod usage")
@@ -1076,11 +1589,11 @@ var _ = SIGDescribe("ResourceQuota [Feature:ScopeSelectors]", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), podName, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podName1, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
@@ -1089,276 +1602,328 @@ var _ = SIGDescribe("ResourceQuota [Feature:ScopeSelectors]", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Creating a terminating pod")
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod2, metav1.CreateOptions{})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota with terminating scope captures the pod usage")
+		usedResources[v1.ResourcePods] = resource.MustParse("1")
+		usedResources[v1.ResourceRequestsCPU] = requests[v1.ResourceCPU]
+		usedResources[v1.ResourceRequestsMemory] = requests[v1.ResourceMemory]
+		usedResources[v1.ResourceLimitsCPU] = limits[v1.ResourceCPU]
+		usedResources[v1.ResourceLimitsMemory] = limits[v1.ResourceMemory]
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota with not terminating scope ignored the pod usage")
+		usedResources[v1.ResourcePods] = resource.MustParse("0")
+		usedResources[v1.ResourceRequestsCPU] = resource.MustParse("0")
+		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
+		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
+		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Deleting the pod")
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podName2, *metav1.NewDeleteOptions(0))
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota status released the pod usage")
+		usedResources[v1.ResourcePods] = resource.MustParse("0")
+		usedResources[v1.ResourceRequestsCPU] = resource.MustParse("0")
+		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
+		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
+		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 	})
 })
 
-var _ = SIGDescribe("ResourceQuota [Feature:PodPriority]", func() {
+var _ = SIGDescribe("ResourceQuota", feature.PodPriority, func() {
 	f := framework.NewDefaultFramework("resourcequota-priorityclass")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 
-	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against a pod with same priority class.", func() {
+	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against a pod with same priority class.", func(ctx context.Context) {
 
-		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass1"}, Value: int32(1000)}, metav1.CreateOptions{})
-		framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
+		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass1"}, Value: int32(1000)}, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			framework.Failf("unexpected error while creating priority class: %v", err)
+		}
 
 		hard := v1.ResourceList{}
 		hard[v1.ResourcePods] = resource.MustParse("1")
 
 		ginkgo.By("Creating a ResourceQuota with priority class scope")
-		resourceQuotaPriorityClass, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass1"}))
+		resourceQuotaPriorityClass, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass1"}))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a pod with priority class")
 		podName := "testpod-pclass1"
 		pod := newTestPodForQuotaWithPriority(f, podName, v1.ResourceList{}, v1.ResourceList{}, "pclass1")
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with priority class scope captures the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 	})
 
-	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against 2 pods with same priority class.", func() {
+	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against 2 pods with same priority class.", func(ctx context.Context) {
 
-		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass2"}, Value: int32(1000)}, metav1.CreateOptions{})
-		framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
+		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass2"}, Value: int32(1000)}, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			framework.Failf("unexpected error while creating priority class: %v", err)
+		}
 
 		hard := v1.ResourceList{}
 		hard[v1.ResourcePods] = resource.MustParse("1")
 
 		ginkgo.By("Creating a ResourceQuota with priority class scope")
-		resourceQuotaPriorityClass, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass2"}))
+		resourceQuotaPriorityClass, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass2"}))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating first pod with priority class should pass")
 		podName := "testpod-pclass2-1"
 		pod := newTestPodForQuotaWithPriority(f, podName, v1.ResourceList{}, v1.ResourceList{}, "pclass2")
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with priority class scope captures the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating 2nd pod with priority class should fail")
 		podName2 := "testpod-pclass2-2"
 		pod2 := newTestPodForQuotaWithPriority(f, podName2, v1.ResourceList{}, v1.ResourceList{}, "pclass2")
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod2, metav1.CreateOptions{})
-		framework.ExpectError(err)
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod2, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.HaveOccurred())
 
 		ginkgo.By("Deleting first pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 	})
 
-	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against 2 pods with different priority class.", func() {
+	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against 2 pods with different priority class.", func(ctx context.Context) {
 
-		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass3"}, Value: int32(1000)}, metav1.CreateOptions{})
-		framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
+		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass3"}, Value: int32(1000)}, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			framework.Failf("unexpected error while creating priority class: %v", err)
+		}
 
 		hard := v1.ResourceList{}
 		hard[v1.ResourcePods] = resource.MustParse("1")
 
 		ginkgo.By("Creating a ResourceQuota with priority class scope")
-		resourceQuotaPriorityClass, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass4"}))
+		resourceQuotaPriorityClass, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass4"}))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a pod with priority class with pclass3")
 		podName := "testpod-pclass3-1"
 		pod := newTestPodForQuotaWithPriority(f, podName, v1.ResourceList{}, v1.ResourceList{}, "pclass3")
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with priority class scope remains same")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a 2nd pod with priority class pclass3")
 		podName2 := "testpod-pclass2-2"
 		pod2 := newTestPodForQuotaWithPriority(f, podName2, v1.ResourceList{}, v1.ResourceList{}, "pclass3")
-		pod2, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod2, metav1.CreateOptions{})
+		pod2, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod2, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with priority class scope remains same")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting both pods")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod2.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod2.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 	})
 
-	ginkgo.It("should verify ResourceQuota's multiple priority class scope (quota set to pod count: 2) against 2 pods with same priority classes.", func() {
-		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass5"}, Value: int32(1000)}, metav1.CreateOptions{})
-		framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
+	ginkgo.It("should verify ResourceQuota's multiple priority class scope (quota set to pod count: 2) against 2 pods with same priority classes.", func(ctx context.Context) {
+		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass5"}, Value: int32(1000)}, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			framework.Failf("unexpected error while creating priority class: %v", err)
+		}
 
-		_, err = f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass6"}, Value: int32(1000)}, metav1.CreateOptions{})
-		framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
+		_, err = f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass6"}, Value: int32(1000)}, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			framework.Failf("unexpected error while creating priority class: %v", err)
+		}
 
 		hard := v1.ResourceList{}
 		hard[v1.ResourcePods] = resource.MustParse("2")
 
 		ginkgo.By("Creating a ResourceQuota with priority class scope")
-		resourceQuotaPriorityClass, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass5", "pclass6"}))
+		resourceQuotaPriorityClass, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass5", "pclass6"}))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a pod with priority class pclass5")
 		podName := "testpod-pclass5"
 		pod := newTestPodForQuotaWithPriority(f, podName, v1.ResourceList{}, v1.ResourceList{}, "pclass5")
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with priority class is updated with the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating 2nd pod with priority class pclass6")
 		podName2 := "testpod-pclass6"
 		pod2 := newTestPodForQuotaWithPriority(f, podName2, v1.ResourceList{}, v1.ResourceList{}, "pclass6")
-		pod2, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod2, metav1.CreateOptions{})
+		pod2, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod2, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with priority class scope is updated with the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("2")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting both pods")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod2.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod2.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 	})
 
-	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against a pod with different priority class (ScopeSelectorOpNotIn).", func() {
+	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against a pod with different priority class (ScopeSelectorOpNotIn).", func(ctx context.Context) {
 
-		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass7"}, Value: int32(1000)}, metav1.CreateOptions{})
-		framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
+		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass7"}, Value: int32(1000)}, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			framework.Failf("unexpected error while creating priority class: %v", err)
+		}
 
 		hard := v1.ResourceList{}
 		hard[v1.ResourcePods] = resource.MustParse("1")
 
 		ginkgo.By("Creating a ResourceQuota with priority class scope")
-		resourceQuotaPriorityClass, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpNotIn, []string{"pclass7"}))
+		resourceQuotaPriorityClass, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpNotIn, []string{"pclass7"}))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a pod with priority class pclass7")
 		podName := "testpod-pclass7"
 		pod := newTestPodForQuotaWithPriority(f, podName, v1.ResourceList{}, v1.ResourceList{}, "pclass7")
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with priority class is not used")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 	})
 
-	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against a pod with different priority class (ScopeSelectorOpExists).", func() {
+	ginkgo.It("should verify ResourceQuota's priority class scope (quota set to pod count: 1) against a pod with different priority class (ScopeSelectorOpExists).", func(ctx context.Context) {
 
-		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass8"}, Value: int32(1000)}, metav1.CreateOptions{})
-		framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
+		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass8"}, Value: int32(1000)}, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			framework.Failf("unexpected error while creating priority class: %v", err)
+		}
 
 		hard := v1.ResourceList{}
 		hard[v1.ResourcePods] = resource.MustParse("1")
 
 		ginkgo.By("Creating a ResourceQuota with priority class scope")
-		resourceQuotaPriorityClass, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpExists, []string{}))
+		resourceQuotaPriorityClass, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpExists, []string{}))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		usedResources := v1.ResourceList{}
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a pod with priority class pclass8")
 		podName := "testpod-pclass8"
 		pod := newTestPodForQuotaWithPriority(f, podName, v1.ResourceList{}, v1.ResourceList{}, "pclass8")
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with priority class is updated with the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
 		usedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 	})
 
-	ginkgo.It("should verify ResourceQuota's priority class scope (cpu, memory quota set) against a pod with same priority class.", func() {
+	ginkgo.It("should verify ResourceQuota's priority class scope (cpu, memory quota set) against a pod with same priority class.", func(ctx context.Context) {
 
-		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(context.TODO(), &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass9"}, Value: int32(1000)}, metav1.CreateOptions{})
-		framework.ExpectEqual(err == nil || apierrors.IsAlreadyExists(err), true)
+		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(ctx, &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: "pclass9"}, Value: int32(1000)}, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			framework.Failf("unexpected error while creating priority class: %v", err)
+		}
 
 		hard := v1.ResourceList{}
 		hard[v1.ResourcePods] = resource.MustParse("1")
@@ -1368,7 +1933,7 @@ var _ = SIGDescribe("ResourceQuota [Feature:PodPriority]", func() {
 		hard[v1.ResourceLimitsMemory] = resource.MustParse("3Gi")
 
 		ginkgo.By("Creating a ResourceQuota with priority class scope")
-		resourceQuotaPriorityClass, err := createResourceQuota(f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass9"}))
+		resourceQuotaPriorityClass, err := createResourceQuota(ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeForPriorityClass("quota-priorityclass", hard, v1.ScopeSelectorOpIn, []string{"pclass9"}))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
@@ -1378,7 +1943,7 @@ var _ = SIGDescribe("ResourceQuota [Feature:PodPriority]", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0Gi")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0Gi")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a pod with priority class")
@@ -1391,7 +1956,7 @@ var _ = SIGDescribe("ResourceQuota [Feature:PodPriority]", func() {
 		limit[v1.ResourceMemory] = resource.MustParse("2Gi")
 
 		pod := newTestPodForQuotaWithPriority(f, podName, request, limit, "pclass9")
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with priority class scope captures the pod usage")
@@ -1400,11 +1965,11 @@ var _ = SIGDescribe("ResourceQuota [Feature:PodPriority]", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("1Gi")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("2")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("2Gi")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
@@ -1413,7 +1978,7 @@ var _ = SIGDescribe("ResourceQuota [Feature:PodPriority]", func() {
 		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0Gi")
 		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
 		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0Gi")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaPriorityClass.Name, usedResources)
 		framework.ExpectNoError(err)
 	})
 
@@ -1421,15 +1986,16 @@ var _ = SIGDescribe("ResourceQuota [Feature:PodPriority]", func() {
 
 var _ = SIGDescribe("ResourceQuota", func() {
 	f := framework.NewDefaultFramework("cross-namespace-pod-affinity")
-	ginkgo.It("should verify ResourceQuota with cross namespace pod affinity scope using scope-selectors.", func() {
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
+	ginkgo.It("should verify ResourceQuota with cross namespace pod affinity scope using scope-selectors.", func(ctx context.Context) {
 		ginkgo.By("Creating a ResourceQuota with cross namespace pod affinity scope")
 		quota, err := createResourceQuota(
-			f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector("quota-cross-namespace-pod-affinity", v1.ResourceQuotaScopeCrossNamespacePodAffinity))
+			ctx, f.ClientSet, f.Namespace.Name, newTestResourceQuotaWithScopeSelector("quota-cross-namespace-pod-affinity", v1.ResourceQuotaScopeCrossNamespacePodAffinity))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring ResourceQuota status is calculated")
 		wantUsedResources := v1.ResourceList{v1.ResourcePods: resource.MustParse("0")}
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quota.Name, wantUsedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quota.Name, wantUsedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a pod that does not use cross namespace affinity")
@@ -1438,7 +2004,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 				RequiredDuringSchedulingIgnoredDuringExecution: []v1.PodAffinityTerm{{
 					TopologyKey: "region",
 				}}}})
-		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		pod, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a pod that uses namespaces field")
@@ -1448,12 +2014,12 @@ var _ = SIGDescribe("ResourceQuota", func() {
 					TopologyKey: "region",
 					Namespaces:  []string{"ns1"},
 				}}}})
-		podWithNamespaces, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), podWithNamespaces, metav1.CreateOptions{})
+		podWithNamespaces, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, podWithNamespaces, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota captures podWithNamespaces usage")
 		wantUsedResources[v1.ResourcePods] = resource.MustParse("1")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quota.Name, wantUsedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quota.Name, wantUsedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a pod that uses namespaceSelector field")
@@ -1470,25 +2036,25 @@ var _ = SIGDescribe("ResourceQuota", func() {
 							},
 						},
 					}}}}})
-		podWithNamespaceSelector, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), podWithNamespaceSelector, metav1.CreateOptions{})
+		podWithNamespaceSelector, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, podWithNamespaceSelector, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota captures podWithNamespaceSelector usage")
 		wantUsedResources[v1.ResourcePods] = resource.MustParse("2")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quota.Name, wantUsedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quota.Name, wantUsedResources)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pods")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, pod.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), podWithNamespaces.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podWithNamespaces.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(context.TODO(), podWithNamespaceSelector.Name, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podWithNamespaceSelector.Name, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
 		wantUsedResources[v1.ResourcePods] = resource.MustParse("0")
-		err = waitForResourceQuota(f.ClientSet, f.Namespace.Name, quota.Name, wantUsedResources)
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, quota.Name, wantUsedResources)
 		framework.ExpectNoError(err)
 	})
 })
@@ -1499,6 +2065,7 @@ func newTestResourceQuotaWithScopeSelector(name string, scope v1.ResourceQuotaSc
 	hard[v1.ResourcePods] = resource.MustParse("5")
 	switch scope {
 	case v1.ResourceQuotaScopeTerminating, v1.ResourceQuotaScopeNotTerminating:
+		hard[v1.ResourcePods] = resource.MustParse("1")
 		hard[v1.ResourceRequestsCPU] = resource.MustParse("1")
 		hard[v1.ResourceRequestsMemory] = resource.MustParse("500Mi")
 		hard[v1.ResourceLimitsCPU] = resource.MustParse("2")
@@ -1554,6 +2121,25 @@ func newTestResourceQuotaWithScopeForPriorityClass(name string, hard v1.Resource
 	}
 }
 
+// newTestResourceQuotaWithScopeForVolumeAttributesClass returns a quota
+// that enforces default constraints for testing with ResourceQuotaScopeVolumeAttributesClass scope
+func newTestResourceQuotaWithScopeForVolumeAttributesClass(name string, hard v1.ResourceList, op v1.ScopeSelectorOperator, values []string) *v1.ResourceQuota {
+	return &v1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: v1.ResourceQuotaSpec{Hard: hard,
+			ScopeSelector: &v1.ScopeSelector{
+				MatchExpressions: []v1.ScopedResourceSelectorRequirement{
+					{
+						ScopeName: v1.ResourceQuotaScopeVolumeAttributesClass,
+						Operator:  op,
+						Values:    values,
+					},
+				},
+			},
+		},
+	}
+}
+
 // newTestResourceQuota returns a quota that enforces default constraints for testing
 func newTestResourceQuota(name string) *v1.ResourceQuota {
 	hard := v1.ResourceList{}
@@ -1580,6 +2166,14 @@ func newTestResourceQuota(name string) *v1.ResourceQuota {
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec:       v1.ResourceQuotaSpec{Hard: hard},
 	}
+}
+
+// newTestResourceQuotaDRA returns a quota that includes hard limits for ResourceClaim objects.
+func newTestResourceQuotaDRA(name string) *v1.ResourceQuota {
+	quota := newTestResourceQuota(name)
+	quota.Spec.Hard[core.ClaimObjectCountName] = resource.MustParse("1")
+	quota.Spec.Hard[core.V1ResourceByDeviceClass(classGold)] = resource.MustParse("1")
+	return quota
 }
 
 // newTestPodForQuota returns a pod that has the specified requests and limits
@@ -1670,10 +2264,85 @@ func newTestPersistentVolumeClaimForQuota(name string) *v1.PersistentVolumeClaim
 				v1.ReadWriteOnce,
 				v1.ReadOnlyMany,
 			},
-			Resources: v1.ResourceRequirements{
+			Resources: v1.VolumeResourceRequirements{
 				Requests: v1.ResourceList{
 					v1.ResourceName(v1.ResourceStorage): resource.MustParse("1Gi"),
 				},
+			},
+		},
+	}
+}
+
+func newTestPersistentVolumeClaimWithFakeCSIVolumeForQuota(namespace, name string, vacName *string) (*v1.PersistentVolumeClaim, *v1.PersistentVolume) {
+	volumeName := fmt.Sprintf("quota-fake-volume-%s-%s", namespace, name)
+	pvc := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			StorageClassName:          ptr.To(""), // avoid binding to a real storage class
+			VolumeAttributesClassName: vacName,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					// prevent disruption to other test workloads in parallel test runs by ensuring the quota
+					// test claims don't get bound to a volume in use by other tests
+					"x-test.k8s.io/satisfiable": "fake-volume",
+				},
+			},
+			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+			Resources: v1.VolumeResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): resource.MustParse("1Gi"),
+				},
+			},
+			VolumeName: volumeName,
+		},
+	}
+	pv := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: volumeName,
+			Labels: map[string]string{
+				"x-test.k8s.io/satisfiable": "fake-volume",
+			},
+		},
+		Spec: v1.PersistentVolumeSpec{
+			StorageClassName:              "",
+			VolumeAttributesClassName:     vacName,
+			PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+			AccessModes:                   []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+			Capacity: v1.ResourceList{
+				v1.ResourceName(v1.ResourceStorage): resource.MustParse("1Gi"),
+			},
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				CSI: &v1.CSIPersistentVolumeSource{
+					Driver:       "fake.csi.k8s.io",
+					VolumeHandle: "volume-handle",
+				},
+			},
+			ClaimRef: &v1.ObjectReference{
+				APIVersion: "v1",
+				Kind:       "PersistentVolumeClaim",
+				Namespace:  namespace,
+				Name:       name,
+			},
+		},
+	}
+	return pvc, pv
+}
+
+// newTestResourceClaimForQuota returns a simple resource claim
+func newTestResourceClaimForQuota(name string) *resourceapi.ResourceClaim {
+	return &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: resourceapi.ResourceClaimSpec{
+			Devices: resourceapi.DeviceClaim{
+				Requests: []resourceapi.DeviceRequest{{
+					Name:            "req-0",
+					DeviceClassName: classGold,
+				}},
 			},
 		},
 	}
@@ -1686,7 +2355,7 @@ func newTestReplicationControllerForQuota(name, image string, replicas int32) *v
 			Name: name,
 		},
 		Spec: v1.ReplicationControllerSpec{
-			Replicas: func(i int32) *int32 { return &i }(replicas),
+			Replicas: pointer.Int32(replicas),
 			Selector: map[string]string{
 				"name": name,
 			},
@@ -1737,6 +2406,12 @@ func newTestReplicaSetForQuota(name, image string, replicas int32) *appsv1.Repli
 
 // newTestServiceForQuota returns a simple service
 func newTestServiceForQuota(name string, serviceType v1.ServiceType, allocateLoadBalancerNodePorts bool) *v1.Service {
+	var allocateNPs *bool
+	// Only set allocateLoadBalancerNodePorts when service type is LB
+	if serviceType == v1.ServiceTypeLoadBalancer {
+		allocateNPs = &allocateLoadBalancerNodePorts
+	}
+
 	return &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -1745,9 +2420,9 @@ func newTestServiceForQuota(name string, serviceType v1.ServiceType, allocateLoa
 			Type: serviceType,
 			Ports: []v1.ServicePort{{
 				Port:       80,
-				TargetPort: intstr.FromInt(80),
+				TargetPort: intstr.FromInt32(80),
 			}},
-			AllocateLoadBalancerNodePorts: pointer.BoolPtr(allocateLoadBalancerNodePorts),
+			AllocateLoadBalancerNodePorts: allocateNPs,
 		},
 	}
 }
@@ -1777,22 +2452,22 @@ func newTestSecretForQuota(name string) *v1.Secret {
 }
 
 // createResourceQuota in the specified namespace
-func createResourceQuota(c clientset.Interface, namespace string, resourceQuota *v1.ResourceQuota) (*v1.ResourceQuota, error) {
-	return c.CoreV1().ResourceQuotas(namespace).Create(context.TODO(), resourceQuota, metav1.CreateOptions{})
+func createResourceQuota(ctx context.Context, c clientset.Interface, namespace string, resourceQuota *v1.ResourceQuota) (*v1.ResourceQuota, error) {
+	return c.CoreV1().ResourceQuotas(namespace).Create(ctx, resourceQuota, metav1.CreateOptions{})
 }
 
 // deleteResourceQuota with the specified name
-func deleteResourceQuota(c clientset.Interface, namespace, name string) error {
-	return c.CoreV1().ResourceQuotas(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
+func deleteResourceQuota(ctx context.Context, c clientset.Interface, namespace, name string) error {
+	return c.CoreV1().ResourceQuotas(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
 // countResourceQuota counts the number of ResourceQuota in the specified namespace
 // On contended servers the service account controller can slow down, leading to the count changing during a run.
 // Wait up to 5s for the count to stabilize, assuming that updates come at a consistent rate, and are not held indefinitely.
-func countResourceQuota(c clientset.Interface, namespace string) (int, error) {
+func countResourceQuota(ctx context.Context, c clientset.Interface, namespace string) (int, error) {
 	found, unchanged := 0, 0
-	return found, wait.Poll(1*time.Second, 30*time.Second, func() (bool, error) {
-		resourceQuotas, err := c.CoreV1().ResourceQuotas(namespace).List(context.TODO(), metav1.ListOptions{})
+	return found, wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, false, func(ctx context.Context) (bool, error) {
+		resourceQuotas, err := c.CoreV1().ResourceQuotas(namespace).List(ctx, metav1.ListOptions{})
 		framework.ExpectNoError(err)
 		if len(resourceQuotas.Items) == found {
 			// loop until the number of resource quotas has stabilized for 5 seconds
@@ -1806,9 +2481,9 @@ func countResourceQuota(c clientset.Interface, namespace string) (int, error) {
 }
 
 // wait for resource quota status to show the expected used resources value
-func waitForResourceQuota(c clientset.Interface, ns, quotaName string, used v1.ResourceList) error {
-	return wait.Poll(framework.Poll, resourceQuotaTimeout, func() (bool, error) {
-		resourceQuota, err := c.CoreV1().ResourceQuotas(ns).Get(context.TODO(), quotaName, metav1.GetOptions{})
+func waitForResourceQuota(ctx context.Context, c clientset.Interface, ns, quotaName string, used v1.ResourceList) error {
+	return wait.PollUntilContextTimeout(ctx, framework.Poll, resourceQuotaTimeout, false, func(ctx context.Context) (bool, error) {
+		resourceQuota, err := c.CoreV1().ResourceQuotas(ns).Get(ctx, quotaName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -1829,9 +2504,9 @@ func waitForResourceQuota(c clientset.Interface, ns, quotaName string, used v1.R
 
 // updateResourceQuotaUntilUsageAppears updates the resource quota object until the usage is populated
 // for the specific resource name.
-func updateResourceQuotaUntilUsageAppears(c clientset.Interface, ns, quotaName string, resourceName v1.ResourceName) error {
-	return wait.Poll(framework.Poll, resourceQuotaTimeout, func() (bool, error) {
-		resourceQuota, err := c.CoreV1().ResourceQuotas(ns).Get(context.TODO(), quotaName, metav1.GetOptions{})
+func updateResourceQuotaUntilUsageAppears(ctx context.Context, c clientset.Interface, ns, quotaName string, resourceName v1.ResourceName) error {
+	return wait.PollUntilContextTimeout(ctx, framework.Poll, resourceQuotaTimeout, false, func(ctx context.Context) (bool, error) {
+		resourceQuota, err := c.CoreV1().ResourceQuotas(ns).Get(ctx, quotaName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -1844,11 +2519,22 @@ func updateResourceQuotaUntilUsageAppears(c clientset.Interface, ns, quotaName s
 		current := resourceQuota.Spec.Hard[resourceName]
 		current.Add(resource.MustParse("1"))
 		resourceQuota.Spec.Hard[resourceName] = current
-		_, err = c.CoreV1().ResourceQuotas(ns).Update(context.TODO(), resourceQuota, metav1.UpdateOptions{})
+		_, err = c.CoreV1().ResourceQuotas(ns).Update(ctx, resourceQuota, metav1.UpdateOptions{})
 		// ignoring conflicts since someone else may already updated it.
 		if apierrors.IsConflict(err) {
 			return false, nil
 		}
 		return false, err
 	})
+}
+
+func unstructuredToResourceQuota(obj *unstructured.Unstructured) (*v1.ResourceQuota, error) {
+	json, err := runtime.Encode(unstructured.UnstructuredJSONScheme, obj)
+	if err != nil {
+		return nil, err
+	}
+	rq := &v1.ResourceQuota{}
+	err = runtime.DecodeInto(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), json, rq)
+
+	return rq, err
 }

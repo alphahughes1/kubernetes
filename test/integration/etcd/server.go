@@ -18,8 +18,6 @@ package etcd
 
 import (
 	"context"
-	"encoding/json"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -28,7 +26,6 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/client/v3/concurrency"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -38,17 +35,25 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericapiserveroptions "k8s.io/apiserver/pkg/server/options"
+	"k8s.io/apiserver/pkg/util/compatibility"
+	"k8s.io/apiserver/pkg/util/feature"
 	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
+	utiltesting "k8s.io/client-go/util/testing"
+	basecompatibility "k8s.io/component-base/compatibility"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/test/integration"
 	"k8s.io/kubernetes/test/integration/framework"
+	"k8s.io/kubernetes/test/utils/ktesting"
+	netutils "k8s.io/utils/net"
 
 	// install all APIs
 	_ "k8s.io/kubernetes/pkg/controlplane"
@@ -62,13 +67,16 @@ AwEHoUQDQgAEH6cuzP8XuD5wal6wf9M6xDljTOPLX2i8uIp/C/ASqiIGUeeKQtX0
 -----END EC PRIVATE KEY-----`
 
 // StartRealAPIServerOrDie starts an API server that is appropriate for use in tests that require one of every resource
-func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRunOptions)) *Master {
-	certDir, err := ioutil.TempDir("", t.Name())
+func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRunOptions)) *APIServer {
+	tCtx := ktesting.Init(t)
+
+	// Strip out "/" in subtests
+	certDir, err := os.MkdirTemp("", strings.ReplaceAll(t.Name(), "/", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, defaultServiceClusterIPRange, err := net.ParseCIDR("10.0.0.0/24")
+	_, defaultServiceClusterIPRange, err := netutils.ParseCIDRSloppy("10.0.0.0/24")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,32 +86,56 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 		t.Fatal(err)
 	}
 
-	saSigningKeyFile, err := ioutil.TempFile("/tmp", "insecure_test_key")
+	saSigningKeyFile, err := os.CreateTemp("/tmp", "insecure_test_key")
 	if err != nil {
 		t.Fatalf("create temp file failed: %v", err)
 	}
-	defer os.RemoveAll(saSigningKeyFile.Name())
-	if err = ioutil.WriteFile(saSigningKeyFile.Name(), []byte(ecdsaPrivateKey), 0666); err != nil {
+	defer utiltesting.CloseAndRemove(t, saSigningKeyFile)
+	if err = os.WriteFile(saSigningKeyFile.Name(), []byte(ecdsaPrivateKey), 0666); err != nil {
 		t.Fatalf("write file %s failed: %v", saSigningKeyFile.Name(), err)
 	}
 
-	kubeAPIServerOptions := options.NewServerRunOptions()
-	kubeAPIServerOptions.SecureServing.Listener = listener
-	kubeAPIServerOptions.SecureServing.ServerCert.CertDirectory = certDir
-	kubeAPIServerOptions.ServiceAccountSigningKeyFile = saSigningKeyFile.Name()
-	kubeAPIServerOptions.Etcd.StorageConfig.Transport.ServerList = []string{framework.GetEtcdURL()}
-	kubeAPIServerOptions.Etcd.DefaultStorageMediaType = runtime.ContentTypeJSON // force json we can easily interpret the result in etcd
-	kubeAPIServerOptions.ServiceClusterIPRanges = defaultServiceClusterIPRange.String()
-	kubeAPIServerOptions.Authentication.APIAudiences = []string{"https://foo.bar.example.com"}
-	kubeAPIServerOptions.Authentication.ServiceAccounts.Issuers = []string{"https://foo.bar.example.com"}
-	kubeAPIServerOptions.Authentication.ServiceAccounts.KeyFiles = []string{saSigningKeyFile.Name()}
-	kubeAPIServerOptions.Authorization.Modes = []string{"RBAC"}
-	kubeAPIServerOptions.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
-	kubeAPIServerOptions.APIEnablement.RuntimeConfig["api/all"] = "true"
-	for _, f := range configFuncs {
-		f(kubeAPIServerOptions)
+	opts := options.NewServerRunOptions()
+	// If EmulationVersion of DefaultFeatureGate is set during test, we need to propagate it to the apiserver ComponentGlobalsRegistry.
+	featureGate := feature.DefaultMutableFeatureGate.DeepCopy()
+	effectiveVersion := compatibility.DefaultKubeEffectiveVersionForTest()
+	effectiveVersion.SetEmulationVersion(featureGate.EmulationVersion())
+	// set up new instance of ComponentGlobalsRegistry instead of using the DefaultComponentGlobalsRegistry to avoid contention in parallel tests.
+	componentGlobalsRegistry := basecompatibility.NewComponentGlobalsRegistry()
+	if err := componentGlobalsRegistry.Register(basecompatibility.DefaultKubeComponent, effectiveVersion, featureGate); err != nil {
+		t.Fatal(err)
 	}
-	completedOptions, err := app.Complete(kubeAPIServerOptions)
+	opts.GenericServerRunOptions.ComponentGlobalsRegistry = componentGlobalsRegistry
+
+	opts.Options.SecureServing.Listener = listener
+	opts.Options.SecureServing.ServerCert.CertDirectory = certDir
+	opts.Options.ServiceAccountSigningKeyFile = saSigningKeyFile.Name()
+	opts.Options.Etcd.StorageConfig.Transport.ServerList = []string{framework.GetEtcdURL()}
+	opts.Options.Etcd.DefaultStorageMediaType = runtime.ContentTypeJSON // force json we can easily interpret the result in etcd
+	opts.ServiceClusterIPRanges = defaultServiceClusterIPRange.String()
+	opts.Options.Authentication.APIAudiences = []string{"https://foo.bar.example.com"}
+	opts.Options.Authentication.ServiceAccounts.Issuers = []string{"https://foo.bar.example.com"}
+	opts.Options.Authentication.ServiceAccounts.KeyFiles = []string{saSigningKeyFile.Name()}
+	opts.Options.Authorization.Modes = []string{"RBAC"}
+	opts.Options.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+	opts.Options.APIEnablement.RuntimeConfig["api/all"] = "true"
+	for _, f := range configFuncs {
+		f(opts)
+	}
+
+	// If the local ComponentGlobalsRegistry is changed by configFuncs,
+	// we need to copy the new feature values back to the DefaultFeatureGate because most feature checks still use the DefaultFeatureGate.
+	if !featureGate.EmulationVersion().EqualTo(feature.DefaultMutableFeatureGate.EmulationVersion()) {
+		featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, feature.DefaultMutableFeatureGate, effectiveVersion.EmulationVersion())
+	}
+	for f := range feature.DefaultMutableFeatureGate.GetAll() {
+		if featureGate.Enabled(f) != feature.DefaultFeatureGate.Enabled(f) {
+			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, f, featureGate.Enabled(f))
+		}
+	}
+	feature.DefaultMutableFeatureGate.AddMetrics()
+
+	completedOptions, err := opts.Complete(tCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,25 +150,20 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 		t.Fatal(err)
 	}
 
-	// get a leased session
-	session, err := concurrency.NewSession(rawClient)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// then build and use an etcd lock
-	// this prevents more than one of these masters from running at the same time
-	lock := concurrency.NewLocker(session, "kube_integration_etcd_raw")
-	lock.Lock()
-
 	// make sure we start with a clean slate
 	if _, err := kvClient.Delete(context.Background(), "/registry/", clientv3.WithPrefix()); err != nil {
 		t.Fatal(err)
 	}
 
-	stopCh := make(chan struct{})
-
-	kubeAPIServer, err := app.CreateServerChain(completedOptions, stopCh)
+	config, err := app.NewConfig(completedOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := config.Complete()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kubeAPIServer, err := app.CreateServerChain(completed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +179,7 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 
 	kubeClient := clientset.NewForConfigOrDie(kubeClientConfig)
 
+	errCh := make(chan error)
 	go func() {
 		// Catch panics that occur in this go routine so we get a comprehensible failure
 		defer func() {
@@ -159,19 +187,29 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 				t.Errorf("Unexpected panic trying to start API server: %#v", err)
 			}
 		}()
+		defer close(errCh)
 
 		prepared, err := kubeAPIServer.PrepareRun()
 		if err != nil {
-			t.Error(err)
+			errCh <- err
+			return
 		}
-		if err := prepared.Run(stopCh); err != nil {
+		if err := prepared.Run(tCtx); err != nil {
+			errCh <- err
 			t.Error(err)
+			return
 		}
 	}()
 
 	lastHealth := ""
 	attempt := 0
 	if err := wait.PollImmediate(time.Second, time.Minute, func() (done bool, err error) {
+		select {
+		case err := <-errCh:
+			return false, err
+		default:
+		}
+
 		// wait for the server to be healthy
 		result := kubeClient.RESTClient().Get().AbsPath("/healthz").Do(context.TODO())
 		content, _ := result.Raw()
@@ -207,17 +245,23 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 	}
 
 	cleanup := func() {
-		if err := os.RemoveAll(certDir); err != nil {
-			t.Log(err)
+		// Cancel stopping apiserver and cleaning up
+		// after itself, including shutting down its storage layer.
+		tCtx.Cancel("cleaning up")
+
+		// If the apiserver was started, let's wait for it to
+		// shutdown clearly.
+		err, ok := <-errCh
+		if ok && err != nil {
+			t.Error(err)
 		}
-		close(stopCh)
-		lock.Unlock()
-		if err := session.Close(); err != nil {
+		rawClient.Close()
+		if err := os.RemoveAll(certDir); err != nil {
 			t.Log(err)
 		}
 	}
 
-	return &Master{
+	return &APIServer{
 		Client:    kubeClient,
 		Dynamic:   dynamic.NewForConfigOrDie(kubeClientConfig),
 		Config:    kubeClientConfig,
@@ -228,9 +272,9 @@ func StartRealAPIServerOrDie(t *testing.T, configFuncs ...func(*options.ServerRu
 	}
 }
 
-// Master represents a running API server that is ready for use
+// APIServer represents a running API server that is ready for use
 // The Cleanup func must be deferred to prevent resource leaks
-type Master struct {
+type APIServer struct {
 	Client    clientset.Interface
 	Dynamic   dynamic.Interface
 	Config    *restclient.Config

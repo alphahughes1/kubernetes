@@ -21,6 +21,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/apis/scheduling"
 )
 
@@ -120,8 +121,8 @@ const (
 	SyncPodUpdate
 	// SyncPodCreate is when the pod is created from source
 	SyncPodCreate
-	// SyncPodKill is when the pod is killed based on a trigger internal to the kubelet for eviction.
-	// If a SyncPodKill request is made to pod workers, the request is never dropped, and will always be processed.
+	// SyncPodKill is when the pod should have no running containers. A pod stopped in this way could be
+	// restarted in the future due config changes.
 	SyncPodKill
 )
 
@@ -142,6 +143,9 @@ func (sp SyncPodType) String() string {
 
 // IsMirrorPod returns true if the passed Pod is a Mirror Pod.
 func IsMirrorPod(pod *v1.Pod) bool {
+	if pod.Annotations == nil {
+		return false
+	}
 	_, ok := pod.Annotations[ConfigMirrorAnnotationKey]
 	return ok
 }
@@ -188,4 +192,15 @@ func IsCriticalPodBasedOnPriority(priority int32) bool {
 // IsNodeCriticalPod checks if the given pod is a system-node-critical
 func IsNodeCriticalPod(pod *v1.Pod) bool {
 	return IsCriticalPod(pod) && (pod.Spec.PriorityClassName == scheduling.SystemNodeCritical)
+}
+
+// HasRestartableInitContainer returns true if the pod has any restartable init
+// container
+func HasRestartableInitContainer(pod *v1.Pod) bool {
+	for _, container := range pod.Spec.InitContainers {
+		if podutil.IsRestartableInitContainer(&container) {
+			return true
+		}
+	}
+	return false
 }

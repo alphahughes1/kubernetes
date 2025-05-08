@@ -18,10 +18,13 @@ package openapi
 
 import (
 	"encoding/json"
-	"reflect"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/diff"
+	"github.com/go-openapi/jsonreference"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+
+	"k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/handler"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
@@ -44,8 +47,22 @@ func TestOpenAPIRoundtrip(t *testing.T) {
 				return
 			}
 
-			if !reflect.DeepEqual(value.Schema, roundTripped) {
-				t.Errorf("unexpected diff (a=expected,b=roundtripped):\n%s", diff.ObjectReflectDiff(value.Schema, roundTripped))
+			// Remove the embedded v2 schema if it presents.
+			// The v2 schema either become the schema (when serving v2) or get pruned (v3)
+			// and it is never round-tripped.
+			delete(roundTripped.Extensions, common.ExtensionV2Schema)
+			delete(value.Schema.Extensions, common.ExtensionV2Schema)
+
+			opts := []cmp.Option{
+				cmpopts.EquateEmpty(),
+				// jsonreference.Ref contains unexported fields. Compare
+				// by string representation provides a consistent
+				cmp.Comparer(func(x, y jsonreference.Ref) bool {
+					return x.String() == y.String()
+				}),
+			}
+			if !cmp.Equal(value.Schema, roundTripped, opts...) {
+				t.Errorf("unexpected diff (a=expected,b=roundtripped):\n%s", cmp.Diff(value.Schema, roundTripped, opts...))
 				return
 			}
 		})

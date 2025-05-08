@@ -19,124 +19,33 @@ limitations under the License.
 package fake
 
 import (
-	"context"
-
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	labels "k8s.io/apimachinery/pkg/labels"
-	schema "k8s.io/apimachinery/pkg/runtime/schema"
-	types "k8s.io/apimachinery/pkg/types"
-	watch "k8s.io/apimachinery/pkg/watch"
-	testing "k8s.io/client-go/testing"
+	gentype "k8s.io/client-go/gentype"
 	v1alpha1 "k8s.io/sample-apiserver/pkg/apis/wardle/v1alpha1"
+	wardlev1alpha1 "k8s.io/sample-apiserver/pkg/generated/applyconfiguration/wardle/v1alpha1"
+	typedwardlev1alpha1 "k8s.io/sample-apiserver/pkg/generated/clientset/versioned/typed/wardle/v1alpha1"
 )
 
-// FakeFlunders implements FlunderInterface
-type FakeFlunders struct {
+// fakeFlunders implements FlunderInterface
+type fakeFlunders struct {
+	*gentype.FakeClientWithListAndApply[*v1alpha1.Flunder, *v1alpha1.FlunderList, *wardlev1alpha1.FlunderApplyConfiguration]
 	Fake *FakeWardleV1alpha1
-	ns   string
 }
 
-var flundersResource = schema.GroupVersionResource{Group: "wardle.example.com", Version: "v1alpha1", Resource: "flunders"}
-
-var flundersKind = schema.GroupVersionKind{Group: "wardle.example.com", Version: "v1alpha1", Kind: "Flunder"}
-
-// Get takes name of the flunder, and returns the corresponding flunder object, and an error if there is any.
-func (c *FakeFlunders) Get(ctx context.Context, name string, options v1.GetOptions) (result *v1alpha1.Flunder, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewGetAction(flundersResource, c.ns, name), &v1alpha1.Flunder{})
-
-	if obj == nil {
-		return nil, err
+func newFakeFlunders(fake *FakeWardleV1alpha1, namespace string) typedwardlev1alpha1.FlunderInterface {
+	return &fakeFlunders{
+		gentype.NewFakeClientWithListAndApply[*v1alpha1.Flunder, *v1alpha1.FlunderList, *wardlev1alpha1.FlunderApplyConfiguration](
+			fake.Fake,
+			namespace,
+			v1alpha1.SchemeGroupVersion.WithResource("flunders"),
+			v1alpha1.SchemeGroupVersion.WithKind("Flunder"),
+			func() *v1alpha1.Flunder { return &v1alpha1.Flunder{} },
+			func() *v1alpha1.FlunderList { return &v1alpha1.FlunderList{} },
+			func(dst, src *v1alpha1.FlunderList) { dst.ListMeta = src.ListMeta },
+			func(list *v1alpha1.FlunderList) []*v1alpha1.Flunder { return gentype.ToPointerSlice(list.Items) },
+			func(list *v1alpha1.FlunderList, items []*v1alpha1.Flunder) {
+				list.Items = gentype.FromPointerSlice(items)
+			},
+		),
+		fake,
 	}
-	return obj.(*v1alpha1.Flunder), err
-}
-
-// List takes label and field selectors, and returns the list of Flunders that match those selectors.
-func (c *FakeFlunders) List(ctx context.Context, opts v1.ListOptions) (result *v1alpha1.FlunderList, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewListAction(flundersResource, flundersKind, c.ns, opts), &v1alpha1.FlunderList{})
-
-	if obj == nil {
-		return nil, err
-	}
-
-	label, _, _ := testing.ExtractFromListOptions(opts)
-	if label == nil {
-		label = labels.Everything()
-	}
-	list := &v1alpha1.FlunderList{ListMeta: obj.(*v1alpha1.FlunderList).ListMeta}
-	for _, item := range obj.(*v1alpha1.FlunderList).Items {
-		if label.Matches(labels.Set(item.Labels)) {
-			list.Items = append(list.Items, item)
-		}
-	}
-	return list, err
-}
-
-// Watch returns a watch.Interface that watches the requested flunders.
-func (c *FakeFlunders) Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
-	return c.Fake.
-		InvokesWatch(testing.NewWatchAction(flundersResource, c.ns, opts))
-
-}
-
-// Create takes the representation of a flunder and creates it.  Returns the server's representation of the flunder, and an error, if there is any.
-func (c *FakeFlunders) Create(ctx context.Context, flunder *v1alpha1.Flunder, opts v1.CreateOptions) (result *v1alpha1.Flunder, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewCreateAction(flundersResource, c.ns, flunder), &v1alpha1.Flunder{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1alpha1.Flunder), err
-}
-
-// Update takes the representation of a flunder and updates it. Returns the server's representation of the flunder, and an error, if there is any.
-func (c *FakeFlunders) Update(ctx context.Context, flunder *v1alpha1.Flunder, opts v1.UpdateOptions) (result *v1alpha1.Flunder, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateAction(flundersResource, c.ns, flunder), &v1alpha1.Flunder{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1alpha1.Flunder), err
-}
-
-// UpdateStatus was generated because the type contains a Status member.
-// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
-func (c *FakeFlunders) UpdateStatus(ctx context.Context, flunder *v1alpha1.Flunder, opts v1.UpdateOptions) (*v1alpha1.Flunder, error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateSubresourceAction(flundersResource, "status", c.ns, flunder), &v1alpha1.Flunder{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1alpha1.Flunder), err
-}
-
-// Delete takes name of the flunder and deletes it. Returns an error if one occurs.
-func (c *FakeFlunders) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
-	_, err := c.Fake.
-		Invokes(testing.NewDeleteAction(flundersResource, c.ns, name), &v1alpha1.Flunder{})
-
-	return err
-}
-
-// DeleteCollection deletes a collection of objects.
-func (c *FakeFlunders) DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error {
-	action := testing.NewDeleteCollectionAction(flundersResource, c.ns, listOpts)
-
-	_, err := c.Fake.Invokes(action, &v1alpha1.FlunderList{})
-	return err
-}
-
-// Patch applies the patch and returns the patched flunder.
-func (c *FakeFlunders) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *v1alpha1.Flunder, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(flundersResource, c.ns, name, pt, data, subresources...), &v1alpha1.Flunder{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1alpha1.Flunder), err
 }

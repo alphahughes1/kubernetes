@@ -27,12 +27,12 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/pkg/errors"
@@ -41,39 +41,35 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/keyutil"
+	"k8s.io/klog/v2"
+	netutils "k8s.io/utils/net"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/features"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
 )
 
 const (
-	// PrivateKeyBlockType is a possible value for pem.Block.Type.
-	PrivateKeyBlockType = "PRIVATE KEY"
 	// PublicKeyBlockType is a possible value for pem.Block.Type.
 	PublicKeyBlockType = "PUBLIC KEY"
 	// CertificateBlockType is a possible value for pem.Block.Type.
 	CertificateBlockType = "CERTIFICATE"
-	// RSAPrivateKeyBlockType is a possible value for pem.Block.Type.
-	RSAPrivateKeyBlockType = "RSA PRIVATE KEY"
-	rsaKeySize             = 2048
 )
 
-// CertConfig is a wrapper around certutil.Config extending it with PublicKeyAlgorithm.
+// CertConfig is a wrapper around certutil.Config extending it with EncryptionAlgorithm.
 type CertConfig struct {
 	certutil.Config
-	NotAfter           *time.Time
-	PublicKeyAlgorithm x509.PublicKeyAlgorithm
+	NotAfter            time.Time
+	EncryptionAlgorithm kubeadmapi.EncryptionAlgorithmType
 }
 
 // NewCertificateAuthority creates new certificate and private key for the certificate authority
 func NewCertificateAuthority(config *CertConfig) (*x509.Certificate, crypto.Signer, error) {
-	key, err := NewPrivateKey(config.PublicKeyAlgorithm)
+	key, err := NewPrivateKey(config.EncryptionAlgorithm)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "unable to create private key while generating CA certificate")
 	}
-
-	cert, err := certutil.NewSelfSignedCACert(config.Config, key)
+	cert, err := NewSelfSignedCACert(config, key)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "unable to create self-signed CA certificate")
 	}
@@ -83,7 +79,7 @@ func NewCertificateAuthority(config *CertConfig) (*x509.Certificate, crypto.Sign
 
 // NewIntermediateCertificateAuthority creates new certificate and private key for an intermediate certificate authority
 func NewIntermediateCertificateAuthority(parentCert *x509.Certificate, parentKey crypto.Signer, config *CertConfig) (*x509.Certificate, crypto.Signer, error) {
-	key, err := NewPrivateKey(config.PublicKeyAlgorithm)
+	key, err := NewPrivateKey(config.EncryptionAlgorithm)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "unable to create private key while generating intermediate CA certificate")
 	}
@@ -102,7 +98,7 @@ func NewCertAndKey(caCert *x509.Certificate, caKey crypto.Signer, config *CertCo
 		return nil, nil, errors.New("must specify at least one ExtKeyUsage")
 	}
 
-	key, err := NewPrivateKey(config.PublicKeyAlgorithm)
+	key, err := NewPrivateKey(config.EncryptionAlgorithm)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "unable to create private key")
 	}
@@ -117,7 +113,7 @@ func NewCertAndKey(caCert *x509.Certificate, caKey crypto.Signer, config *CertCo
 
 // NewCSRAndKey generates a new key and CSR and that could be signed to create the given certificate
 func NewCSRAndKey(config *CertConfig) (*x509.CertificateRequest, crypto.Signer, error) {
-	key, err := NewPrivateKey(config.PublicKeyAlgorithm)
+	key, err := NewPrivateKey(config.EncryptionAlgorithm)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "unable to create private key")
 	}
@@ -132,12 +128,7 @@ func NewCSRAndKey(config *CertConfig) (*x509.CertificateRequest, crypto.Signer, 
 
 // HasServerAuth returns true if the given certificate is a ServerAuth
 func HasServerAuth(cert *x509.Certificate) bool {
-	for i := range cert.ExtKeyUsage {
-		if cert.ExtKeyUsage[i] == x509.ExtKeyUsageServerAuth {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(cert.ExtKeyUsage, x509.ExtKeyUsageServerAuth)
 }
 
 // WriteCertAndKey stores certificate and key at the specified location
@@ -215,7 +206,7 @@ func WriteCSR(csrDir, name string, csr *x509.CertificateRequest) error {
 		return errors.Wrapf(err, "failed to make directory %s", filepath.Dir(csrPath))
 	}
 
-	if err := ioutil.WriteFile(csrPath, EncodeCSRPEM(csr), os.FileMode(0600)); err != nil {
+	if err := os.WriteFile(csrPath, EncodeCSRPEM(csr), os.FileMode(0600)); err != nil {
 		return errors.Wrapf(err, "unable to write CSR to file %s", csrPath)
 	}
 
@@ -246,13 +237,8 @@ func CertOrKeyExist(pkiPath, name string) bool {
 
 	_, certErr := os.Stat(certificatePath)
 	_, keyErr := os.Stat(privateKeyPath)
-	if os.IsNotExist(certErr) && os.IsNotExist(keyErr) {
-		// The cert and the key do not exist
-		return false
-	}
 
-	// Both files exist or one of them
-	return true
+	return !(os.IsNotExist(certErr) && os.IsNotExist(keyErr))
 }
 
 // CSROrKeyExist returns true if one of the CSR or key exists
@@ -290,8 +276,8 @@ func TryLoadCertFromDisk(pkiPath, name string) (*x509.Certificate, error) {
 		return nil, errors.Wrapf(err, "couldn't load the certificate file %s", certificatePath)
 	}
 
-	// We are only putting one certificate in the certificate pem file, so it's safe to just pick the first one
-	// TODO: Support multiple certs here in order to be able to rotate certs
+	// Safely pick the first one because the sender's certificate must come first in the list.
+	// For details, see: https://www.rfc-editor.org/rfc/rfc4346#section-7.4.2
 	cert := certs[0]
 
 	return cert, nil
@@ -336,23 +322,8 @@ func TryLoadKeyFromDisk(pkiPath, name string) (crypto.Signer, error) {
 	return key, nil
 }
 
-// TryLoadCSRAndKeyFromDisk tries to load the CSR and key from the disk
-func TryLoadCSRAndKeyFromDisk(pkiPath, name string) (*x509.CertificateRequest, crypto.Signer, error) {
-	csr, err := TryLoadCSRFromDisk(pkiPath, name)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "could not load CSR file")
-	}
-
-	key, err := TryLoadKeyFromDisk(pkiPath, name)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "could not load key file")
-	}
-
-	return csr, key, nil
-}
-
 // TryLoadPrivatePublicKeyFromDisk tries to load the key from the disk and validates that it is valid
-func TryLoadPrivatePublicKeyFromDisk(pkiPath, name string) (*rsa.PrivateKey, *rsa.PublicKey, error) {
+func TryLoadPrivatePublicKeyFromDisk(pkiPath, name string) (crypto.PrivateKey, crypto.PublicKey, error) {
 	privateKeyPath := pathForKey(pkiPath, name)
 
 	// Parse the private key from a file
@@ -369,27 +340,15 @@ func TryLoadPrivatePublicKeyFromDisk(pkiPath, name string) (*rsa.PrivateKey, *rs
 		return nil, nil, errors.Wrapf(err, "couldn't load the public key file %s", publicKeyPath)
 	}
 
-	// Allow RSA format only
-	k, ok := privKey.(*rsa.PrivateKey)
-	if !ok {
-		return nil, nil, errors.Errorf("the private key file %s isn't in RSA format", privateKeyPath)
+	// Allow RSA and ECDSA formats only
+	switch k := privKey.(type) {
+	case *rsa.PrivateKey:
+		return k, pubKeys[0].(*rsa.PublicKey), nil
+	case *ecdsa.PrivateKey:
+		return k, pubKeys[0].(*ecdsa.PublicKey), nil
+	default:
+		return nil, nil, errors.Errorf("the private key file %s is neither in RSA nor ECDSA format", privateKeyPath)
 	}
-
-	p := pubKeys[0].(*rsa.PublicKey)
-
-	return k, p, nil
-}
-
-// TryLoadCSRFromDisk tries to load the CSR from the disk
-func TryLoadCSRFromDisk(pkiPath, name string) (*x509.CertificateRequest, error) {
-	csrPath := pathForCSR(pkiPath, name)
-
-	csr, err := CertificateRequestFromFile(csrPath)
-	if err != nil {
-		return nil, errors.Wrapf(err, "could not load the CSR %s", csrPath)
-	}
-
-	return csr, nil
 }
 
 // PathsForCertAndKey returns the paths for the certificate and key given the path and basename.
@@ -416,13 +375,13 @@ func pathForCSR(pkiPath, name string) string {
 // GetAPIServerAltNames builds an AltNames object for to be used when generating apiserver certificate
 func GetAPIServerAltNames(cfg *kubeadmapi.InitConfiguration) (*certutil.AltNames, error) {
 	// advertise address
-	advertiseAddress := net.ParseIP(cfg.LocalAPIEndpoint.AdvertiseAddress)
+	advertiseAddress := netutils.ParseIPSloppy(cfg.LocalAPIEndpoint.AdvertiseAddress)
 	if advertiseAddress == nil {
 		return nil, errors.Errorf("error parsing LocalAPIEndpoint AdvertiseAddress %v: is not a valid textual representation of an IP address",
 			cfg.LocalAPIEndpoint.AdvertiseAddress)
 	}
 
-	internalAPIServerVirtualIP, err := kubeadmconstants.GetAPIServerVirtualIP(cfg.Networking.ServiceSubnet, features.Enabled(cfg.FeatureGates, features.IPv6DualStack))
+	internalAPIServerVirtualIP, err := kubeadmconstants.GetAPIServerVirtualIP(cfg.Networking.ServiceSubnet)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to get first IP address from the given CIDR: %v", cfg.Networking.ServiceSubnet)
 	}
@@ -445,7 +404,7 @@ func GetAPIServerAltNames(cfg *kubeadmapi.InitConfiguration) (*certutil.AltNames
 	// add cluster controlPlaneEndpoint if present (dns or ip)
 	if len(cfg.ControlPlaneEndpoint) > 0 {
 		if host, _, err := kubeadmutil.ParseHostPort(cfg.ControlPlaneEndpoint); err == nil {
-			if ip := net.ParseIP(host); ip != nil {
+			if ip := netutils.ParseIPSloppy(host); ip != nil {
 				altNames.IPs = append(altNames.IPs, ip)
 			} else {
 				altNames.DNSNames = append(altNames.DNSNames, host)
@@ -477,7 +436,7 @@ func GetEtcdPeerAltNames(cfg *kubeadmapi.InitConfiguration) (*certutil.AltNames,
 // getAltNames builds an AltNames object with the cfg and certName.
 func getAltNames(cfg *kubeadmapi.InitConfiguration, certName string) (*certutil.AltNames, error) {
 	// advertise address
-	advertiseAddress := net.ParseIP(cfg.LocalAPIEndpoint.AdvertiseAddress)
+	advertiseAddress := netutils.ParseIPSloppy(cfg.LocalAPIEndpoint.AdvertiseAddress)
 	if advertiseAddress == nil {
 		return nil, errors.Errorf("error parsing LocalAPIEndpoint AdvertiseAddress %v: is not a valid textual representation of an IP address",
 			cfg.LocalAPIEndpoint.AdvertiseAddress)
@@ -504,17 +463,17 @@ func getAltNames(cfg *kubeadmapi.InitConfiguration, certName string) (*certutil.
 // valid IP address strings are parsed and added to altNames.IPs as net.IP's
 // RFC-1123 compliant DNS strings are added to altNames.DNSNames as strings
 // RFC-1123 compliant wildcard DNS strings are added to altNames.DNSNames as strings
-// certNames is used to print user facing warnings and should be the name of the cert the altNames will be used for
+// certNames is used to print user facing warnings and should be the name of the cert the altNames will be used for
 func appendSANsToAltNames(altNames *certutil.AltNames, SANs []string, certName string) {
 	for _, altname := range SANs {
-		if ip := net.ParseIP(altname); ip != nil {
+		if ip := netutils.ParseIPSloppy(altname); ip != nil {
 			altNames.IPs = append(altNames.IPs, ip)
 		} else if len(validation.IsDNS1123Subdomain(altname)) == 0 {
 			altNames.DNSNames = append(altNames.DNSNames, altname)
 		} else if len(validation.IsWildcardDNS1123Subdomain(altname)) == 0 {
 			altNames.DNSNames = append(altNames.DNSNames, altname)
 		} else {
-			fmt.Printf(
+			klog.Warningf(
 				"[certificates] WARNING: '%s' was not added to the '%s' SAN, because it is not a valid IP or RFC-1123 compliant DNS entry\n",
 				altname,
 				certName,
@@ -532,36 +491,10 @@ func EncodeCSRPEM(csr *x509.CertificateRequest) []byte {
 	return pem.EncodeToMemory(&block)
 }
 
-func parseCSRPEM(pemCSR []byte) (*x509.CertificateRequest, error) {
-	block, _ := pem.Decode(pemCSR)
-	if block == nil {
-		return nil, errors.New("data doesn't contain a valid certificate request")
-	}
-
-	if block.Type != certutil.CertificateRequestBlockType {
-		return nil, errors.Errorf("expected block type %q, but PEM had type %q", certutil.CertificateRequestBlockType, block.Type)
-	}
-
-	return x509.ParseCertificateRequest(block.Bytes)
-}
-
-// CertificateRequestFromFile returns the CertificateRequest from a given PEM-encoded file.
-// Returns an error if the file could not be read or if the CSR could not be parsed.
-func CertificateRequestFromFile(file string) (*x509.CertificateRequest, error) {
-	pemBlock, err := ioutil.ReadFile(file)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to read file")
-	}
-
-	csr, err := parseCSRPEM(pemBlock)
-	if err != nil {
-		return nil, errors.Wrapf(err, "error reading certificate request file %s", file)
-	}
-	return csr, nil
-}
-
 // NewCSR creates a new CSR
 func NewCSR(cfg CertConfig, key crypto.Signer) (*x509.CertificateRequest, error) {
+	RemoveDuplicateAltNames(&cfg.AltNames)
+
 	template := &x509.CertificateRequest{
 		Subject: pkix.Name{
 			CommonName:   cfg.CommonName,
@@ -580,7 +513,7 @@ func NewCSR(cfg CertConfig, key crypto.Signer) (*x509.CertificateRequest, error)
 	return x509.ParseCertificateRequest(csrBytes)
 }
 
-// EncodeCertPEM returns PEM-endcoded certificate data
+// EncodeCertPEM returns PEM-encoded certificate data
 func EncodeCertPEM(cert *x509.Certificate) []byte {
 	block := pem.Block{
 		Type:  CertificateBlockType,
@@ -589,7 +522,7 @@ func EncodeCertPEM(cert *x509.Certificate) []byte {
 	return pem.EncodeToMemory(&block)
 }
 
-// EncodeCertBundlePEM returns PEM-endcoded certificate bundle
+// EncodeCertBundlePEM returns PEM-encoded certificate bundle
 func EncodeCertBundlePEM(certs []*x509.Certificate) ([]byte, error) {
 	buf := bytes.Buffer{}
 
@@ -623,20 +556,43 @@ func EncodePublicKeyPEM(key crypto.PublicKey) ([]byte, error) {
 // NewPrivateKey returns a new private key.
 var NewPrivateKey = GeneratePrivateKey
 
-func GeneratePrivateKey(keyType x509.PublicKeyAlgorithm) (crypto.Signer, error) {
-	if keyType == x509.ECDSA {
+// rsaKeySizeFromAlgorithmType takes a known RSA algorithm defined in the kubeadm API
+// an returns its key size. For unknown types it returns 0. For an empty type it returns
+// the default size of 2048.
+func rsaKeySizeFromAlgorithmType(keyType kubeadmapi.EncryptionAlgorithmType) int {
+	switch keyType {
+	case kubeadmapi.EncryptionAlgorithmRSA2048, "":
+		return 2048
+	case kubeadmapi.EncryptionAlgorithmRSA3072:
+		return 3072
+	case kubeadmapi.EncryptionAlgorithmRSA4096:
+		return 4096
+	default:
+		return 0
+	}
+}
+
+// GeneratePrivateKey is the default function for generating private keys.
+func GeneratePrivateKey(keyType kubeadmapi.EncryptionAlgorithmType) (crypto.Signer, error) {
+	if keyType == kubeadmapi.EncryptionAlgorithmECDSAP256 {
 		return ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
 	}
 
+	rsaKeySize := rsaKeySizeFromAlgorithmType(keyType)
+	if rsaKeySize == 0 {
+		return nil, errors.Errorf("cannot obtain key size from unknown RSA algorithm: %q", keyType)
+	}
 	return rsa.GenerateKey(cryptorand.Reader, rsaKeySize)
 }
 
 // NewSignedCert creates a signed certificate using the given CA certificate and key
 func NewSignedCert(cfg *CertConfig, key crypto.Signer, caCert *x509.Certificate, caKey crypto.Signer, isCA bool) (*x509.Certificate, error) {
-	serial, err := cryptorand.Int(cryptorand.Reader, new(big.Int).SetInt64(math.MaxInt64))
+	// returns a uniform random value in [0, max-1), then add 1 to serial to make it a uniform random value in [1, max).
+	serial, err := cryptorand.Int(cryptorand.Reader, new(big.Int).SetInt64(math.MaxInt64-1))
 	if err != nil {
 		return nil, err
 	}
+	serial = new(big.Int).Add(serial, big.NewInt(1))
 	if len(cfg.CommonName) == 0 {
 		return nil, errors.New("must specify a CommonName")
 	}
@@ -648,9 +604,14 @@ func NewSignedCert(cfg *CertConfig, key crypto.Signer, caCert *x509.Certificate,
 
 	RemoveDuplicateAltNames(&cfg.AltNames)
 
-	notAfter := time.Now().Add(kubeadmconstants.CertificateValidity).UTC()
-	if cfg.NotAfter != nil {
-		notAfter = *cfg.NotAfter
+	notBefore := caCert.NotBefore
+	if !cfg.NotBefore.IsZero() {
+		notBefore = cfg.NotBefore
+	}
+
+	notAfter := notBefore.Add(kubeadmconstants.CertificateValidityPeriod)
+	if !cfg.NotAfter.IsZero() {
+		notAfter = cfg.NotAfter
 	}
 
 	certTmpl := x509.Certificate{
@@ -661,7 +622,7 @@ func NewSignedCert(cfg *CertConfig, key crypto.Signer, caCert *x509.Certificate,
 		DNSNames:              cfg.AltNames.DNSNames,
 		IPAddresses:           cfg.AltNames.IPs,
 		SerialNumber:          serial,
-		NotBefore:             caCert.NotBefore,
+		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              keyUsage,
 		ExtKeyUsage:           cfg.Usages,
@@ -675,6 +636,48 @@ func NewSignedCert(cfg *CertConfig, key crypto.Signer, caCert *x509.Certificate,
 	return x509.ParseCertificate(certDERBytes)
 }
 
+// NewSelfSignedCACert creates a new self-signed CA certificate
+func NewSelfSignedCACert(cfg *CertConfig, key crypto.Signer) (*x509.Certificate, error) {
+	// returns a uniform random value in [0, max-1), then add 1 to serial to make it a uniform random value in [1, max).
+	serial, err := cryptorand.Int(cryptorand.Reader, new(big.Int).SetInt64(math.MaxInt64-1))
+	if err != nil {
+		return nil, err
+	}
+	serial = new(big.Int).Add(serial, big.NewInt(1))
+
+	keyUsage := x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign
+
+	notBefore := time.Now().UTC()
+	if !cfg.NotBefore.IsZero() {
+		notBefore = cfg.NotBefore
+	}
+
+	notAfter := notBefore.Add(kubeadmconstants.CACertificateValidityPeriod)
+	if !cfg.NotAfter.IsZero() {
+		notAfter = cfg.NotAfter
+	}
+
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			CommonName:   cfg.CommonName,
+			Organization: cfg.Organization,
+		},
+		DNSNames:              []string{cfg.CommonName},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              keyUsage,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	certDERBytes, err := x509.CreateCertificate(cryptorand.Reader, &tmpl, &tmpl, key.Public(), key)
+	if err != nil {
+		return nil, err
+	}
+	return x509.ParseCertificate(certDERBytes)
+}
+
 // RemoveDuplicateAltNames removes duplicate items in altNames.
 func RemoveDuplicateAltNames(altNames *certutil.AltNames) {
 	if altNames == nil {
@@ -682,7 +685,7 @@ func RemoveDuplicateAltNames(altNames *certutil.AltNames) {
 	}
 
 	if altNames.DNSNames != nil {
-		altNames.DNSNames = sets.NewString(altNames.DNSNames...).List()
+		altNames.DNSNames = sets.List(sets.New(altNames.DNSNames...))
 	}
 
 	ipsKeys := make(map[string]struct{})
@@ -700,7 +703,7 @@ func RemoveDuplicateAltNames(altNames *certutil.AltNames) {
 // (+/- offset)
 func ValidateCertPeriod(cert *x509.Certificate, offset time.Duration) error {
 	period := fmt.Sprintf("NotBefore: %v, NotAfter: %v", cert.NotBefore, cert.NotAfter)
-	now := time.Now().Add(offset)
+	now := time.Now().Add(offset).UTC()
 	if now.Before(cert.NotBefore) {
 		return errors.Errorf("the certificate is not valid yet: %s", period)
 	}

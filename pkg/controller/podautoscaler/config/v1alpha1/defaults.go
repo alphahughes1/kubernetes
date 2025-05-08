@@ -34,11 +34,11 @@ import (
 // run it in your wrapper struct of this type in its `SetDefaults_` method.
 func RecommendedDefaultHPAControllerConfiguration(obj *kubectrlmgrconfigv1alpha1.HPAControllerConfiguration) {
 	zero := metav1.Duration{}
+	if obj.ConcurrentHorizontalPodAutoscalerSyncs == 0 {
+		obj.ConcurrentHorizontalPodAutoscalerSyncs = 5
+	}
 	if obj.HorizontalPodAutoscalerSyncPeriod == zero {
 		obj.HorizontalPodAutoscalerSyncPeriod = metav1.Duration{Duration: 15 * time.Second}
-	}
-	if obj.HorizontalPodAutoscalerUpscaleForbiddenWindow == zero {
-		obj.HorizontalPodAutoscalerUpscaleForbiddenWindow = metav1.Duration{Duration: 3 * time.Minute}
 	}
 	if obj.HorizontalPodAutoscalerDownscaleStabilizationWindow == zero {
 		obj.HorizontalPodAutoscalerDownscaleStabilizationWindow = metav1.Duration{Duration: 5 * time.Minute}
@@ -48,9 +48,6 @@ func RecommendedDefaultHPAControllerConfiguration(obj *kubectrlmgrconfigv1alpha1
 	}
 	if obj.HorizontalPodAutoscalerInitialReadinessDelay == zero {
 		obj.HorizontalPodAutoscalerInitialReadinessDelay = metav1.Duration{Duration: 30 * time.Second}
-	}
-	if obj.HorizontalPodAutoscalerDownscaleForbiddenWindow == zero {
-		obj.HorizontalPodAutoscalerDownscaleForbiddenWindow = metav1.Duration{Duration: 5 * time.Minute}
 	}
 	if obj.HorizontalPodAutoscalerTolerance == 0 {
 		obj.HorizontalPodAutoscalerTolerance = 0.1

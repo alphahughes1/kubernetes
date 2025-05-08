@@ -54,7 +54,7 @@ type Phase struct {
 	RunAllSiblings bool
 
 	// Run defines a function implementing the phase action.
-	// It is recommended to implent type assertion, e.g. using golang type switch,
+	// It is recommended to implement type assertion, e.g. using golang type switch,
 	// for validating the RunData type.
 	Run func(data RunData) error
 
@@ -78,6 +78,9 @@ type Phase struct {
 	// ArgsValidator defines the positional arg function to be used for validating args for this phase
 	// If not set a phase will adopt the args of the top level command.
 	ArgsValidator cobra.PositionalArgs
+
+	// Dependencies is a list of phases that the specific phase depends on.
+	Dependencies []string
 }
 
 // AppendPhase adds the given phase to the nested, ordered sequence of phases.

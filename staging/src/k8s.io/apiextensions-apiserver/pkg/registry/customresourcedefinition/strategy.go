@@ -20,20 +20,21 @@ import (
 	"context"
 	"fmt"
 
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/validation"
+	apiextensionsfeatures "k8s.io/apiextensions-apiserver/pkg/features"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/names"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 )
 
 // strategy implements behavior for CustomResources.
@@ -79,6 +80,7 @@ func (strategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 			break
 		}
 	}
+	dropDisabledFields(crd, nil)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
@@ -107,16 +109,12 @@ func (strategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 			break
 		}
 	}
+	dropDisabledFields(newCRD, oldCRD)
 }
 
 // Validate validates a new CustomResourceDefinition.
 func (strategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
-	var groupVersion schema.GroupVersion
-	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion = schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-	}
-
-	return validation.ValidateCustomResourceDefinition(obj.(*apiextensions.CustomResourceDefinition), groupVersion)
+	return validation.ValidateCustomResourceDefinition(ctx, obj.(*apiextensions.CustomResourceDefinition))
 }
 
 // WarningsOnCreate returns warnings for the creation of the given object.
@@ -139,12 +137,7 @@ func (strategy) Canonicalize(obj runtime.Object) {
 
 // ValidateUpdate is the default update validation for an end user updating status.
 func (strategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	var groupVersion schema.GroupVersion
-	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion = schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-	}
-
-	return validation.ValidateCustomResourceDefinitionUpdate(obj.(*apiextensions.CustomResourceDefinition), old.(*apiextensions.CustomResourceDefinition), groupVersion)
+	return validation.ValidateCustomResourceDefinitionUpdate(ctx, obj.(*apiextensions.CustomResourceDefinition), old.(*apiextensions.CustomResourceDefinition))
 }
 
 // WarningsOnUpdate returns warnings for the given update.
@@ -233,4 +226,84 @@ func MatchCustomResourceDefinition(label labels.Selector, field fields.Selector)
 // CustomResourceDefinitionToSelectableFields returns a field set that represents the object.
 func CustomResourceDefinitionToSelectableFields(obj *apiextensions.CustomResourceDefinition) fields.Set {
 	return generic.ObjectMetaFieldsSet(&obj.ObjectMeta, true)
+}
+
+// dropDisabledFields drops disabled fields that are not used if their associated feature gates
+// are not enabled.
+func dropDisabledFields(newCRD *apiextensions.CustomResourceDefinition, oldCRD *apiextensions.CustomResourceDefinition) {
+	if !utilfeature.DefaultFeatureGate.Enabled(apiextensionsfeatures.CRDValidationRatcheting) && (oldCRD == nil || (oldCRD != nil && !specHasOptionalOldSelf(&oldCRD.Spec))) {
+		if newCRD.Spec.Validation != nil {
+			dropOptionalOldSelfField(newCRD.Spec.Validation.OpenAPIV3Schema)
+		}
+
+		for _, v := range newCRD.Spec.Versions {
+			if v.Schema != nil {
+				dropOptionalOldSelfField(v.Schema.OpenAPIV3Schema)
+			}
+		}
+	}
+	if !utilfeature.DefaultFeatureGate.Enabled(apiextensionsfeatures.CustomResourceFieldSelectors) && (oldCRD == nil || (oldCRD != nil && !specHasSelectableFields(&oldCRD.Spec))) {
+		dropSelectableFields(&newCRD.Spec)
+	}
+}
+
+// dropOptionalOldSelfField drops field optionalOldSelf from CRD schema
+func dropOptionalOldSelfField(schema *apiextensions.JSONSchemaProps) {
+	if schema == nil {
+		return
+	}
+	for i := range schema.XValidations {
+		schema.XValidations[i].OptionalOldSelf = nil
+	}
+
+	if schema.AdditionalProperties != nil {
+		dropOptionalOldSelfField(schema.AdditionalProperties.Schema)
+	}
+	for def, jsonSchema := range schema.Properties {
+		dropOptionalOldSelfField(&jsonSchema)
+		schema.Properties[def] = jsonSchema
+	}
+	if schema.Items != nil {
+		dropOptionalOldSelfField(schema.Items.Schema)
+		for i, jsonSchema := range schema.Items.JSONSchemas {
+			dropOptionalOldSelfField(&jsonSchema)
+			schema.Items.JSONSchemas[i] = jsonSchema
+		}
+	}
+}
+
+func specHasOptionalOldSelf(spec *apiextensions.CustomResourceDefinitionSpec) bool {
+	return validation.HasSchemaWith(spec, schemaHasOptionalOldSelf)
+}
+
+func schemaHasOptionalOldSelf(s *apiextensions.JSONSchemaProps) bool {
+	return validation.SchemaHas(s, func(s *apiextensions.JSONSchemaProps) bool {
+		for _, v := range s.XValidations {
+			if v.OptionalOldSelf != nil {
+				return true
+			}
+
+		}
+		return false
+	})
+}
+
+func dropSelectableFields(spec *apiextensions.CustomResourceDefinitionSpec) {
+	spec.SelectableFields = nil
+	for i := range spec.Versions {
+		spec.Versions[i].SelectableFields = nil
+	}
+}
+
+func specHasSelectableFields(spec *apiextensions.CustomResourceDefinitionSpec) bool {
+	if spec.SelectableFields != nil {
+		return true
+	}
+	for _, v := range spec.Versions {
+		if v.SelectableFields != nil {
+			return true
+		}
+	}
+
+	return false
 }

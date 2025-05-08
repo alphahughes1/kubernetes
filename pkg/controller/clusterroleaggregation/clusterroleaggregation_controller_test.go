@@ -17,14 +17,15 @@ limitations under the License.
 package clusterroleaggregation
 
 import (
+	"context"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
 	fakeclient "k8s.io/client-go/kubernetes/fake"
@@ -181,7 +182,7 @@ func TestSyncClusterRole(t *testing.T) {
 					clusterRoleClient: fakeClient.RbacV1(),
 					clusterRoleLister: rbaclisters.NewClusterRoleLister(indexer),
 				}
-				err := c.syncClusterRole(test.clusterRoleToSync)
+				err := c.syncClusterRole(context.TODO(), test.clusterRoleToSync)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -214,7 +215,7 @@ func TestSyncClusterRole(t *testing.T) {
 					t.Fatalf("error unmarshalling apply request: %v", err)
 				}
 				if !equality.Semantic.DeepEqual(ac, test.expectedClusterRoleApply) {
-					t.Fatalf("%v", diff.ObjectDiff(test.expectedClusterRoleApply, ac))
+					t.Fatalf("%v", cmp.Diff(test.expectedClusterRoleApply, ac))
 				}
 				if expectedActions == 2 {
 					action := fakeClient.Actions()[1]
@@ -226,7 +227,7 @@ func TestSyncClusterRole(t *testing.T) {
 						t.Fatalf("unexpected action %#v", action)
 					}
 					if !equality.Semantic.DeepEqual(updateAction.GetObject().(*rbacv1.ClusterRole), test.expectedClusterRole) {
-						t.Fatalf("%v", diff.ObjectDiff(test.expectedClusterRole, updateAction.GetObject().(*rbacv1.ClusterRole)))
+						t.Fatalf("%v", cmp.Diff(test.expectedClusterRole, updateAction.GetObject().(*rbacv1.ClusterRole)))
 					}
 				}
 			})

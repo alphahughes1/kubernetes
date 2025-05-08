@@ -19,9 +19,11 @@ package operationexecutor
 import (
 	"time"
 
+	"k8s.io/klog/v2"
+
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
-	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util/hostutil"
 	volumetypes "k8s.io/kubernetes/pkg/volume/util/types"
@@ -53,11 +55,11 @@ func (f *fakeOGCounter) GenerateUnmountVolumeFunc(volumeToUnmount MountedVolume,
 	return f.recordFuncCall("GenerateUnmountVolumeFunc"), nil
 }
 
-func (f *fakeOGCounter) GenerateAttachVolumeFunc(volumeToAttach VolumeToAttach, actualStateOfWorld ActualStateOfWorldAttacherUpdater) volumetypes.GeneratedOperations {
+func (f *fakeOGCounter) GenerateAttachVolumeFunc(logger klog.Logger, volumeToAttach VolumeToAttach, actualStateOfWorld ActualStateOfWorldAttacherUpdater) volumetypes.GeneratedOperations {
 	return f.recordFuncCall("GenerateAttachVolumeFunc")
 }
 
-func (f *fakeOGCounter) GenerateDetachVolumeFunc(volumeToDetach AttachedVolume, verifySafeToDetach bool, actualStateOfWorld ActualStateOfWorldAttacherUpdater) (volumetypes.GeneratedOperations, error) {
+func (f *fakeOGCounter) GenerateDetachVolumeFunc(logger klog.Logger, volumeToDetach AttachedVolume, verifySafeToDetach bool, actualStateOfWorld ActualStateOfWorldAttacherUpdater) (volumetypes.GeneratedOperations, error) {
 	return f.recordFuncCall("GenerateDetachVolumeFunc"), nil
 }
 
@@ -69,7 +71,7 @@ func (f *fakeOGCounter) GenerateUnmountDeviceFunc(deviceToDetach AttachedVolume,
 	return f.recordFuncCall("GenerateUnmountDeviceFunc"), nil
 }
 
-func (f *fakeOGCounter) GenerateVerifyControllerAttachedVolumeFunc(volumeToMount VolumeToMount, nodeName types.NodeName, actualStateOfWorld ActualStateOfWorldAttacherUpdater) (volumetypes.GeneratedOperations, error) {
+func (f *fakeOGCounter) GenerateVerifyControllerAttachedVolumeFunc(logger klog.Logger, volumeToMount VolumeToMount, nodeName types.NodeName, actualStateOfWorld ActualStateOfWorldAttacherUpdater) (volumetypes.GeneratedOperations, error) {
 	return f.recordFuncCall("GenerateVerifyControllerAttachedVolumeFunc"), nil
 }
 
@@ -89,22 +91,15 @@ func (f *fakeOGCounter) GetVolumePluginMgr() *volume.VolumePluginMgr {
 	return nil
 }
 
-func (f *fakeOGCounter) GetCSITranslator() InTreeToCSITranslator {
-	return csitrans.New()
-}
-
-func (f *fakeOGCounter) GenerateBulkVolumeVerifyFunc(
-	map[types.NodeName][]*volume.Spec,
-	string,
-	map[*volume.Spec]v1.UniqueVolumeName, ActualStateOfWorldAttacherUpdater) (volumetypes.GeneratedOperations, error) {
-	return f.recordFuncCall("GenerateBulkVolumeVerifyFunc"), nil
-}
-
 func (f *fakeOGCounter) GenerateExpandVolumeFunc(*v1.PersistentVolumeClaim, *v1.PersistentVolume) (volumetypes.GeneratedOperations, error) {
 	return f.recordFuncCall("GenerateExpandVolumeFunc"), nil
 }
 
-func (f *fakeOGCounter) GenerateExpandInUseVolumeFunc(volumeToMount VolumeToMount, actualStateOfWorld ActualStateOfWorldMounterUpdater) (volumetypes.GeneratedOperations, error) {
+func (f *fakeOGCounter) GenerateExpandAndRecoverVolumeFunc(*v1.PersistentVolumeClaim, *v1.PersistentVolume, string) (volumetypes.GeneratedOperations, error) {
+	return f.recordFuncCall("GenerateExpandVolumeFunc"), nil
+}
+
+func (f *fakeOGCounter) GenerateExpandInUseVolumeFunc(volumeToMount VolumeToMount, actualStateOfWorld ActualStateOfWorldMounterUpdater, currentSize resource.Quantity) (volumetypes.GeneratedOperations, error) {
 	return f.recordFuncCall("GenerateExpandInUseVolumeFunc"), nil
 }
 

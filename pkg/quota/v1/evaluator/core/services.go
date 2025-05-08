@@ -26,10 +26,8 @@ import (
 	"k8s.io/apiserver/pkg/admission"
 	quota "k8s.io/apiserver/pkg/quota/v1"
 	"k8s.io/apiserver/pkg/quota/v1/generic"
-	"k8s.io/apiserver/pkg/util/feature"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
-	"k8s.io/kubernetes/pkg/features"
 )
 
 // the name used for object count quota
@@ -69,6 +67,9 @@ func (p *serviceEvaluator) GroupResource() schema.GroupResource {
 
 // Handles returns true of the evaluator should handle the specified operation.
 func (p *serviceEvaluator) Handles(a admission.Attributes) bool {
+	if a.GetSubresource() != "" {
+		return false
+	}
 	operation := a.GetOperation()
 	// We handle create and update because a service type can change.
 	return admission.Create == operation || admission.Update == operation
@@ -134,8 +135,7 @@ func (p *serviceEvaluator) Usage(item runtime.Object) (corev1.ResourceList, erro
 		// is suppressed only ports with explicit NodePort values are counted.
 		// nodeports won't be allocated yet, so we can't simply count the actual values.
 		// We need to look at the intent.
-		if feature.DefaultFeatureGate.Enabled(features.ServiceLBNodePortControl) &&
-			svc.Spec.AllocateLoadBalancerNodePorts != nil &&
+		if svc.Spec.AllocateLoadBalancerNodePorts != nil &&
 			*svc.Spec.AllocateLoadBalancerNodePorts == false {
 			result[corev1.ResourceServicesNodePorts] = *portsWithNodePorts(svc)
 		} else {
@@ -164,7 +164,7 @@ func (p *serviceEvaluator) UsageStats(options quota.UsageStatsOptions) (quota.Us
 
 var _ quota.Evaluator = &serviceEvaluator{}
 
-//GetQuotaServiceType returns ServiceType if the service type is eligible to track against a quota, nor return ""
+// GetQuotaServiceType returns ServiceType if the service type is eligible to track against a quota, nor return ""
 func GetQuotaServiceType(service *corev1.Service) corev1.ServiceType {
 	switch service.Spec.Type {
 	case corev1.ServiceTypeNodePort:

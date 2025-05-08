@@ -17,11 +17,12 @@ limitations under the License.
 package conversion
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -63,9 +64,9 @@ func StartConversionWebhookServer(handler http.Handler) (func(), *apiextensionsv
 	}
 
 	// StartTLS returns immediately, there is a small chance of a race to avoid.
-	if err := wait.PollImmediate(time.Millisecond*100, wait.ForeverTestTimeout, func() (bool, error) {
-		_, err := webhookServer.Client().Get(webhookServer.URL) // even a 404 is fine
-		return err == nil, nil
+	if err := wait.PollUntilContextTimeout(context.Background(), time.Millisecond*100, wait.ForeverTestTimeout, true, func(ctx context.Context) (done bool, err error) {
+		_, getErr := webhookServer.Client().Get(webhookServer.URL) // even a 404 is fine
+		return getErr == nil, nil
 	}); err != nil {
 		webhookServer.Close()
 		return nil, nil, err
@@ -84,7 +85,7 @@ type V1ReviewConverterFunc func(review *apiextensionsv1.ConversionReview) (*apie
 func NewReviewWebhookHandler(t *testing.T, v1beta1ConverterFunc V1Beta1ReviewConverterFunc, v1ConverterFunc V1ReviewConverterFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
-		data, err := ioutil.ReadAll(r.Body)
+		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Error(err)
 			return
@@ -209,7 +210,8 @@ func NewObjectConverterWebhookHandler(t *testing.T, converterFunc ObjectConverte
 }
 
 // localhostCert was generated from crypto/tls/generate_cert.go with the following command:
-//     go run generate_cert.go  --rsa-bits 2048 --host 127.0.0.1,::1,example.com --ca --start-date "Jan 1 00:00:00 1970" --duration=1000000h
+//
+//	go run generate_cert.go  --rsa-bits 2048 --host 127.0.0.1,::1,example.com --ca --start-date "Jan 1 00:00:00 1970" --duration=1000000h
 var localhostCert = []byte(`-----BEGIN CERTIFICATE-----
 MIIDGDCCAgCgAwIBAgIQTKCKn99d5HhQVCLln2Q+eTANBgkqhkiG9w0BAQsFADAS
 MRAwDgYDVQQKEwdBY21lIENvMCAXDTcwMDEwMTAwMDAwMFoYDzIwODQwMTI5MTYw

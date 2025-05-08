@@ -34,8 +34,10 @@ import (
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	bootstrap "k8s.io/cluster-bootstrap/token/jws"
 	"k8s.io/klog/v2"
+
+	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/pubkeypin"
@@ -47,36 +49,45 @@ const BootstrapUser = "token-bootstrap-client"
 // RetrieveValidatedConfigInfo connects to the API Server and tries to fetch the cluster-info ConfigMap
 // It then makes sure it can trust the API Server by looking at the JWS-signed tokens and (if CACertHashes is not empty)
 // validating the cluster CA against a set of pinned public keys
-func RetrieveValidatedConfigInfo(cfg *kubeadmapi.Discovery) (*clientcmdapi.Config, error) {
-	return retrieveValidatedConfigInfo(nil, cfg, constants.DiscoveryRetryInterval)
+func RetrieveValidatedConfigInfo(dryRunClient clientset.Interface, cfg *kubeadmapi.Discovery, timeout time.Duration) (*clientcmdapi.Config, error) {
+	isDryRun := dryRunClient != nil
+	isTesting := false
+	return retrieveValidatedConfigInfo(dryRunClient, cfg, constants.DiscoveryRetryInterval, timeout, isDryRun, isTesting)
 }
 
 // retrieveValidatedConfigInfo is a private implementation of RetrieveValidatedConfigInfo.
 // It accepts an optional clientset that can be used for testing purposes.
-func retrieveValidatedConfigInfo(client clientset.Interface, cfg *kubeadmapi.Discovery, interval time.Duration) (*clientcmdapi.Config, error) {
-	token, err := kubeadmapi.NewBootstrapTokenString(cfg.BootstrapToken.Token)
+func retrieveValidatedConfigInfo(client clientset.Interface, cfg *kubeadmapi.Discovery, interval, timeout time.Duration, isDryRun, isTesting bool) (*clientcmdapi.Config, error) {
+	var err error
+
+	// Make sure the interval is not bigger than the duration
+	if interval > timeout {
+		interval = timeout
+	}
+
+	endpoint := cfg.BootstrapToken.APIServerEndpoint
+	insecureBootstrapConfig := BuildInsecureBootstrapKubeConfig(endpoint)
+	clusterName := insecureBootstrapConfig.Contexts[insecureBootstrapConfig.CurrentContext].Cluster
+
+	klog.V(1).Infof("[discovery] Created cluster-info discovery client, requesting info from %q", endpoint)
+	if !isDryRun && !isTesting {
+		client, err = kubeconfigutil.ToClientSet(insecureBootstrapConfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+	insecureClusterInfo, err := getClusterInfo(client, cfg, interval, timeout, isDryRun)
 	if err != nil {
 		return nil, err
 	}
 
 	// Load the CACertHashes into a pubkeypin.Set
 	pubKeyPins := pubkeypin.NewSet()
-	if err = pubKeyPins.Allow(cfg.BootstrapToken.CACertHashes...); err != nil {
+	if err := pubKeyPins.Allow(cfg.BootstrapToken.CACertHashes...); err != nil {
 		return nil, errors.Wrap(err, "invalid discovery token CA certificate hash")
 	}
 
-	duration := cfg.Timeout.Duration
-	// Make sure the interval is not bigger than the duration
-	if interval > duration {
-		interval = duration
-	}
-
-	endpoint := cfg.BootstrapToken.APIServerEndpoint
-	insecureBootstrapConfig := buildInsecureBootstrapKubeConfig(endpoint, kubeadmapiv1.DefaultClusterName)
-	clusterName := insecureBootstrapConfig.Contexts[insecureBootstrapConfig.CurrentContext].Cluster
-
-	klog.V(1).Infof("[discovery] Created cluster-info discovery client, requesting info from %q", endpoint)
-	insecureClusterInfo, err := getClusterInfo(client, insecureBootstrapConfig, token, interval, duration)
+	token, err := bootstraptokenv1.NewBootstrapTokenString(cfg.BootstrapToken.Token)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +125,13 @@ func retrieveValidatedConfigInfo(client clientset.Interface, cfg *kubeadmapi.Dis
 	secureBootstrapConfig := buildSecureBootstrapKubeConfig(endpoint, clusterCABytes, clusterName)
 
 	klog.V(1).Infof("[discovery] Requesting info from %q again to validate TLS against the pinned public key", endpoint)
-	secureClusterInfo, err := getClusterInfo(client, secureBootstrapConfig, token, interval, duration)
+	if !isDryRun && !isTesting {
+		client, err = kubeconfigutil.ToClientSet(secureBootstrapConfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+	secureClusterInfo, err := getClusterInfo(client, cfg, interval, timeout, isDryRun)
 	if err != nil {
 		return nil, err
 	}
@@ -135,11 +152,12 @@ func retrieveValidatedConfigInfo(client clientset.Interface, cfg *kubeadmapi.Dis
 	return secureKubeconfig, nil
 }
 
-// buildInsecureBootstrapKubeConfig makes a kubeconfig object that connects insecurely to the API Server for bootstrapping purposes
-func buildInsecureBootstrapKubeConfig(endpoint, clustername string) *clientcmdapi.Config {
+// BuildInsecureBootstrapKubeConfig makes a kubeconfig object that connects insecurely to the API Server for bootstrapping purposes
+func BuildInsecureBootstrapKubeConfig(endpoint string) *clientcmdapi.Config {
 	controlPlaneEndpoint := fmt.Sprintf("https://%s", endpoint)
-	bootstrapConfig := kubeconfigutil.CreateBasic(controlPlaneEndpoint, clustername, BootstrapUser, []byte{})
-	bootstrapConfig.Clusters[clustername].InsecureSkipTLSVerify = true
+	clusterName := kubeadmapiv1.DefaultClusterName
+	bootstrapConfig := kubeconfigutil.CreateBasic(controlPlaneEndpoint, clusterName, BootstrapUser, []byte{})
+	bootstrapConfig.Clusters[clusterName].InsecureSkipTLSVerify = true
 	return bootstrapConfig
 }
 
@@ -151,7 +169,7 @@ func buildSecureBootstrapKubeConfig(endpoint string, caCert []byte, clustername 
 }
 
 // validateClusterInfoToken validates that the JWS token present in the cluster info ConfigMap is valid
-func validateClusterInfoToken(insecureClusterInfo *v1.ConfigMap, token *kubeadmapi.BootstrapTokenString) ([]byte, error) {
+func validateClusterInfoToken(insecureClusterInfo *v1.ConfigMap, token *bootstraptokenv1.BootstrapTokenString) ([]byte, error) {
 	insecureKubeconfigString, ok := insecureClusterInfo.Data[bootstrapapi.KubeConfigKey]
 	if !ok || len(insecureKubeconfigString) == 0 {
 		return nil, errors.Errorf("there is no %s key in the %s ConfigMap. This API Server isn't set up for token bootstrapping, can't connect",
@@ -191,44 +209,77 @@ func validateClusterCA(insecureConfig *clientcmdapi.Config, pubKeyPins *pubkeypi
 	return clusterCABytes, nil
 }
 
-// getClusterInfo creates a client from the given kubeconfig if the given client is nil,
-// and requests the cluster info ConfigMap using PollImmediate.
-// If a client is provided it will be used instead.
-func getClusterInfo(client clientset.Interface, kubeconfig *clientcmdapi.Config, token *kubeadmapi.BootstrapTokenString, interval, duration time.Duration) (*v1.ConfigMap, error) {
-	var cm *v1.ConfigMap
-	var err error
+// getClusterInfo requests the cluster-info ConfigMap with the provided client.
+func getClusterInfo(client clientset.Interface, cfg *kubeadmapi.Discovery, interval, duration time.Duration, dryRun bool) (*v1.ConfigMap, error) {
+	var (
+		cm        *v1.ConfigMap
+		err       error
+		lastError error
+	)
 
-	// Create client from kubeconfig
-	if client == nil {
-		client, err = kubeconfigutil.ToClientSet(kubeconfig)
-		if err != nil {
-			return nil, err
-		}
-	}
+	err = wait.PollUntilContextTimeout(context.Background(),
+		interval, duration, true,
+		func(ctx context.Context) (bool, error) {
+			token, err := bootstraptokenv1.NewBootstrapTokenString(cfg.BootstrapToken.Token)
+			if err != nil {
+				lastError = errors.Wrapf(err, "could not construct token string for token: %s",
+					cfg.BootstrapToken.Token)
+				return true, lastError
+			}
 
-	ctx, cancel := context.WithTimeout(context.TODO(), duration)
-	defer cancel()
+			klog.V(1).Infof("[discovery] Waiting for the cluster-info ConfigMap to receive a JWS signature"+
+				" for token ID %q", token.ID)
 
-	wait.JitterUntil(func() {
-		cm, err = client.CoreV1().ConfigMaps(metav1.NamespacePublic).Get(context.TODO(), bootstrapapi.ConfigMapClusterInfo, metav1.GetOptions{})
-		if err != nil {
-			klog.V(1).Infof("[discovery] Failed to request cluster-info, will try again: %v", err)
-			return
-		}
-		// Even if the ConfigMap is available the JWS signature is patched-in a bit later.
-		// Make sure we retry util then.
-		if _, ok := cm.Data[bootstrapapi.JWSSignatureKeyPrefix+token.ID]; !ok {
-			klog.V(1).Infof("[discovery] The cluster-info ConfigMap does not yet contain a JWS signature for token ID %q, will try again", token.ID)
-			err = errors.Errorf("could not find a JWS signature in the cluster-info ConfigMap for token ID %q", token.ID)
-			return
-		}
-		// Cancel the context on success
-		cancel()
-	}, interval, 0.3, true, ctx.Done())
-
+			cm, err = client.CoreV1().ConfigMaps(metav1.NamespacePublic).
+				Get(context.Background(), bootstrapapi.ConfigMapClusterInfo, metav1.GetOptions{})
+			if err != nil {
+				lastError = errors.Wrapf(err, "failed to request the cluster-info ConfigMap")
+				klog.V(1).Infof("[discovery] Retrying due to error: %v", lastError)
+				return false, nil
+			}
+			// Even if the ConfigMap is available the JWS signature is patched-in a bit later.
+			if _, ok := cm.Data[bootstrapapi.JWSSignatureKeyPrefix+token.ID]; !ok {
+				lastError = errors.Errorf("could not find a JWS signature in the cluster-info ConfigMap"+
+					" for token ID %q", token.ID)
+				if dryRun {
+					// Assume the user is dry-running with a token that will never appear in the cluster-info
+					// ConfigMap. Use the default dry-run token and CA cert hash.
+					mutateTokenDiscoveryForDryRun(cfg)
+					return false, nil
+				}
+				klog.V(1).Infof("[discovery] Retrying due to error: %v", lastError)
+				return false, nil
+			}
+			return true, nil
+		})
 	if err != nil {
-		return nil, err
+		return nil, lastError
 	}
 
 	return cm, nil
+}
+
+// mutateTokenDiscoveryForDryRun mutates the JoinConfiguration.Discovery so that it includes a dry-run token
+// CA cert hash and fake API server endpoint to comply with the fake "cluster-info" ConfigMap
+// that this reactor returns. The information here should be in sync with what the GetClusterInfoReactor()
+// dry-run reactor does.
+func mutateTokenDiscoveryForDryRun(cfg *kubeadmapi.Discovery) {
+	const (
+		tokenID     = "abcdef"
+		tokenSecret = "abcdef0123456789"
+		caHash      = "sha256:3b793efefe27a19f93b0fbe6e637e9c41d0dde8a377d6ab1c0f656bf1136dd8a"
+		endpoint    = "https://192.168.0.101:6443"
+	)
+
+	token := fmt.Sprintf("%s.%s", tokenID, tokenSecret)
+	klog.Warningf("[dryrun] Mutating the JoinConfiguration.Discovery.BootstrapToken to satisfy "+
+		"the dry-run without a real cluster-info ConfigMap:\n"+
+		"  Token: %s\n  CACertHash: %s\n  APIServerEndpoint: %s\n",
+		token, caHash, endpoint)
+	if cfg.BootstrapToken == nil {
+		cfg.BootstrapToken = &kubeadmapi.BootstrapTokenDiscovery{}
+	}
+	cfg.BootstrapToken.Token = token
+	cfg.BootstrapToken.CACertHashes = append(cfg.BootstrapToken.CACertHashes, caHash)
+	cfg.BootstrapToken.APIServerEndpoint = endpoint
 }

@@ -19,23 +19,16 @@ package daemonset
 import (
 	"context"
 
-	appsv1beta2 "k8s.io/api/apps/v1beta2"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	apivalidation "k8s.io/apimachinery/pkg/api/validation"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/api/pod"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	"k8s.io/kubernetes/pkg/apis/apps/validation"
-	"k8s.io/kubernetes/pkg/features"
 	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
@@ -48,20 +41,12 @@ type daemonSetStrategy struct {
 // Strategy is the default logic that applies when creating and updating DaemonSet objects.
 var Strategy = daemonSetStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
 
-// DefaultGarbageCollectionPolicy returns OrphanDependents for extensions/v1beta1 and apps/v1beta2 for backwards compatibility,
-// and DeleteDependents for all other versions.
+// Make sure we correctly implement the interface.
+var _ = rest.GarbageCollectionDeleteStrategy(Strategy)
+
+// DefaultGarbageCollectionPolicy returns DeleteDependents for all currently served versions.
 func (daemonSetStrategy) DefaultGarbageCollectionPolicy(ctx context.Context) rest.GarbageCollectionPolicy {
-	var groupVersion schema.GroupVersion
-	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion = schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-	}
-	switch groupVersion {
-	case extensionsv1beta1.SchemeGroupVersion, appsv1beta2.SchemeGroupVersion:
-		// for back compatibility
-		return rest.OrphanDependents
-	default:
-		return rest.DeleteDependents
-	}
+	return rest.DeleteDependents
 }
 
 // NamespaceScoped returns true because all DaemonSets need to be within a namespace.
@@ -91,7 +76,6 @@ func (daemonSetStrategy) PrepareForCreate(ctx context.Context, obj runtime.Objec
 		daemonSet.Spec.TemplateGeneration = 1
 	}
 
-	dropDaemonSetDisabledFields(daemonSet, nil)
 	pod.DropDisabledTemplateFields(&daemonSet.Spec.Template, nil)
 }
 
@@ -100,7 +84,6 @@ func (daemonSetStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.
 	newDaemonSet := obj.(*apps.DaemonSet)
 	oldDaemonSet := old.(*apps.DaemonSet)
 
-	dropDaemonSetDisabledFields(newDaemonSet, oldDaemonSet)
 	pod.DropDisabledTemplateFields(&newDaemonSet.Spec.Template, &oldDaemonSet.Spec.Template)
 
 	// update is not allowed to set status
@@ -128,35 +111,6 @@ func (daemonSetStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.
 	if !apiequality.Semantic.DeepEqual(oldDaemonSet.Spec, newDaemonSet.Spec) {
 		newDaemonSet.Generation = oldDaemonSet.Generation + 1
 	}
-}
-
-// dropDaemonSetDisabledFields drops fields that are not used if their associated feature gates
-// are not enabled.  The typical pattern is:
-//     if !utilfeature.DefaultFeatureGate.Enabled(features.MyFeature) && !myFeatureInUse(oldSvc) {
-//         newSvc.Spec.MyFeature = nil
-//     }
-func dropDaemonSetDisabledFields(newDS *apps.DaemonSet, oldDS *apps.DaemonSet) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.DaemonSetUpdateSurge) {
-		if r := newDS.Spec.UpdateStrategy.RollingUpdate; r != nil {
-			if daemonSetSurgeFieldsInUse(oldDS) {
-				// we need to ensure that MaxUnavailable is non-zero to preserve previous behavior
-				if r.MaxUnavailable.IntVal == 0 && r.MaxUnavailable.StrVal == "0%" {
-					r.MaxUnavailable = intstr.FromInt(1)
-				}
-			} else {
-				// clear the MaxSurge field and let validation deal with MaxUnavailable
-				r.MaxSurge = intstr.IntOrString{}
-			}
-		}
-	}
-}
-
-// daemonSetSurgeFieldsInUse returns true if fields related to daemonset update surge are set
-func daemonSetSurgeFieldsInUse(ds *apps.DaemonSet) bool {
-	if ds == nil {
-		return false
-	}
-	return ds.Spec.UpdateStrategy.RollingUpdate != nil && (ds.Spec.UpdateStrategy.RollingUpdate.MaxSurge.IntVal != 0 || ds.Spec.UpdateStrategy.RollingUpdate.MaxSurge.StrVal != "")
 }
 
 // Validate validates a new daemon set.
@@ -188,23 +142,10 @@ func (daemonSetStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Ob
 	oldDaemonSet := old.(*apps.DaemonSet)
 
 	opts := pod.GetValidationOptionsFromPodTemplate(&newDaemonSet.Spec.Template, &oldDaemonSet.Spec.Template)
+	opts.AllowInvalidLabelValueInSelector = opts.AllowInvalidLabelValueInSelector || metav1validation.LabelSelectorHasInvalidLabelValue(oldDaemonSet.Spec.Selector)
+
 	allErrs := validation.ValidateDaemonSet(obj.(*apps.DaemonSet), opts)
 	allErrs = append(allErrs, validation.ValidateDaemonSetUpdate(newDaemonSet, oldDaemonSet, opts)...)
-
-	// Update is not allowed to set Spec.Selector for apps/v1 and apps/v1beta2 (allowed for extensions/v1beta1).
-	// If RequestInfo is nil, it is better to revert to old behavior (i.e. allow update to set Spec.Selector)
-	// to prevent unintentionally breaking users who may rely on the old behavior.
-	// TODO(#50791): after extensions/v1beta1 is removed, move selector immutability check inside ValidateDaemonSetUpdate().
-	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion := schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-		switch groupVersion {
-		case extensionsv1beta1.SchemeGroupVersion:
-			// no-op for compatibility
-		default:
-			// disallow mutation of selector
-			allErrs = append(allErrs, apivalidation.ValidateImmutableField(newDaemonSet.Spec.Selector, oldDaemonSet.Spec.Selector, field.NewPath("spec").Child("selector"))...)
-		}
-	}
 
 	return allErrs
 }

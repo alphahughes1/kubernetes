@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientsetfake "k8s.io/client-go/kubernetes/fake"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
@@ -55,7 +56,7 @@ func TestUploadConfiguration(t *testing.T) {
 			cfg.ComponentConfigs = kubeadmapi.ComponentConfigMap{}
 			cfg.ClusterConfiguration.KubernetesVersion = kubeadmconstants.MinimumControlPlaneVersion.WithPatch(10).String()
 			cfg.NodeRegistration.Name = "node-foo"
-			cfg.NodeRegistration.CRISocket = kubeadmconstants.UnknownCRISocket
+			cfg.NodeRegistration.CRISocket = kubeadmconstants.DefaultCRISocket
 
 			client := clientsetfake.NewSimpleClientset()
 			// For idempotent test, we check the result of the second call.

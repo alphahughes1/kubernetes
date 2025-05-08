@@ -18,19 +18,22 @@ package node
 
 import (
 	"context"
-	"k8s.io/api/core/v1"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/kubernetes/test/e2e/environment"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	imageutils "k8s.io/kubernetes/test/utils/image"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
 
-var _ = SIGDescribe("Sysctls [LinuxOnly] [NodeFeature:Sysctls]", func() {
+var _ = SIGDescribe("Sysctls [LinuxOnly]", framework.WithNodeConformance(), func() {
 
 	ginkgo.BeforeEach(func() {
 		// sysctl is not supported on Windows.
@@ -38,7 +41,8 @@ var _ = SIGDescribe("Sysctls [LinuxOnly] [NodeFeature:Sysctls]", func() {
 	})
 
 	f := framework.NewDefaultFramework("sysctl")
-	var podClient *framework.PodClient
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	var podClient *e2epod.PodClient
 
 	testPod := func() *v1.Pod {
 		podName := "sysctl-" + string(uuid.NewUUID())
@@ -62,7 +66,7 @@ var _ = SIGDescribe("Sysctls [LinuxOnly] [NodeFeature:Sysctls]", func() {
 	}
 
 	ginkgo.BeforeEach(func() {
-		podClient = f.PodClient()
+		podClient = e2epod.NewPodClient(f)
 	})
 
 	/*
@@ -70,8 +74,9 @@ var _ = SIGDescribe("Sysctls [LinuxOnly] [NodeFeature:Sysctls]", func() {
 	  Testname: Sysctl, test sysctls
 	  Description: Pod is created with kernel.shm_rmid_forced sysctl. Kernel.shm_rmid_forced must be set to 1
 	  [LinuxOnly]: This test is marked as LinuxOnly since Windows does not support sysctls
+	  [Environment:NotInUserNS]: The test fails in UserNS (as expected): `open /proc/sys/kernel/shm_rmid_forced: permission denied`
 	*/
-	framework.ConformanceIt("should support sysctls [MinimumKubeletVersion:1.21]", func() {
+	framework.ConformanceIt("should support sysctls [MinimumKubeletVersion:1.21]", environment.NotInUserNS, func(ctx context.Context) {
 		pod := testPod()
 		pod.Spec.SecurityContext = &v1.PodSecurityContext{
 			Sysctls: []v1.Sysctl{
@@ -84,27 +89,27 @@ var _ = SIGDescribe("Sysctls [LinuxOnly] [NodeFeature:Sysctls]", func() {
 		pod.Spec.Containers[0].Command = []string{"/bin/sysctl", "kernel.shm_rmid_forced"}
 
 		ginkgo.By("Creating a pod with the kernel.shm_rmid_forced sysctl")
-		pod = podClient.Create(pod)
+		pod = podClient.Create(ctx, pod)
 
 		ginkgo.By("Watching for error events or started pod")
 		// watch for events instead of termination of pod because the kubelet deletes
 		// failed pods without running containers. This would create a race as the pod
 		// might have already been deleted here.
-		ev, err := f.PodClient().WaitForErrorEventOrSuccess(pod)
+		ev, err := e2epod.NewPodClient(f).WaitForErrorEventOrSuccess(ctx, pod)
 		framework.ExpectNoError(err)
 		gomega.Expect(ev).To(gomega.BeNil())
 
 		ginkgo.By("Waiting for pod completion")
-		err = e2epod.WaitForPodNoLongerRunningInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+		err = e2epod.WaitForPodNoLongerRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name)
 		framework.ExpectNoError(err)
-		pod, err = podClient.Get(context.TODO(), pod.Name, metav1.GetOptions{})
+		pod, err = podClient.Get(ctx, pod.Name, metav1.GetOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Checking that the pod succeeded")
-		framework.ExpectEqual(pod.Status.Phase, v1.PodSucceeded)
+		gomega.Expect(pod.Status.Phase).To(gomega.Equal(v1.PodSucceeded))
 
 		ginkgo.By("Getting logs from the pod")
-		log, err := e2epod.GetPodLogs(f.ClientSet, f.Namespace.Name, pod.Name, pod.Spec.Containers[0].Name)
+		log, err := e2epod.GetPodLogs(ctx, f.ClientSet, f.Namespace.Name, pod.Name, pod.Spec.Containers[0].Name)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Checking that the sysctl is actually updated")
@@ -113,57 +118,11 @@ var _ = SIGDescribe("Sysctls [LinuxOnly] [NodeFeature:Sysctls]", func() {
 
 	/*
 	  Release: v1.21
-	  Testname: Sysctl, allow specified unsafe sysctls
-	  Description: Pod is created with kernel.shm_rmid_forced. Should allow unsafe sysctls that are specified.
+	  Testname: Sysctls, reject invalid sysctls
+	  Description: Pod is created with one valid and two invalid sysctls. Pod should not apply invalid sysctls.
 	  [LinuxOnly]: This test is marked as LinuxOnly since Windows does not support sysctls
 	*/
-	framework.ConformanceIt("should support unsafe sysctls which are actually allowed [MinimumKubeletVersion:1.21]", func() {
-		pod := testPod()
-		pod.Spec.SecurityContext = &v1.PodSecurityContext{
-			Sysctls: []v1.Sysctl{
-				{
-					Name:  "kernel.shm_rmid_forced",
-					Value: "1",
-				},
-			},
-		}
-		pod.Spec.Containers[0].Command = []string{"/bin/sysctl", "kernel.shm_rmid_forced"}
-
-		ginkgo.By("Creating a pod with the kernel.shm_rmid_forced sysctl")
-		pod = podClient.Create(pod)
-
-		ginkgo.By("Watching for error events or started pod")
-		// watch for events instead of termination of pod because the kubelet deletes
-		// failed pods without running containers. This would create a race as the pod
-		// might have already been deleted here.
-		ev, err := f.PodClient().WaitForErrorEventOrSuccess(pod)
-		framework.ExpectNoError(err)
-		gomega.Expect(ev).To(gomega.BeNil())
-
-		ginkgo.By("Waiting for pod completion")
-		err = e2epod.WaitForPodNoLongerRunningInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
-		framework.ExpectNoError(err)
-		pod, err = podClient.Get(context.TODO(), pod.Name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
-
-		ginkgo.By("Checking that the pod succeeded")
-		framework.ExpectEqual(pod.Status.Phase, v1.PodSucceeded)
-
-		ginkgo.By("Getting logs from the pod")
-		log, err := e2epod.GetPodLogs(f.ClientSet, f.Namespace.Name, pod.Name, pod.Spec.Containers[0].Name)
-		framework.ExpectNoError(err)
-
-		ginkgo.By("Checking that the sysctl is actually updated")
-		gomega.Expect(log).To(gomega.ContainSubstring("kernel.shm_rmid_forced = 1"))
-	})
-
-	/*
-		Release: v1.21
-		Testname: Sysctls, reject invalid sysctls
-		Description: Pod is created with one valid and two invalid sysctls. Pod should not apply invalid sysctls.
-		[LinuxOnly]: This test is marked as LinuxOnly since Windows does not support sysctls
-	*/
-	framework.ConformanceIt("should reject invalid sysctls [MinimumKubeletVersion:1.21]", func() {
+	framework.ConformanceIt("should reject invalid sysctls [MinimumKubeletVersion:1.21]", func(ctx context.Context) {
 		pod := testPod()
 		pod.Spec.SecurityContext = &v1.PodSecurityContext{
 			Sysctls: []v1.Sysctl{
@@ -189,16 +148,18 @@ var _ = SIGDescribe("Sysctls [LinuxOnly] [NodeFeature:Sysctls]", func() {
 
 		ginkgo.By("Creating a pod with one valid and two invalid sysctls")
 		client := f.ClientSet.CoreV1().Pods(f.Namespace.Name)
-		_, err := client.Create(context.TODO(), pod, metav1.CreateOptions{})
+		_, err := client.Create(ctx, pod, metav1.CreateOptions{})
 
-		gomega.Expect(err).NotTo(gomega.BeNil())
-		gomega.Expect(err.Error()).To(gomega.ContainSubstring(`Invalid value: "foo-"`))
-		gomega.Expect(err.Error()).To(gomega.ContainSubstring(`Invalid value: "bar.."`))
-		gomega.Expect(err.Error()).NotTo(gomega.ContainSubstring(`safe-and-unsafe`))
-		gomega.Expect(err.Error()).NotTo(gomega.ContainSubstring("kernel.shmmax"))
+		gomega.Expect(err).To(gomega.MatchError(gomega.SatisfyAll(
+			gomega.ContainSubstring(`Invalid value: "foo-"`),
+			gomega.ContainSubstring(`Invalid value: "bar.."`),
+			gomega.Not(gomega.ContainSubstring(`safe-and-unsafe`)),
+			gomega.Not(gomega.ContainSubstring("kernel.shmmax")),
+		)))
 	})
 
-	ginkgo.It("should not launch unsafe, but not explicitly enabled sysctls on the node [MinimumKubeletVersion:1.21]", func() {
+	// Pod is created with kernel.msgmax, an unsafe sysctl.
+	ginkgo.It("should not launch unsafe, but not explicitly enabled sysctls on the node [MinimumKubeletVersion:1.21]", func(ctx context.Context) {
 		pod := testPod()
 		pod.Spec.SecurityContext = &v1.PodSecurityContext{
 			Sysctls: []v1.Sysctl{
@@ -209,18 +170,65 @@ var _ = SIGDescribe("Sysctls [LinuxOnly] [NodeFeature:Sysctls]", func() {
 			},
 		}
 
-		ginkgo.By("Creating a pod with a greylisted, but not whitelisted sysctl on the node")
-		pod = podClient.Create(pod)
+		ginkgo.By("Creating a pod with an ignorelisted, but not allowlisted sysctl on the node")
+		pod = podClient.Create(ctx, pod)
+
+		ginkgo.By("Wait for pod failed reason")
+		// watch for pod failed reason instead of termination of pod
+		err := e2epod.WaitForPodFailedReason(ctx, f.ClientSet, pod, "SysctlForbidden", f.Timeouts.PodStart)
+		framework.ExpectNoError(err)
+	})
+
+	/*
+	  Release: v1.23
+	  Testname: Sysctl, test sysctls supports slashes
+	  Description: Pod is created with kernel/shm_rmid_forced sysctl. Support slashes as sysctl separator. The '/' separator is also accepted in place of a '.'
+	  [LinuxOnly]: This test is marked as LinuxOnly since Windows does not support sysctls
+	  [Environment:NotInUserNS]: The test fails in UserNS (as expected): `open /proc/sys/kernel/shm_rmid_forced: permission denied`
+	*/
+	f.It("should support sysctls with slashes as separator [MinimumKubeletVersion:1.23]", environment.NotInUserNS, func(ctx context.Context) {
+		pod := testPod()
+		pod.Spec.SecurityContext = &v1.PodSecurityContext{
+			Sysctls: []v1.Sysctl{
+				{
+					Name:  "kernel/shm_rmid_forced",
+					Value: "1",
+				},
+			},
+		}
+		pod.Spec.Containers[0].Command = []string{"/bin/sysctl", "kernel/shm_rmid_forced"}
+
+		ginkgo.By("Creating a pod with the kernel/shm_rmid_forced sysctl")
+		pod = podClient.Create(ctx, pod)
 
 		ginkgo.By("Watching for error events or started pod")
 		// watch for events instead of termination of pod because the kubelet deletes
 		// failed pods without running containers. This would create a race as the pod
 		// might have already been deleted here.
-		ev, err := f.PodClient().WaitForErrorEventOrSuccess(pod)
+		ev, err := e2epod.NewPodClient(f).WaitForErrorEventOrSuccess(ctx, pod)
+		framework.ExpectNoError(err)
+		gomega.Expect(ev).To(gomega.BeNil())
+
+		ginkgo.By("Waiting for pod completion")
+		err = e2epod.WaitForPodNoLongerRunningInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name)
+		framework.ExpectNoError(err)
+		pod, err = podClient.Get(ctx, pod.Name, metav1.GetOptions{})
 		framework.ExpectNoError(err)
 
-		ginkgo.By("Checking that the pod was rejected")
-		gomega.Expect(ev).ToNot(gomega.BeNil())
-		framework.ExpectEqual(ev.Reason, "SysctlForbidden")
+		ginkgo.By("Checking that the pod succeeded")
+		gomega.Expect(pod.Status.Phase).To(gomega.Equal(v1.PodSucceeded))
+
+		ginkgo.By("Getting logs from the pod")
+		log, err := e2epod.GetPodLogs(ctx, f.ClientSet, f.Namespace.Name, pod.Name, pod.Spec.Containers[0].Name)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Checking that the sysctl is actually updated")
+		// Note that either "/" or "."  may be used as separators within sysctl variable names.
+		// "kernel.shm_rmid_forced=1" and "kernel/shm_rmid_forced=1" are equivalent.
+		// Run "/bin/sysctl kernel/shm_rmid_forced" command on Linux system
+		// The displayed result is "kernel.shm_rmid_forced=1"
+		// Therefore, the substring that needs to be checked for the obtained pod log is
+		// "kernel.shm_rmid_forced=1" instead of "kernel/shm_rmid_forced=1".
+		gomega.Expect(log).To(gomega.ContainSubstring("kernel.shm_rmid_forced = 1"))
 	})
 })

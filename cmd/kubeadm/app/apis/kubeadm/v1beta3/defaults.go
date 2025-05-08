@@ -20,8 +20,11 @@ import (
 	"net/url"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+
+	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
@@ -34,12 +37,11 @@ const (
 	DefaultClusterDNSIP = "10.96.0.10"
 	// DefaultKubernetesVersion defines default kubernetes version
 	DefaultKubernetesVersion = "stable-1"
-	// DefaultAPIBindPort defines default API port
-	DefaultAPIBindPort = 6443
 	// DefaultCertificatesDir defines default certificate directory
 	DefaultCertificatesDir = "/etc/kubernetes/pki"
 	// DefaultImageRepository defines default image registry
-	DefaultImageRepository = "k8s.gcr.io"
+	// (previously this defaulted to k8s.gcr.io)
+	DefaultImageRepository = "registry.k8s.io"
 	// DefaultManifestsDir defines default manifests directory
 	DefaultManifestsDir = "/etc/kubernetes/manifests"
 	// DefaultClusterName defines the default cluster name
@@ -53,12 +55,9 @@ const (
 	DefaultProxyBindAddressv6 = "::"
 	// DefaultDiscoveryTimeout specifies the default discovery timeout for kubeadm (used unless one is specified in the JoinConfiguration)
 	DefaultDiscoveryTimeout = 5 * time.Minute
-)
 
-var (
-	// DefaultAuditPolicyLogMaxAge is defined as a var so its address can be taken
-	// It is the number of days to store audit logs
-	DefaultAuditPolicyLogMaxAge = int32(2)
+	// DefaultImagePullPolicy is the default image pull policy in kubeadm
+	DefaultImagePullPolicy = corev1.PullIfNotPresent
 )
 
 func addDefaultingFuncs(scheme *runtime.Scheme) error {
@@ -69,6 +68,7 @@ func addDefaultingFuncs(scheme *runtime.Scheme) error {
 func SetDefaults_InitConfiguration(obj *InitConfiguration) {
 	SetDefaults_BootstrapTokens(obj)
 	SetDefaults_APIEndpoint(&obj.LocalAPIEndpoint)
+	SetDefaults_NodeRegistration(&obj.NodeRegistration)
 }
 
 // SetDefaults_ClusterConfiguration assigns default values for the ClusterConfiguration
@@ -105,7 +105,7 @@ func SetDefaults_ClusterConfiguration(obj *ClusterConfiguration) {
 func SetDefaults_APIServer(obj *APIServer) {
 	if obj.TimeoutForControlPlane == nil {
 		obj.TimeoutForControlPlane = &metav1.Duration{
-			Duration: constants.DefaultControlPlaneTimeout,
+			Duration: constants.ControlPlaneComponentHealthCheckTimeout,
 		}
 	}
 }
@@ -130,8 +130,10 @@ func SetDefaults_JoinConfiguration(obj *JoinConfiguration) {
 
 	SetDefaults_JoinControlPlane(obj.ControlPlane)
 	SetDefaults_Discovery(&obj.Discovery)
+	SetDefaults_NodeRegistration(&obj.NodeRegistration)
 }
 
+// SetDefaults_JoinControlPlane assigns default values for a joining control plane node
 func SetDefaults_JoinControlPlane(obj *JoinControlPlane) {
 	if obj != nil {
 		SetDefaults_APIEndpoint(&obj.LocalAPIEndpoint)
@@ -173,34 +175,25 @@ func SetDefaults_FileDiscovery(obj *FileDiscovery) {
 // layer, but set to a random value later at runtime if not set before.
 func SetDefaults_BootstrapTokens(obj *InitConfiguration) {
 
-	if obj.BootstrapTokens == nil || len(obj.BootstrapTokens) == 0 {
-		obj.BootstrapTokens = []BootstrapToken{{}}
+	if len(obj.BootstrapTokens) == 0 {
+		obj.BootstrapTokens = []bootstraptokenv1.BootstrapToken{{}}
 	}
 
 	for i := range obj.BootstrapTokens {
-		SetDefaults_BootstrapToken(&obj.BootstrapTokens[i])
-	}
-}
-
-// SetDefaults_BootstrapToken sets the defaults for an individual Bootstrap Token
-func SetDefaults_BootstrapToken(bt *BootstrapToken) {
-	if bt.TTL == nil {
-		bt.TTL = &metav1.Duration{
-			Duration: constants.DefaultTokenDuration,
-		}
-	}
-	if len(bt.Usages) == 0 {
-		bt.Usages = constants.DefaultTokenUsages
-	}
-
-	if len(bt.Groups) == 0 {
-		bt.Groups = constants.DefaultTokenGroups
+		bootstraptokenv1.SetDefaults_BootstrapToken(&obj.BootstrapTokens[i])
 	}
 }
 
 // SetDefaults_APIEndpoint sets the defaults for the API server instance deployed on a node.
 func SetDefaults_APIEndpoint(obj *APIEndpoint) {
 	if obj.BindPort == 0 {
-		obj.BindPort = DefaultAPIBindPort
+		obj.BindPort = constants.KubeAPIServerPort
+	}
+}
+
+// SetDefaults_NodeRegistration sets the defaults for the NodeRegistrationOptions object
+func SetDefaults_NodeRegistration(obj *NodeRegistrationOptions) {
+	if len(obj.ImagePullPolicy) == 0 {
+		obj.ImagePullPolicy = DefaultImagePullPolicy
 	}
 }

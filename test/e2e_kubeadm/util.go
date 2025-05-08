@@ -18,6 +18,7 @@ package kubeadm
 
 import (
 	"context"
+
 	appsv1 "k8s.io/api/apps/v1"
 	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -174,7 +175,7 @@ func ExpectSubjectHasAccessToResource(c clientset.Interface, subjectKind, subjec
 	s, err := c.AuthorizationV1().SubjectAccessReviews().Create(context.TODO(), sar, metav1.CreateOptions{})
 	framework.ExpectNoError(err, "error getting SubjectAccessReview for %s %s to resource %+v", subjectKind, subject, *sar.Spec.ResourceAttributes)
 
-	gomega.Expect(s.Status.Allowed).Should(gomega.BeTrue(), "%s %s has no access to resource %+v", subjectKind, subject, *sar.Spec.ResourceAttributes)
+	gomega.Expect(s.Status.Allowed).Should(gomega.BeTrueBecause("%s %s has no access to resource %+v", subjectKind, subject, *sar.Spec.ResourceAttributes))
 }
 
 // matchers

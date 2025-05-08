@@ -20,42 +20,42 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/endpoints/metrics"
+	"k8s.io/apiserver/pkg/storage/cacher"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	compbasemetrics "k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/testutil"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
-func scrapeMetrics(s *httptest.Server) (testutil.Metrics, error) {
-	req, err := http.NewRequest("GET", s.URL+"/metrics", nil)
+func scrapeMetrics(s *kubeapiservertesting.TestServer) (testutil.Metrics, error) {
+	client, err := clientset.NewForConfig(s.ClientConfig)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to create http request: %v", err)
+		return nil, fmt.Errorf("couldn't create client")
 	}
-	client := &http.Client{}
-	resp, err := client.Do(req)
+
+	body, err := client.RESTClient().Get().AbsPath("metrics").DoRaw(context.TODO())
 	if err != nil {
-		return nil, fmt.Errorf("Unable to contact metrics endpoint of API server: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Non-200 response trying to scrape metrics from API Server: %v", resp)
+		return nil, fmt.Errorf("request failed: %v", err)
 	}
 	metrics := testutil.NewMetrics()
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("Unable to read response: %v", resp)
-	}
-	err = testutil.ParseMetrics(string(data), &metrics)
+	err = testutil.ParseMetrics(string(body), &metrics)
 	return metrics, err
 }
 
@@ -72,8 +72,8 @@ func TestAPIServerProcessMetrics(t *testing.T) {
 		t.Skipf("not supported on GOOS=%s", runtime.GOOS)
 	}
 
-	_, s, closeFn := framework.RunAnAPIServer(nil)
-	defer closeFn()
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
+	defer s.TearDownFn()
 
 	metrics, err := scrapeMetrics(s)
 	if err != nil {
@@ -87,20 +87,49 @@ func TestAPIServerProcessMetrics(t *testing.T) {
 	})
 }
 
+func TestAPIServerStorageMetrics(t *testing.T) {
+	config := framework.SharedEtcd()
+	config.Transport.ServerList = []string{config.Transport.ServerList[0], config.Transport.ServerList[0]}
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), config)
+	defer s.TearDownFn()
+
+	metrics, err := scrapeMetrics(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	samples, ok := metrics["apiserver_storage_size_bytes"]
+	if !ok {
+		t.Fatalf("apiserver_storage_size_bytes metric not exposed")
+	}
+	if len(samples) != 1 {
+		t.Fatalf("Unexpected number of samples in apiserver_storage_size_bytes")
+	}
+
+	if samples[0].Value == -1 {
+		t.Errorf("Unexpected non-zero apiserver_storage_size_bytes, got: %s", samples[0].Value)
+	}
+}
+
 func TestAPIServerMetrics(t *testing.T) {
-	_, s, closeFn := framework.RunAnAPIServer(nil)
-	defer closeFn()
+	// KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE allows for APIs pending removal to not block tests
+	t.Setenv("KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE", "true")
+
+	flags := framework.DefaultTestServerFlags()
+	flags = append(flags, fmt.Sprintf("--runtime-config=%s=true", admissionregistrationv1beta1.SchemeGroupVersion))
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, flags, framework.SharedEtcd())
+	defer s.TearDownFn()
 
 	// Make a request to the apiserver to ensure there's at least one data point
 	// for the metrics we're expecting -- otherwise, they won't be exported.
-	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
+	client := clientset.NewForConfigOrDie(s.ClientConfig)
 	if _, err := client.CoreV1().Pods(metav1.NamespaceDefault).List(context.TODO(), metav1.ListOptions{}); err != nil {
 		t.Fatalf("unexpected error getting pods: %v", err)
 	}
 
 	// Make a request to a deprecated API to ensure there's at least one data point
-	if _, err := client.PolicyV1beta1().PodSecurityPolicies().List(context.TODO(), metav1.ListOptions{}); err != nil {
-		t.Fatalf("unexpected error getting rbac roles: %v", err)
+	if _, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().List(context.TODO(), metav1.ListOptions{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	metrics, err := scrapeMetrics(s)
@@ -116,10 +145,13 @@ func TestAPIServerMetrics(t *testing.T) {
 }
 
 func TestAPIServerMetricsLabels(t *testing.T) {
-	_, s, closeFn := framework.RunAnAPIServer(nil)
-	defer closeFn()
+	// Disable ServiceAccount admission plugin as we don't have service account controller running.
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
+	defer s.TearDownFn()
 
-	client, err := clientset.NewForConfig(&restclient.Config{Host: s.URL, QPS: -1})
+	clientConfig := restclient.CopyConfig(s.ClientConfig)
+	clientConfig.QPS = -1
+	client, err := clientset.NewForConfig(clientConfig)
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
@@ -242,6 +274,101 @@ func TestAPIServerMetricsLabels(t *testing.T) {
 	}
 }
 
+func TestAPIServerMetricsLabelsWithAllowList(t *testing.T) {
+	testCases := []struct {
+		name        string
+		metricName  string
+		labelName   model.LabelName
+		allowValues model.LabelValues
+		isHistogram bool
+	}{
+		{
+			name:        "check CounterVec metric",
+			metricName:  "apiserver_request_total",
+			labelName:   "code",
+			allowValues: model.LabelValues{"201", "500"},
+		},
+		{
+			name:        "check GaugeVec metric",
+			metricName:  "apiserver_current_inflight_requests",
+			labelName:   "request_kind",
+			allowValues: model.LabelValues{"mutating"},
+		},
+		{
+			name:        "check Histogram metric",
+			metricName:  "apiserver_request_duration_seconds",
+			labelName:   "verb",
+			allowValues: model.LabelValues{"POST", "LIST"},
+			isHistogram: true,
+		},
+	}
+
+	// Assemble the allow-metric-labels flag.
+	var allowMetricLabelFlagStrs []string
+	for _, tc := range testCases {
+		var allowValuesStr []string
+		for _, allowValue := range tc.allowValues {
+			allowValuesStr = append(allowValuesStr, string(allowValue))
+		}
+		allowMetricLabelFlagStrs = append(allowMetricLabelFlagStrs, fmt.Sprintf("\"%s,%s=%s\"", tc.metricName, tc.labelName, strings.Join(allowValuesStr, ",")))
+	}
+	allowMetricLabelsFlag := "--allow-metric-labels=" + strings.Join(allowMetricLabelFlagStrs, ",")
+
+	testServerFlags := framework.DefaultTestServerFlags()
+	testServerFlags = append(testServerFlags, allowMetricLabelsFlag)
+
+	// TODO: have a better way to setup and teardown for all the other tests.
+	metrics.Reset()
+	defer metrics.Reset()
+	metrics.ResetLabelAllowLists()
+	defer metrics.ResetLabelAllowLists()
+	defer compbasemetrics.ResetLabelValueAllowLists()
+
+	// KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE allows for APIs pending removal to not block tests
+	t.Setenv("KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE", "true")
+	s := kubeapiservertesting.StartTestServerOrDie(t, nil, testServerFlags, framework.SharedEtcd())
+	defer s.TearDownFn()
+
+	metrics, err := scrapeMetrics(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			metricName := tc.metricName
+			if tc.isHistogram {
+				metricName += "_sum"
+			}
+			samples, found := metrics[metricName]
+			if !found {
+				t.Fatalf("metric %q not found", metricName)
+			}
+			for _, sample := range samples {
+				if value, ok := sample.Metric[tc.labelName]; ok {
+					if !slices.Contains(tc.allowValues, value) && value != "unexpected" {
+						t.Fatalf("value %q is not allowed for label %q", value, tc.labelName)
+					}
+				}
+			}
+		})
+
+	}
+
+	t.Run("check cardinality_enforcement_unexpected_categorizations_total", func(t *testing.T) {
+		samples, found := metrics["cardinality_enforcement_unexpected_categorizations_total"]
+		if !found {
+			t.Fatal("metric cardinality_enforcement_unexpected_categorizations_total not found")
+		}
+		if len(samples) != 1 {
+			t.Fatalf("Unexpected number of samples in cardinality_enforcement_unexpected_categorizations_total")
+		}
+		if samples[0].Value <= 0 {
+			t.Fatalf("Unexpected non-positive cardinality_enforcement_unexpected_categorizations_total, got: %s", samples[0].Value)
+		}
+
+	})
+}
+
 func TestAPIServerMetricsPods(t *testing.T) {
 	callOrDie := func(_ interface{}, err error) {
 		if err != nil {
@@ -266,10 +393,13 @@ func TestAPIServerMetricsPods(t *testing.T) {
 		}
 	}
 
-	_, server, closeFn := framework.RunAnAPIServer(framework.NewControlPlaneConfig())
-	defer closeFn()
+	// Disable ServiceAccount admission plugin as we don't have service account controller running.
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
+	defer server.TearDownFn()
 
-	client, err := clientset.NewForConfig(&restclient.Config{Host: server.URL, QPS: -1})
+	clientConfig := restclient.CopyConfig(server.ClientConfig)
+	clientConfig.QPS = -1
+	client, err := clientset.NewForConfig(clientConfig)
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
@@ -372,10 +502,12 @@ func TestAPIServerMetricsNamespaces(t *testing.T) {
 		}
 	}
 
-	_, server, closeFn := framework.RunAnAPIServer(framework.NewControlPlaneConfig())
-	defer closeFn()
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
+	defer server.TearDownFn()
 
-	client, err := clientset.NewForConfig(&restclient.Config{Host: server.URL, QPS: -1})
+	clientConfig := restclient.CopyConfig(server.ClientConfig)
+	clientConfig.QPS = -1
+	client, err := clientset.NewForConfig(clientConfig)
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
@@ -462,7 +594,7 @@ func TestAPIServerMetricsNamespaces(t *testing.T) {
 	}
 }
 
-func getSamples(s *httptest.Server) (model.Samples, error) {
+func getSamples(s *kubeapiservertesting.TestServer) (model.Samples, error) {
 	metrics, err := scrapeMetrics(s)
 	if err != nil {
 		return nil, err
@@ -492,4 +624,109 @@ func sampleExistsInSamples(s *model.Sample, samples model.Samples) bool {
 		}
 	}
 	return false
+}
+
+func TestWatchCacheConsistencyCheckMetrics(t *testing.T) {
+	period := time.Second
+	clean := overrideConsistencyCheckerTimings(period)
+	defer clean()
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
+	defer server.TearDownFn()
+
+	rt, err := restclient.TransportFor(server.ClientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, server.ClientConfig.Host+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Do at least 2 scrape cycles to require 2 successes
+	delay := 2 * period
+	time.Sleep(delay)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+	statuses, err := parseConsistencyCheckMetric(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceSuccesses := 0
+	for status, count := range statuses {
+		switch status.status {
+		case "success":
+			if count >= 2 {
+				resourceSuccesses++
+			}
+		case "failure":
+			t.Errorf("Failure checking consistency of resource %q", status.resource)
+		case "error":
+			t.Errorf("Error when checking consistency of resource %q", status.resource)
+		default:
+			t.Errorf("Unknown status of resource %q, status: %q", status.resource, status.status)
+		}
+	}
+	if resourceSuccesses <= 10 {
+		t.Errorf("Expected at least 10 resources with success, got: %d", resourceSuccesses)
+	}
+}
+
+func overrideConsistencyCheckerTimings(period time.Duration) func() {
+	tmpPeriod := cacher.ConsistencyCheckPeriod
+	tmpEnabled := cacher.ConsistencyCheckerEnabled
+	cacher.ConsistencyCheckPeriod = period
+	cacher.ConsistencyCheckerEnabled = true
+	return func() {
+		cacher.ConsistencyCheckPeriod = tmpPeriod
+		cacher.ConsistencyCheckerEnabled = tmpEnabled
+	}
+}
+
+func parseConsistencyCheckMetric(r io.Reader) (map[consistencyCheckStatus]float64, error) {
+	statuses := map[consistencyCheckStatus]float64{}
+	metric, err := parseMetric(r, "apiserver_storage_consistency_checks_total")
+	if err != nil {
+		return statuses, err
+	}
+	for _, m := range metric.GetMetric() {
+		status := consistencyCheckStatus{}
+		for _, label := range m.GetLabel() {
+			switch label.GetName() {
+			case "resource":
+				status.resource = label.GetValue()
+			case "status":
+				status.status = label.GetValue()
+			default:
+				return statuses, fmt.Errorf("Unknown label: %v", label.GetName())
+			}
+		}
+		statuses[status] = m.GetCounter().GetValue()
+	}
+	return statuses, nil
+}
+
+type consistencyCheckStatus struct {
+	resource string
+	status   string
+}
+
+func parseMetric(r io.Reader, name string) (*dto.MetricFamily, error) {
+	var parser expfmt.TextParser
+	mfs, err := parser.TextToMetricFamilies(r)
+	if err != nil {
+		return nil, err
+	}
+	for metricName, metric := range mfs {
+		if metricName == name {
+			return metric, nil
+		}
+	}
+	return nil, fmt.Errorf("Metric not found %q", name)
 }

@@ -1,21 +1,23 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 approvers:
-- fabriziopandini
-- neolit123
-- SataQiu
+  - neolit123
+  - SataQiu
+  - pacoxu
+  - carlory
 reviewers:
-- fabriziopandini
-- neolit123
-- SataQiu
-- yagonobre
-- pacoxu
-- RA489
+  - neolit123
+  - SataQiu
+  - pacoxu
+  - carlory
+  - HirazawaUi
 emeritus_approvers:
-- luxas
-- timothysc
-- rosti
-- ereslibre
+  - fabriziopandini
+  - luxas
+  - timothysc
+  - rosti
+  - ereslibre
+  - chendave
 labels:
-- area/kubeadm
-- sig/cluster-lifecycle
+  - area/kubeadm
+  - sig/cluster-lifecycle

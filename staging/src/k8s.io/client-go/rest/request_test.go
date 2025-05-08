@@ -23,20 +23,26 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"reflect"
+	"regexp"
+	goruntime "runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
-	"k8s.io/klog/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/google/go-cmp/cmp"
 
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -44,21 +50,24 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/runtime/serializer/streaming"
-	"k8s.io/apimachinery/pkg/util/clock"
-	"k8s.io/apimachinery/pkg/util/diff"
-	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/scheme"
 	restclientwatch "k8s.io/client-go/rest/watch"
+	"k8s.io/client-go/tools/metrics"
 	"k8s.io/client-go/util/flowcontrol"
 	utiltesting "k8s.io/client-go/util/testing"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func TestNewRequestSetsAccept(t *testing.T) {
 	r := NewRequestWithClient(&url.URL{Path: "/path/"}, "", ClientContentConfig{}, nil).Verb("get")
-	if r.headers.Get("Accept") != "" {
+	if r.headers.Get("Accept") != "application/json, */*" {
 		t.Errorf("unexpected headers: %#v", r.headers)
 	}
 	r = NewRequestWithClient(&url.URL{Path: "/path/"}, "", ClientContentConfig{ContentType: "application/other"}, nil).Verb("get")
@@ -86,7 +95,7 @@ func TestRequestSetsHeaders(t *testing.T) {
 		}
 		return &http.Response{
 			StatusCode: http.StatusForbidden,
-			Body:       ioutil.NopCloser(bytes.NewReader([]byte{})),
+			Body:       io.NopCloser(bytes.NewReader([]byte{})),
 		}, nil
 	})
 	config := defaultContentConfig()
@@ -104,9 +113,9 @@ func TestRequestWithErrorWontChange(t *testing.T) {
 	gvCopy := v1.SchemeGroupVersion
 	original := Request{
 		err: errors.New("test"),
-		c: &RESTClient{
-			content: ClientContentConfig{GroupVersion: gvCopy},
-		},
+		c:   &RESTClient{},
+
+		contentConfig: ClientContentConfig{GroupVersion: gvCopy},
 	}
 	r := original
 	changed := r.Param("foo", "bar").
@@ -135,11 +144,6 @@ func TestRequestPreservesBaseTrailingSlash(t *testing.T) {
 
 func TestRequestAbsPathPreservesTrailingSlash(t *testing.T) {
 	r := (&Request{c: &RESTClient{base: &url.URL{}}}).AbsPath("/foo/")
-	if s := r.URL().String(); s != "/foo/" {
-		t.Errorf("trailing slash should be preserved: %s", s)
-	}
-
-	r = (&Request{c: &RESTClient{base: &url.URL{}}}).AbsPath("/foo/")
 	if s := r.URL().String(); s != "/foo/" {
 		t.Errorf("trailing slash should be preserved: %s", s)
 	}
@@ -233,7 +237,7 @@ func TestRequestParam(t *testing.T) {
 }
 
 func TestRequestVersionedParams(t *testing.T) {
-	r := (&Request{c: &RESTClient{content: ClientContentConfig{GroupVersion: v1.SchemeGroupVersion}}}).Param("foo", "a")
+	r := (&Request{c: &RESTClient{}, contentConfig: ClientContentConfig{GroupVersion: v1.SchemeGroupVersion}}).Param("foo", "a")
 	if !reflect.DeepEqual(r.params, url.Values{"foo": []string{"a"}}) {
 		t.Errorf("should have set a param: %#v", r)
 	}
@@ -249,7 +253,7 @@ func TestRequestVersionedParams(t *testing.T) {
 }
 
 func TestRequestVersionedParamsFromListOptions(t *testing.T) {
-	r := &Request{c: &RESTClient{content: ClientContentConfig{GroupVersion: v1.SchemeGroupVersion}}}
+	r := &Request{c: &RESTClient{}, contentConfig: ClientContentConfig{GroupVersion: v1.SchemeGroupVersion}}
 	r.VersionedParams(&metav1.ListOptions{ResourceVersion: "1"}, scheme.ParameterCodec)
 	if !reflect.DeepEqual(r.params, url.Values{
 		"resourceVersion": []string{"1"},
@@ -267,15 +271,57 @@ func TestRequestVersionedParamsFromListOptions(t *testing.T) {
 	}
 }
 
+func TestRequestVersionedParamsWithInvalidScheme(t *testing.T) {
+	parameterCodec := runtime.NewParameterCodec(runtime.NewScheme())
+	r := &Request{c: &RESTClient{}, contentConfig: ClientContentConfig{GroupVersion: v1.SchemeGroupVersion}}
+	r.VersionedParams(&v1.PodExecOptions{Stdin: false, Stdout: true},
+		parameterCodec)
+
+	if r.Error() == nil {
+		t.Errorf("should have recorded an error: %#v", r.params)
+	}
+}
+
+func TestRequestError(t *testing.T) {
+	// Invalid body, see TestRequestBody()
+	r := (&Request{}).Body([]string{"test"})
+
+	if r.Error() != r.err {
+		t.Errorf("getter should be identical to reference: %#v %#v", r.Error(), r.err)
+	}
+}
+
 func TestRequestURI(t *testing.T) {
-	r := (&Request{}).Param("foo", "a")
+	r := (&Request{c: &RESTClient{base: &url.URL{Path: "/"}}}).Param("foo", "a").Param("bar", "b")
 	r.Prefix("other")
 	r.RequestURI("/test?foo=b&a=b&c=1&c=2")
 	if r.pathPrefix != "/test" {
 		t.Errorf("path is wrong: %#v", r)
 	}
 	if !reflect.DeepEqual(r.params, url.Values{"a": []string{"b"}, "foo": []string{"b"}, "c": []string{"1", "2"}}) {
-		t.Errorf("should have set a param: %#v", r)
+		t.Errorf("should have set a param, got: %#v", r.params)
+	}
+}
+
+func TestRequestURIContext(t *testing.T) {
+	r := (&Request{c: &RESTClient{base: &url.URL{Path: "/context"}}}).Param("foo", "a").Param("bar", "b")
+	r.Prefix("other")
+	r.RequestURI("/test?foo=b&a=b&c=1&c=2")
+	if r.pathPrefix != "/context/test" {
+		t.Errorf("path is wrong: %#v", r)
+	}
+	if !reflect.DeepEqual(r.params, url.Values{"a": []string{"b"}, "foo": []string{"b"}, "c": []string{"1", "2"}}) {
+		t.Errorf("should have set a param, got: %#v", r.params)
+	}
+
+	r = (&Request{c: &RESTClient{base: &url.URL{Path: "/context"}}}).Param("foo", "a").Param("bar", "b")
+	r.Prefix("other")
+	r.RequestURI("../test?foo=b&a=b&c=1&c=2")
+	if r.pathPrefix != "/test" {
+		t.Errorf("path is wrong: %#v", r)
+	}
+	if !reflect.DeepEqual(r.params, url.Values{"a": []string{"b"}, "foo": []string{"b"}, "c": []string{"1", "2"}}) {
+		t.Errorf("should have set a param, got: %#v", r.params)
 	}
 }
 
@@ -301,7 +347,7 @@ func TestRequestBody(t *testing.T) {
 	}
 
 	// test error set when failing to read file
-	f, err := ioutil.TempFile("", "test")
+	f, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Fatalf("unable to create temp file")
 	}
@@ -313,7 +359,7 @@ func TestRequestBody(t *testing.T) {
 	}
 
 	// test unencodable api object
-	r = (&Request{c: &RESTClient{content: defaultContentConfig()}}).Body(&NotAnAPIObject{})
+	r = (&Request{c: &RESTClient{}, contentConfig: defaultContentConfig()}).Body(&NotAnAPIObject{})
 	if r.err == nil || r.body != nil {
 		t.Errorf("should have set err and left body nil: %#v", r)
 	}
@@ -537,6 +583,7 @@ func TestURLTemplate(t *testing.T) {
 }
 
 func TestTransformResponse(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
 	invalid := []byte("aaaaa")
 	uri, _ := url.Parse("http://localhost")
 	testCases := []struct {
@@ -558,7 +605,7 @@ func TestTransformResponse(t *testing.T) {
 			Response: &http.Response{
 				StatusCode: http.StatusUnauthorized,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       ioutil.NopCloser(bytes.NewReader(invalid)),
+				Body:       io.NopCloser(bytes.NewReader(invalid)),
 			},
 			Error: true,
 			ErrFn: func(err error) bool {
@@ -569,7 +616,7 @@ func TestTransformResponse(t *testing.T) {
 			Response: &http.Response{
 				StatusCode: http.StatusUnauthorized,
 				Header:     http.Header{"Content-Type": []string{"text/any"}},
-				Body:       ioutil.NopCloser(bytes.NewReader(invalid)),
+				Body:       io.NopCloser(bytes.NewReader(invalid)),
 			},
 			Error: true,
 			ErrFn: func(err error) bool {
@@ -577,15 +624,15 @@ func TestTransformResponse(t *testing.T) {
 			},
 		},
 		{Response: &http.Response{StatusCode: http.StatusForbidden}, Error: true},
-		{Response: &http.Response{StatusCode: http.StatusOK, Body: ioutil.NopCloser(bytes.NewReader(invalid))}, Data: invalid},
-		{Response: &http.Response{StatusCode: http.StatusOK, Body: ioutil.NopCloser(bytes.NewReader(invalid))}, Data: invalid},
+		{Response: &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(invalid))}, Data: invalid},
+		{Response: &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(invalid))}, Data: invalid},
 	}
 	for i, test := range testCases {
 		r := NewRequestWithClient(uri, "", defaultContentConfig(), nil)
 		if test.Response.Body == nil {
-			test.Response.Body = ioutil.NopCloser(bytes.NewReader([]byte{}))
+			test.Response.Body = io.NopCloser(bytes.NewReader([]byte{}))
 		}
-		result := r.transformResponse(test.Response, &http.Request{})
+		result := r.transformResponse(ctx, test.Response, &http.Request{})
 		response, created, err := result.body, result.statusCode == http.StatusCreated, result.err
 		hasErr := err != nil
 		if hasErr != test.Error {
@@ -636,6 +683,7 @@ func (r *renegotiator) StreamDecoder(contentType string, params map[string]strin
 }
 
 func TestTransformResponseNegotiate(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
 	invalid := []byte("aaaaa")
 	uri, _ := url.Parse("http://localhost")
 	testCases := []struct {
@@ -656,7 +704,7 @@ func TestTransformResponseNegotiate(t *testing.T) {
 			Response: &http.Response{
 				StatusCode: http.StatusUnauthorized,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       ioutil.NopCloser(bytes.NewReader(invalid)),
+				Body:       io.NopCloser(bytes.NewReader(invalid)),
 			},
 			Called:            true,
 			ExpectContentType: "application/json",
@@ -670,7 +718,7 @@ func TestTransformResponseNegotiate(t *testing.T) {
 			Response: &http.Response{
 				StatusCode: http.StatusUnauthorized,
 				Header:     http.Header{"Content-Type": []string{"application/protobuf"}},
-				Body:       ioutil.NopCloser(bytes.NewReader(invalid)),
+				Body:       io.NopCloser(bytes.NewReader(invalid)),
 			},
 			Decoder: scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion),
 
@@ -700,7 +748,7 @@ func TestTransformResponseNegotiate(t *testing.T) {
 			Response: &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/any"}},
-				Body:       ioutil.NopCloser(bytes.NewReader(invalid)),
+				Body:       io.NopCloser(bytes.NewReader(invalid)),
 			},
 			Decoder:           scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion),
 			Called:            true,
@@ -711,7 +759,7 @@ func TestTransformResponseNegotiate(t *testing.T) {
 			ContentType: "text/any",
 			Response: &http.Response{
 				StatusCode: http.StatusOK,
-				Body:       ioutil.NopCloser(bytes.NewReader(invalid)),
+				Body:       io.NopCloser(bytes.NewReader(invalid)),
 			},
 			Decoder:           scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion),
 			Called:            true,
@@ -723,7 +771,7 @@ func TestTransformResponseNegotiate(t *testing.T) {
 			Response: &http.Response{
 				StatusCode: http.StatusNotFound,
 				Header:     http.Header{"Content-Type": []string{"application/unrecognized"}},
-				Body:       ioutil.NopCloser(bytes.NewReader(invalid)),
+				Body:       io.NopCloser(bytes.NewReader(invalid)),
 			},
 			Decoder: scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion),
 
@@ -747,9 +795,9 @@ func TestTransformResponseNegotiate(t *testing.T) {
 		contentConfig.Negotiator = negotiator
 		r := NewRequestWithClient(uri, "", contentConfig, nil)
 		if test.Response.Body == nil {
-			test.Response.Body = ioutil.NopCloser(bytes.NewReader([]byte{}))
+			test.Response.Body = io.NopCloser(bytes.NewReader([]byte{}))
 		}
-		result := r.transformResponse(test.Response, &http.Request{})
+		result := r.transformResponse(ctx, test.Response, &http.Request{})
 		_, err := result.body, result.err
 		hasErr := err != nil
 		if hasErr != test.Error {
@@ -799,7 +847,7 @@ func TestTransformUnstructuredError(t *testing.T) {
 			},
 			Res: &http.Response{
 				StatusCode: http.StatusConflict,
-				Body:       ioutil.NopCloser(bytes.NewReader(nil)),
+				Body:       io.NopCloser(bytes.NewReader(nil)),
 			},
 			ErrFn: apierrors.IsAlreadyExists,
 		},
@@ -811,7 +859,7 @@ func TestTransformUnstructuredError(t *testing.T) {
 			},
 			Res: &http.Response{
 				StatusCode: http.StatusConflict,
-				Body:       ioutil.NopCloser(bytes.NewReader(nil)),
+				Body:       io.NopCloser(bytes.NewReader(nil)),
 			},
 			ErrFn: apierrors.IsConflict,
 		},
@@ -821,7 +869,7 @@ func TestTransformUnstructuredError(t *testing.T) {
 			Req:      &http.Request{},
 			Res: &http.Response{
 				StatusCode: http.StatusNotFound,
-				Body:       ioutil.NopCloser(bytes.NewReader(nil)),
+				Body:       io.NopCloser(bytes.NewReader(nil)),
 			},
 			ErrFn: apierrors.IsNotFound,
 		},
@@ -829,14 +877,14 @@ func TestTransformUnstructuredError(t *testing.T) {
 			Req: &http.Request{},
 			Res: &http.Response{
 				StatusCode: http.StatusBadRequest,
-				Body:       ioutil.NopCloser(bytes.NewReader(nil)),
+				Body:       io.NopCloser(bytes.NewReader(nil)),
 			},
 			ErrFn: apierrors.IsBadRequest,
 		},
 		{
 			// status in response overrides transformed result
 			Req:   &http.Request{},
-			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: ioutil.NopCloser(bytes.NewReader([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","code":404}`)))},
+			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(bytes.NewReader([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","code":404}`)))},
 			ErrFn: apierrors.IsBadRequest,
 			Transformed: &apierrors.StatusError{
 				ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: http.StatusNotFound},
@@ -845,20 +893,20 @@ func TestTransformUnstructuredError(t *testing.T) {
 		{
 			// successful status is ignored
 			Req:   &http.Request{},
-			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: ioutil.NopCloser(bytes.NewReader([]byte(`{"kind":"Status","apiVersion":"v1","status":"Success","code":404}`)))},
+			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(bytes.NewReader([]byte(`{"kind":"Status","apiVersion":"v1","status":"Success","code":404}`)))},
 			ErrFn: apierrors.IsBadRequest,
 		},
 		{
 			// empty object does not change result
 			Req:   &http.Request{},
-			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: ioutil.NopCloser(bytes.NewReader([]byte(`{}`)))},
+			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(bytes.NewReader([]byte(`{}`)))},
 			ErrFn: apierrors.IsBadRequest,
 		},
 		{
 			// we default apiVersion for backwards compatibility with old clients
 			// TODO: potentially remove in 1.7
 			Req:   &http.Request{},
-			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: ioutil.NopCloser(bytes.NewReader([]byte(`{"kind":"Status","status":"Failure","code":404}`)))},
+			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(bytes.NewReader([]byte(`{"kind":"Status","status":"Failure","code":404}`)))},
 			ErrFn: apierrors.IsBadRequest,
 			Transformed: &apierrors.StatusError{
 				ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: http.StatusNotFound},
@@ -867,21 +915,21 @@ func TestTransformUnstructuredError(t *testing.T) {
 		{
 			// we do not default kind
 			Req:   &http.Request{},
-			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: ioutil.NopCloser(bytes.NewReader([]byte(`{"status":"Failure","code":404}`)))},
+			Res:   &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(bytes.NewReader([]byte(`{"status":"Failure","code":404}`)))},
 			ErrFn: apierrors.IsBadRequest,
 		},
 	}
 
 	for _, testCase := range testCases {
 		t.Run("", func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
 			r := &Request{
-				c: &RESTClient{
-					content: defaultContentConfig(),
-				},
-				resourceName: testCase.Name,
-				resource:     testCase.Resource,
+				contentConfig: defaultContentConfig(),
+				c:             &RESTClient{},
+				resourceName:  testCase.Name,
+				resource:      testCase.Resource,
 			}
-			result := r.transformResponse(testCase.Res, testCase.Req)
+			result := r.transformResponse(ctx, testCase.Res, testCase.Req)
 			err := result.err
 			if !testCase.ErrFn(err) {
 				t.Fatalf("unexpected error: %v", err)
@@ -903,22 +951,22 @@ func TestTransformUnstructuredError(t *testing.T) {
 				expect = err
 			}
 			if !reflect.DeepEqual(expect, transformed) {
-				t.Errorf("unexpected Error(): %s", diff.ObjectReflectDiff(expect, transformed))
+				t.Errorf("unexpected Error(): %s", cmp.Diff(expect, transformed))
 			}
 
 			// verify result.Get properly transforms the error
 			if _, err := result.Get(); !reflect.DeepEqual(expect, err) {
-				t.Errorf("unexpected error on Get(): %s", diff.ObjectReflectDiff(expect, err))
+				t.Errorf("unexpected error on Get(): %s", cmp.Diff(expect, err))
 			}
 
 			// verify result.Into properly handles the error
 			if err := result.Into(&v1.Pod{}); !reflect.DeepEqual(expect, err) {
-				t.Errorf("unexpected error on Into(): %s", diff.ObjectReflectDiff(expect, err))
+				t.Errorf("unexpected error on Into(): %s", cmp.Diff(expect, err))
 			}
 
 			// verify result.Raw leaves the error in the untransformed state
 			if _, err := result.Raw(); !reflect.DeepEqual(result.err, err) {
-				t.Errorf("unexpected error on Raw(): %s", diff.ObjectReflectDiff(expect, err))
+				t.Errorf("unexpected error on Raw(): %s", cmp.Diff(expect, err))
 			}
 		})
 	}
@@ -961,60 +1009,46 @@ func TestRequestWatch(t *testing.T) {
 			Err:              true,
 		},
 		{
-			name: "server returns forbidden",
+			name: "server returns forbidden with json content",
 			Request: &Request{
+				contentConfig: defaultContentConfig(),
 				c: &RESTClient{
-					content: defaultContentConfig(),
-					base:    &url.URL{},
+					base: &url.URL{},
 				},
 			},
 			serverReturns: []responseErr{
 				{response: &http.Response{
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
 					StatusCode: http.StatusForbidden,
-					Body:       ioutil.NopCloser(bytes.NewReader([]byte{})),
+					Body: io.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &metav1.Status{
+						Status:  metav1.StatusFailure,
+						Message: "secrets is forbidden",
+						Reason:  metav1.StatusReasonForbidden,
+						Code:    http.StatusForbidden,
+					})))),
 				}, err: nil},
 			},
 			attemptsExpected: 1,
-			Expect: []watch.Event{
-				{
-					Type: watch.Error,
-					Object: &metav1.Status{
-						Status:  "Failure",
-						Code:    500,
-						Reason:  "InternalError",
-						Message: `an error on the server ("unable to decode an event from the watch stream: test error") has prevented the request from succeeding`,
-						Details: &metav1.StatusDetails{
-							Causes: []metav1.StatusCause{
-								{
-									Type:    "UnexpectedServerResponse",
-									Message: "unable to decode an event from the watch stream: test error",
-								},
-								{
-									Type:    "ClientWatchDecoding",
-									Message: "unable to decode an event from the watch stream: test error",
-								},
-							},
-						},
-					},
-				},
-			},
-			Err: true,
+			Err:              true,
 			ErrFn: func(err error) bool {
+				if err.Error() != "secrets is forbidden" {
+					return false
+				}
 				return apierrors.IsForbidden(err)
 			},
 		},
 		{
-			name: "server returns forbidden",
+			name: "server returns forbidden without content",
 			Request: &Request{
+				contentConfig: defaultContentConfig(),
 				c: &RESTClient{
-					content: defaultContentConfig(),
-					base:    &url.URL{},
+					base: &url.URL{},
 				},
 			},
 			serverReturns: []responseErr{
 				{response: &http.Response{
 					StatusCode: http.StatusForbidden,
-					Body:       ioutil.NopCloser(bytes.NewReader([]byte{})),
+					Body:       io.NopCloser(bytes.NewReader([]byte{})),
 				}, err: nil},
 			},
 			attemptsExpected: 1,
@@ -1026,15 +1060,15 @@ func TestRequestWatch(t *testing.T) {
 		{
 			name: "server returns unauthorized",
 			Request: &Request{
+				contentConfig: defaultContentConfig(),
 				c: &RESTClient{
-					content: defaultContentConfig(),
-					base:    &url.URL{},
+					base: &url.URL{},
 				},
 			},
 			serverReturns: []responseErr{
 				{response: &http.Response{
 					StatusCode: http.StatusUnauthorized,
-					Body:       ioutil.NopCloser(bytes.NewReader([]byte{})),
+					Body:       io.NopCloser(bytes.NewReader([]byte{})),
 				}, err: nil},
 			},
 			attemptsExpected: 1,
@@ -1046,15 +1080,15 @@ func TestRequestWatch(t *testing.T) {
 		{
 			name: "server returns unauthorized",
 			Request: &Request{
+				contentConfig: defaultContentConfig(),
 				c: &RESTClient{
-					content: defaultContentConfig(),
-					base:    &url.URL{},
+					base: &url.URL{},
 				},
 			},
 			serverReturns: []responseErr{
 				{response: &http.Response{
 					StatusCode: http.StatusUnauthorized,
-					Body: ioutil.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &metav1.Status{
+					Body: io.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &metav1.Status{
 						Status: metav1.StatusFailure,
 						Reason: metav1.StatusReasonUnauthorized,
 					})))),
@@ -1122,39 +1156,6 @@ func TestRequestWatch(t *testing.T) {
 			Empty: true,
 		},
 		{
-			name: "max retries 1, server returns a retry-after response, request body seek error",
-			Request: &Request{
-				body: &readSeeker{err: io.EOF},
-				c: &RESTClient{
-					base: &url.URL{},
-				},
-			},
-			maxRetries:       1,
-			attemptsExpected: 1,
-			serverReturns: []responseErr{
-				{response: retryAfterResponse(), err: nil},
-			},
-			Err: true,
-			ErrFn: func(err error) bool {
-				return apierrors.IsInternalError(err)
-			},
-		},
-		{
-			name: "max retries 1, server returns a retryable error, request body seek error",
-			Request: &Request{
-				body: &readSeeker{err: io.EOF},
-				c: &RESTClient{
-					base: &url.URL{},
-				},
-			},
-			maxRetries:       1,
-			attemptsExpected: 1,
-			serverReturns: []responseErr{
-				{response: nil, err: io.EOF},
-			},
-			Empty: true,
-		},
-		{
 			name: "max retries 2, server always returns a response with Retry-After header",
 			Request: &Request{
 				c: &RESTClient{
@@ -1193,7 +1194,8 @@ func TestRequestWatch(t *testing.T) {
 				c.Client = client
 			}
 			testCase.Request.backoff = &noSleepBackOff{}
-			testCase.Request.retry = &withRetry{maxRetries: testCase.maxRetries}
+			testCase.Request.maxRetries = testCase.maxRetries
+			testCase.Request.retryFn = defaultRequestRetryFn
 
 			watch, err := testCase.Request.Watch(context.Background())
 
@@ -1230,7 +1232,7 @@ func TestRequestWatch(t *testing.T) {
 						t.Fatalf("Watch closed early, %d/%d read", i, len(testCase.Expect))
 					}
 					if !reflect.DeepEqual(evt, out) {
-						t.Fatalf("Event %d does not match: %s", i, diff.ObjectReflectDiff(evt, out))
+						t.Fatalf("Event %d does not match: %s", i, cmp.Diff(evt, out))
 					}
 				}
 			}
@@ -1274,15 +1276,15 @@ func TestRequestStream(t *testing.T) {
 		},
 		{
 			Request: &Request{
+				contentConfig: defaultContentConfig(),
 				c: &RESTClient{
-					content: defaultContentConfig(),
-					base:    &url.URL{},
+					base: &url.URL{},
 				},
 			},
 			serverReturns: []responseErr{
 				{response: &http.Response{
 					StatusCode: http.StatusUnauthorized,
-					Body: ioutil.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &metav1.Status{
+					Body: io.NopCloser(bytes.NewReader([]byte(runtime.EncodeOrDie(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), &metav1.Status{
 						Status: metav1.StatusFailure,
 						Reason: metav1.StatusReasonUnauthorized,
 					})))),
@@ -1293,15 +1295,15 @@ func TestRequestStream(t *testing.T) {
 		},
 		{
 			Request: &Request{
+				contentConfig: defaultContentConfig(),
 				c: &RESTClient{
-					content: defaultContentConfig(),
-					base:    &url.URL{},
+					base: &url.URL{},
 				},
 			},
 			serverReturns: []responseErr{
 				{response: &http.Response{
 					StatusCode: http.StatusBadRequest,
-					Body:       ioutil.NopCloser(bytes.NewReader([]byte(`{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"a container name must be specified for pod kube-dns-v20-mz5cv, choose one of: [kubedns dnsmasq healthz]","reason":"BadRequest","code":400}`))),
+					Body:       io.NopCloser(bytes.NewReader([]byte(`{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"a container name must be specified for pod kube-dns-v20-mz5cv, choose one of: [kubedns dnsmasq healthz]","reason":"BadRequest","code":400}`))),
 				}, err: nil},
 			},
 			attemptsExpected: 1,
@@ -1314,7 +1316,7 @@ func TestRequestStream(t *testing.T) {
 			},
 		},
 		{
-			name: "max retries 1, server returns a retry-after response, request body seek error",
+			name: "max retries 1, server returns a retry-after response, non-bytes request, no retry",
 			Request: &Request{
 				body: &readSeeker{err: io.EOF},
 				c: &RESTClient{
@@ -1327,9 +1329,6 @@ func TestRequestStream(t *testing.T) {
 				{response: retryAfterResponse(), err: nil},
 			},
 			Err: true,
-			ErrFn: func(err error) bool {
-				return apierrors.IsInternalError(err)
-			},
 		},
 		{
 			name: "max retries 2, server always returns a response with Retry-After header",
@@ -1382,7 +1381,7 @@ func TestRequestStream(t *testing.T) {
 				{response: retryAfterResponse(), err: nil},
 				{response: &http.Response{
 					StatusCode: http.StatusOK,
-					Body:       ioutil.NopCloser(bytes.NewReader([]byte{})),
+					Body:       io.NopCloser(bytes.NewReader([]byte{})),
 				}, err: nil},
 			},
 		},
@@ -1406,7 +1405,8 @@ func TestRequestStream(t *testing.T) {
 				c.Client = client
 			}
 			testCase.Request.backoff = &noSleepBackOff{}
-			testCase.Request.retry = &withRetry{maxRetries: testCase.maxRetries}
+			testCase.Request.maxRetries = testCase.maxRetries
+			testCase.Request.retryFn = defaultRequestRetryFn
 
 			body, err := testCase.Request.Stream(context.Background())
 
@@ -1432,40 +1432,6 @@ func TestRequestStream(t *testing.T) {
 			}
 		})
 	}
-}
-
-type fakeUpgradeConnection struct{}
-
-func (c *fakeUpgradeConnection) CreateStream(headers http.Header) (httpstream.Stream, error) {
-	return nil, nil
-}
-func (c *fakeUpgradeConnection) Close() error {
-	return nil
-}
-func (c *fakeUpgradeConnection) CloseChan() <-chan bool {
-	return make(chan bool)
-}
-func (c *fakeUpgradeConnection) SetIdleTimeout(timeout time.Duration) {
-}
-
-type fakeUpgradeRoundTripper struct {
-	req  *http.Request
-	conn httpstream.Connection
-}
-
-func (f *fakeUpgradeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	f.req = req
-	b := []byte{}
-	body := ioutil.NopCloser(bytes.NewReader(b))
-	resp := &http.Response{
-		StatusCode: http.StatusSwitchingProtocols,
-		Body:       body,
-	}
-	return resp, nil
-}
-
-func (f *fakeUpgradeRoundTripper) NewConnection(resp *http.Response) (httpstream.Connection, error) {
-	return f.conn, nil
 }
 
 func TestRequestDo(t *testing.T) {
@@ -1495,7 +1461,7 @@ func TestRequestDo(t *testing.T) {
 	}
 	for i, testCase := range testCases {
 		testCase.Request.backoff = &NoBackoff{}
-		testCase.Request.retry = &withRetry{}
+		testCase.Request.retryFn = defaultRequestRetryFn
 		body, err := testCase.Request.Do(context.Background()).Raw()
 		hasErr := err != nil
 		if hasErr != testCase.Err {
@@ -1512,7 +1478,7 @@ func TestDoRequestNewWay(t *testing.T) {
 	expectedObj := &v1.Service{Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{
 		Protocol:   "TCP",
 		Port:       12345,
-		TargetPort: intstr.FromInt(12345),
+		TargetPort: intstr.FromInt32(12345),
 	}}}}
 	expectedBody, _ := runtime.Encode(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), expectedObj)
 	fakeHandler := utiltesting.FakeHandler{
@@ -1545,6 +1511,7 @@ func TestDoRequestNewWay(t *testing.T) {
 
 // This test assumes that the client implementation backs off exponentially, for an individual request.
 func TestBackoffLifecycle(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
 	count := 0
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		count++
@@ -1563,23 +1530,31 @@ func TestBackoffLifecycle(t *testing.T) {
 	// which are used in the server implementation returning StatusOK above.
 	seconds := []int{0, 1, 2, 4, 8, 0, 1, 2, 4, 0}
 	request := c.Verb("POST").Prefix("backofftest").Suffix("abc")
-	clock := clock.FakeClock{}
-	request.backoff = &URLBackoff{
-		// Use a fake backoff here to avoid flakes and speed the test up.
-		Backoff: flowcontrol.NewFakeBackOff(
-			time.Duration(1)*time.Second,
-			time.Duration(200)*time.Second,
-			&clock,
-		)}
+	clock := testingclock.FakeClock{}
+	request.backoff = stepClockDuringSleep{
+		BackoffManagerWithContext: &URLBackoff{
+			// Use a fake backoff here to avoid flakes and speed the test up.
+			Backoff: flowcontrol.NewFakeBackOff(
+				time.Duration(1)*time.Second,
+				time.Duration(200)*time.Second,
+				&clock,
+			),
+		},
+		clock: &clock,
+	}
 
 	for _, sec := range seconds {
-		thisBackoff := request.backoff.CalculateBackoff(request.URL())
+		thisBackoff := request.backoff.CalculateBackoffWithContext(ctx, request.URL())
 		t.Logf("Current backoff %v", thisBackoff)
 		if thisBackoff != time.Duration(sec)*time.Second {
 			t.Errorf("Backoff is %v instead of %v", thisBackoff, sec)
 		}
+
+		// This relies on advancing the fake clock by exactly the duration
+		// that SleepWithContext is being called for while DoRaw is executing.
+		// stepClockDuringSleep.SleepWithContext ensures that this happens.
 		now := clock.Now()
-		request.DoRaw(context.Background())
+		request.DoRaw(ctx)
 		elapsed := clock.Since(now)
 		if clock.Since(now) != thisBackoff {
 			t.Errorf("CalculatedBackoff not honored by clock: Expected time of %v, but got %v ", thisBackoff, elapsed)
@@ -1587,18 +1562,51 @@ func TestBackoffLifecycle(t *testing.T) {
 	}
 }
 
+type stepClockDuringSleep struct {
+	BackoffManagerWithContext
+	clock *testingclock.FakeClock
+}
+
+// SleepWithContext wraps the underlying SleepWithContext and ensures that once
+// that is sleeping, the fake clock advances by exactly the duration that
+// it is sleeping for.
+func (s stepClockDuringSleep) SleepWithContext(ctx context.Context, d time.Duration) {
+	// This code is sensitive to both the implementation of
+	// URLBackoff.SleepWithContext and of FakeClock.NewTimer:
+	// - SleepWithContext must be a no-op when the duration is zero
+	//   => no need to step the fake clock
+	// - SleepWithContext must use FakeClock.NewTimer, not FakeClock.Sleep
+	//   because the latter would advance time itself
+	if d != 0 {
+		go func() {
+			// Poll until the caller is sleeping.
+			for {
+				if s.clock.HasWaiters() {
+					s.clock.Step(d)
+					return
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+	s.BackoffManagerWithContext.SleepWithContext(ctx, d)
+}
+
 type testBackoffManager struct {
 	sleeps []time.Duration
 }
 
-func (b *testBackoffManager) UpdateBackoff(actualUrl *url.URL, err error, responseCode int) {
+func (b *testBackoffManager) UpdateBackoffWithContext(ctx context.Context, actualURL *url.URL, err error, responseCode int) {
 }
 
-func (b *testBackoffManager) CalculateBackoff(actualUrl *url.URL) time.Duration {
+func (b *testBackoffManager) CalculateBackoffWithContext(ctx context.Context, actualURL *url.URL) time.Duration {
 	return time.Duration(0)
 }
 
-func (b *testBackoffManager) Sleep(d time.Duration) {
+func (b *testBackoffManager) SleepWithContext(ctx context.Context, d time.Duration) {
 	b.sleeps = append(b.sleeps, d)
 }
 
@@ -1619,10 +1627,12 @@ func TestCheckRetryClosesBody(t *testing.T) {
 	defer testServer.Close()
 
 	backoff := &testBackoffManager{}
-	expectedSleeps := []time.Duration{0, time.Second, 0, time.Second, 0, time.Second, 0, time.Second, 0}
+
+	// testBackoffManager.CalculateBackoff always returns 0
+	expectedSleeps := []time.Duration{0, time.Second, time.Second, time.Second, time.Second}
 
 	c := testRESTClient(t, testServer)
-	c.createBackoffMgr = func() BackoffManager { return backoff }
+	c.createBackoffMgr = func() BackoffManagerWithContext { return backoff }
 	_, err := c.Verb("POST").
 		Prefix("foo", "bar").
 		Suffix("baz").
@@ -1652,24 +1662,27 @@ func TestConnectionResetByPeerIsRetried(t *testing.T) {
 				if count >= 3 {
 					return &http.Response{
 						StatusCode: http.StatusOK,
-						Body:       ioutil.NopCloser(bytes.NewReader([]byte{})),
+						Body:       io.NopCloser(bytes.NewReader([]byte{})),
 					}, nil
 				}
 				return nil, &net.OpError{Err: syscall.ECONNRESET}
 			}),
 		},
-		backoff: backoff,
-		retry:   &withRetry{maxRetries: 10},
+		backoff:    backoff,
+		maxRetries: 10,
+		retryFn:    defaultRequestRetryFn,
 	}
 	// We expect two retries of "connection reset by peer" and the success.
 	_, err := req.Do(context.Background()).Raw()
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
-	// We have a sleep before each retry (including the initial one) and for
-	// every "retry-after" call - thus 5 together.
-	if len(backoff.sleeps) != 5 {
-		t.Errorf("Expected 5 retries, got: %d", len(backoff.sleeps))
+	if count != 3 {
+		t.Errorf("Expected 3 attempts, got: %d", count)
+	}
+	// We have a sleep before each retry (including the initial one) thus 3 together.
+	if len(backoff.sleeps) != 3 {
+		t.Errorf("Expected 3 backoff.Sleep, got: %d", len(backoff.sleeps))
 	}
 }
 
@@ -1677,7 +1690,7 @@ func TestCheckRetryHandles429And5xx(t *testing.T) {
 	count := 0
 	ch := make(chan struct{})
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		data, err := ioutil.ReadAll(req.Body)
+		data, err := io.ReadAll(req.Body)
 		if err != nil {
 			t.Fatalf("unable to read request body: %v", err)
 		}
@@ -1750,7 +1763,7 @@ func TestDoRequestNewWayReader(t *testing.T) {
 	expectedObj := &v1.Service{Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{
 		Protocol:   "TCP",
 		Port:       12345,
-		TargetPort: intstr.FromInt(12345),
+		TargetPort: intstr.FromInt32(12345),
 	}}}}
 	expectedBody, _ := runtime.Encode(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), expectedObj)
 	fakeHandler := utiltesting.FakeHandler{
@@ -1789,7 +1802,7 @@ func TestDoRequestNewWayObj(t *testing.T) {
 	expectedObj := &v1.Service{Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{
 		Protocol:   "TCP",
 		Port:       12345,
-		TargetPort: intstr.FromInt(12345),
+		TargetPort: intstr.FromInt32(12345),
 	}}}}
 	expectedBody, _ := runtime.Encode(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), expectedObj)
 	fakeHandler := utiltesting.FakeHandler{
@@ -1829,7 +1842,7 @@ func TestDoRequestNewWayFile(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	file, err := ioutil.TempFile("", "foo")
+	file, err := os.CreateTemp("", "foo")
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -1844,7 +1857,7 @@ func TestDoRequestNewWayFile(t *testing.T) {
 	expectedObj := &v1.Service{Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{
 		Protocol:   "TCP",
 		Port:       12345,
-		TargetPort: intstr.FromInt(12345),
+		TargetPort: intstr.FromInt32(12345),
 	}}}}
 	expectedBody, _ := runtime.Encode(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), expectedObj)
 	fakeHandler := utiltesting.FakeHandler{
@@ -1889,7 +1902,7 @@ func TestWasCreated(t *testing.T) {
 	expectedObj := &v1.Service{Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{
 		Protocol:   "TCP",
 		Port:       12345,
-		TargetPort: intstr.FromInt(12345),
+		TargetPort: intstr.FromInt32(12345),
 	}}}}
 	expectedBody, _ := runtime.Encode(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), expectedObj)
 	fakeHandler := utiltesting.FakeHandler{
@@ -2001,7 +2014,7 @@ func TestBody(t *testing.T) {
 	obj := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}}
 	bodyExpected, _ := runtime.Encode(scheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), obj)
 
-	f, err := ioutil.TempFile("", "test_body")
+	f, err := os.CreateTemp("", "test_body")
 	if err != nil {
 		t.Fatalf("TempFile error: %v", err)
 	}
@@ -2039,20 +2052,24 @@ func TestBody(t *testing.T) {
 			}
 		}
 
-		if r.body == nil {
+		req, err := r.newHTTPRequest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.Body == nil {
 			if len(tt.expected) != 0 {
-				t.Errorf("%d: r.body = %q; want %q", i, r.body, tt.expected)
+				t.Errorf("%d: req.Body = %q; want %q", i, req.Body, tt.expected)
 			}
 			continue
 		}
 		buf := make([]byte, len(tt.expected))
-		if _, err := r.body.Read(buf); err != nil {
-			t.Errorf("%d: r.body.Read error: %v", i, err)
+		if _, err := req.Body.Read(buf); err != nil {
+			t.Errorf("%d: req.Body.Read error: %v", i, err)
 			continue
 		}
 		body := string(buf)
 		if body != tt.expected {
-			t.Errorf("%d: r.body = %q; want %q", i, body, tt.expected)
+			t.Errorf("%d: req.Body = %q; want %q", i, body, tt.expected)
 		}
 	}
 }
@@ -2273,15 +2290,17 @@ func TestStream(t *testing.T) {
 
 func testRESTClientWithConfig(t testing.TB, srv *httptest.Server, contentConfig ClientContentConfig) *RESTClient {
 	base, _ := url.Parse("http://localhost")
+	var c *http.Client
 	if srv != nil {
 		var err error
 		base, err = url.Parse(srv.URL)
 		if err != nil {
 			t.Fatalf("failed to parse test URL: %v", err)
 		}
+		c = srv.Client()
 	}
 	versionedAPIPath := defaultResourcePathWithPrefix("", "", "", "")
-	client, err := NewRESTClient(base, versionedAPIPath, contentConfig, nil, nil)
+	client, err := NewRESTClient(base, versionedAPIPath, contentConfig, nil, c)
 	if err != nil {
 		t.Fatalf("failed to create a client: %v", err)
 	}
@@ -2386,7 +2405,7 @@ func TestTruncateBody(t *testing.T) {
 	l := flag.Lookup("v").Value.(flag.Getter).Get().(klog.Level)
 	for _, test := range tests {
 		flag.Set("v", test.level)
-		got := truncateBody(test.body)
+		got := truncateBody(klog.Background(), test.body)
 		if got != test.want {
 			t.Errorf("truncateBody(%v) = %v, want %v", test.body, got, test.want)
 		}
@@ -2479,12 +2498,13 @@ func TestRequestPreflightCheck(t *testing.T) {
 }
 
 func TestThrottledLogger(t *testing.T) {
+	logger := klog.Background()
 	now := time.Now()
 	oldClock := globalThrottledLogger.clock
 	defer func() {
 		globalThrottledLogger.clock = oldClock
 	}()
-	clock := clock.NewFakeClock(now)
+	clock := testingclock.NewFakeClock(now)
 	globalThrottledLogger.clock = clock
 
 	logMessages := 0
@@ -2493,7 +2513,7 @@ func TestThrottledLogger(t *testing.T) {
 		wg.Add(10)
 		for j := 0; j < 10; j++ {
 			go func() {
-				if _, ok := globalThrottledLogger.attemptToLog(); ok {
+				if _, ok := globalThrottledLogger.attemptToLog(logger); ok {
 					logMessages++
 				}
 				wg.Done()
@@ -2657,62 +2677,66 @@ type noSleepBackOff struct {
 
 func (n *noSleepBackOff) Sleep(d time.Duration) {}
 
+func (n *noSleepBackOff) SleepWithContext(ctx context.Context, d time.Duration) {}
+
 func TestRequestWithRetry(t *testing.T) {
 	tests := []struct {
 		name                         string
 		body                         io.Reader
+		bodyBytes                    []byte
 		serverReturns                responseErr
 		errExpected                  error
+		errContains                  string
 		transformFuncInvokedExpected int
 		roundTripInvokedExpected     int
 	}{
 		{
-			name:                         "server returns retry-after response, request body is not io.Seeker, retry goes ahead",
-			body:                         ioutil.NopCloser(bytes.NewReader([]byte{})),
+			name:                         "server returns retry-after response, no request body, retry goes ahead",
+			bodyBytes:                    nil,
 			serverReturns:                responseErr{response: retryAfterResponse(), err: nil},
 			errExpected:                  nil,
 			transformFuncInvokedExpected: 1,
 			roundTripInvokedExpected:     2,
 		},
 		{
-			name:                         "server returns retry-after response, request body Seek returns error, retry aborted",
-			body:                         &readSeeker{err: io.EOF},
+			name:                         "server returns retry-after response, bytes request body, retry goes ahead",
+			bodyBytes:                    []byte{},
+			serverReturns:                responseErr{response: retryAfterResponse(), err: nil},
+			errExpected:                  nil,
+			transformFuncInvokedExpected: 1,
+			roundTripInvokedExpected:     2,
+		},
+		{
+			name:                         "server returns retry-after response, opaque request body, retry aborted",
+			body:                         &readSeeker{},
 			serverReturns:                responseErr{response: retryAfterResponse(), err: nil},
 			errExpected:                  nil,
 			transformFuncInvokedExpected: 1,
 			roundTripInvokedExpected:     1,
 		},
 		{
-			name:                         "server returns retry-after response, request body Seek returns no error, retry goes ahead",
-			body:                         &readSeeker{err: nil},
-			serverReturns:                responseErr{response: retryAfterResponse(), err: nil},
-			errExpected:                  nil,
-			transformFuncInvokedExpected: 1,
-			roundTripInvokedExpected:     2,
-		},
-		{
-			name:                         "server returns retryable err, request body is not io.Seek, retry goes ahead",
-			body:                         ioutil.NopCloser(bytes.NewReader([]byte{})),
+			name:                         "server returns retryable err, no request body, retry goes ahead",
+			bodyBytes:                    nil,
 			serverReturns:                responseErr{response: nil, err: io.ErrUnexpectedEOF},
 			errExpected:                  io.ErrUnexpectedEOF,
 			transformFuncInvokedExpected: 0,
 			roundTripInvokedExpected:     2,
 		},
 		{
-			name:                         "server returns retryable err, request body Seek returns error, retry aborted",
-			body:                         &readSeeker{err: io.EOF},
+			name:                         "server returns retryable err, bytes request body, retry goes ahead",
+			bodyBytes:                    []byte{},
+			serverReturns:                responseErr{response: nil, err: io.ErrUnexpectedEOF},
+			errExpected:                  io.ErrUnexpectedEOF,
+			transformFuncInvokedExpected: 0,
+			roundTripInvokedExpected:     2,
+		},
+		{
+			name:                         "server returns retryable err, opaque request body, retry aborted",
+			body:                         &readSeeker{},
 			serverReturns:                responseErr{response: nil, err: io.ErrUnexpectedEOF},
 			errExpected:                  io.ErrUnexpectedEOF,
 			transformFuncInvokedExpected: 0,
 			roundTripInvokedExpected:     1,
-		},
-		{
-			name:                         "server returns retryable err, request body Seek returns no err, retry goes ahead",
-			body:                         &readSeeker{err: nil},
-			serverReturns:                responseErr{response: nil, err: io.ErrUnexpectedEOF},
-			errExpected:                  io.ErrUnexpectedEOF,
-			transformFuncInvokedExpected: 0,
-			roundTripInvokedExpected:     2,
 		},
 	}
 
@@ -2730,8 +2754,9 @@ func TestRequestWithRetry(t *testing.T) {
 				c: &RESTClient{
 					Client: client,
 				},
-				backoff: &noSleepBackOff{},
-				retry:   &withRetry{maxRetries: 1},
+				backoff:    &noSleepBackOff{},
+				maxRetries: 1,
+				retryFn:    defaultRequestRetryFn,
 			}
 
 			var transformFuncInvoked int
@@ -2745,8 +2770,15 @@ func TestRequestWithRetry(t *testing.T) {
 			if test.transformFuncInvokedExpected != transformFuncInvoked {
 				t.Errorf("Expected transform func to be invoked %d times, but got: %d", test.transformFuncInvokedExpected, transformFuncInvoked)
 			}
-			if test.errExpected != unWrap(err) {
-				t.Errorf("Expected error: %v, but got: %v", test.errExpected, unWrap(err))
+			switch {
+			case test.errExpected != nil:
+				if test.errExpected != unWrap(err) {
+					t.Errorf("Expected error: %v, but got: %v", test.errExpected, unWrap(err))
+				}
+			case len(test.errContains) > 0:
+				if !strings.Contains(err.Error(), test.errContains) {
+					t.Errorf("Expected error message to caontain: %q, but got: %q", test.errContains, err.Error())
+				}
 			}
 		})
 	}
@@ -2775,7 +2807,7 @@ func TestRequestWatchWithRetry(t *testing.T) {
 	testRequestWithRetry(t, "Watch", func(ctx context.Context, r *Request) {
 		w, err := r.Watch(ctx)
 		if err == nil {
-			// in this test the the response body returned by the server is always empty,
+			// in this test the response body returned by the server is always empty,
 			// this will cause StreamWatcher.receive() to:
 			// - return an io.EOF to indicate that the watch closed normally and
 			// - then close the io.Reader
@@ -2783,6 +2815,86 @@ func TestRequestWatchWithRetry(t *testing.T) {
 			// body of the response object, we need to wait here to avoid race condition.
 			<-w.ResultChan()
 		}
+	})
+}
+
+func TestRequestDoRetryWithRateLimiterBackoffAndMetrics(t *testing.T) {
+	// both request.Do and request.DoRaw have the same behavior and expectations
+	testRetryWithRateLimiterBackoffAndMetrics(t, "Do", func(ctx context.Context, r *Request) {
+		r.DoRaw(ctx)
+	})
+}
+
+func TestRequestStreamRetryWithRateLimiterBackoffAndMetrics(t *testing.T) {
+	testRetryWithRateLimiterBackoffAndMetrics(t, "Stream", func(ctx context.Context, r *Request) {
+		r.Stream(ctx)
+	})
+}
+
+func TestRequestWatchRetryWithRateLimiterBackoffAndMetrics(t *testing.T) {
+	testRetryWithRateLimiterBackoffAndMetrics(t, "Watch", func(ctx context.Context, r *Request) {
+		w, err := r.Watch(ctx)
+		if err == nil {
+			// in this test the response body returned by the server is always empty,
+			// this will cause StreamWatcher.receive() to:
+			// - return an io.EOF to indicate that the watch closed normally and
+			// - then close the io.Reader
+			// since we assert on the number of times 'Close' has been called on the
+			// body of the response object, we need to wait here to avoid race condition.
+			<-w.ResultChan()
+		}
+	})
+}
+
+func TestRequestDoWithRetryInvokeOrder(t *testing.T) {
+	// both request.Do and request.DoRaw have the same behavior and expectations
+	testWithRetryInvokeOrder(t, "Do", func(ctx context.Context, r *Request) {
+		r.DoRaw(ctx)
+	})
+}
+
+func TestRequestStreamWithRetryInvokeOrder(t *testing.T) {
+	testWithRetryInvokeOrder(t, "Stream", func(ctx context.Context, r *Request) {
+		r.Stream(ctx)
+	})
+}
+
+func TestRequestWatchWithRetryInvokeOrder(t *testing.T) {
+	testWithRetryInvokeOrder(t, "Watch", func(ctx context.Context, r *Request) {
+		w, err := r.Watch(ctx)
+		if err == nil {
+			// in this test the response body returned by the server is always empty,
+			// this will cause StreamWatcher.receive() to:
+			// - return an io.EOF to indicate that the watch closed normally and
+			// - then close the io.Reader
+			// since we assert on the number of times 'Close' has been called on the
+			// body of the response object, we need to wait here to avoid race condition.
+			<-w.ResultChan()
+		}
+	})
+}
+
+func TestRequestWatchWithWrapPreviousError(t *testing.T) {
+	testWithWrapPreviousError(t, func(ctx context.Context, r *Request) error {
+		w, err := r.Watch(ctx)
+		if err == nil {
+			// in this test the response body returned by the server is always empty,
+			// this will cause StreamWatcher.receive() to:
+			// - return an io.EOF to indicate that the watch closed normally and
+			// - then close the io.Reader
+			// since we assert on the number of times 'Close' has been called on the
+			// body of the response object, we need to wait here to avoid race condition.
+			<-w.ResultChan()
+		}
+		return err
+	})
+}
+
+func TestRequestDoWithWrapPreviousError(t *testing.T) {
+	// both request.Do and request.DoRaw have the same behavior and expectations
+	testWithWrapPreviousError(t, func(ctx context.Context, r *Request) error {
+		result := r.Do(ctx)
+		return result.err
 	})
 }
 
@@ -2796,7 +2908,8 @@ func testRequestWithRetry(t *testing.T, key string, doFunc func(ctx context.Cont
 	tests := []struct {
 		name          string
 		verb          string
-		body          func() io.Reader
+		body          io.Reader
+		bodyBytes     []byte
 		maxRetries    int
 		serverReturns []responseErr
 
@@ -2806,7 +2919,7 @@ func testRequestWithRetry(t *testing.T, key string, doFunc func(ctx context.Cont
 		{
 			name:       "server always returns retry-after response",
 			verb:       "GET",
-			body:       func() io.Reader { return bytes.NewReader([]byte{}) },
+			bodyBytes:  []byte{},
 			maxRetries: 2,
 			serverReturns: []responseErr{
 				{response: retryAfterResponse(), err: nil},
@@ -2834,7 +2947,7 @@ func testRequestWithRetry(t *testing.T, key string, doFunc func(ctx context.Cont
 		{
 			name:       "server always returns retryable error",
 			verb:       "GET",
-			body:       func() io.Reader { return bytes.NewReader([]byte{}) },
+			bodyBytes:  []byte{},
 			maxRetries: 2,
 			serverReturns: []responseErr{
 				{response: nil, err: io.EOF},
@@ -2863,7 +2976,7 @@ func testRequestWithRetry(t *testing.T, key string, doFunc func(ctx context.Cont
 		{
 			name:       "server returns success on the final retry",
 			verb:       "GET",
-			body:       func() io.Reader { return bytes.NewReader([]byte{}) },
+			bodyBytes:  []byte{},
 			maxRetries: 2,
 			serverReturns: []responseErr{
 				{response: retryAfterResponse(), err: nil},
@@ -2904,25 +3017,23 @@ func testRequestWithRetry(t *testing.T, key string, doFunc func(ctx context.Cont
 
 				resp := test.serverReturns[attempts].response
 				if resp != nil {
-					responseRecorder.delegated = ioutil.NopCloser(bytes.NewReader([]byte{}))
+					responseRecorder.delegated = io.NopCloser(bytes.NewReader([]byte{}))
 					resp.Body = responseRecorder
 				}
 				return resp, test.serverReturns[attempts].err
 			})
 
-			reqCountGot := newCount()
-			reqRecorder := newReadTracker(reqCountGot)
-			reqRecorder.delegated = test.body()
-
 			req := &Request{
-				verb: test.verb,
-				body: reqRecorder,
+				verb:          test.verb,
+				body:          test.body,
+				bodyBytes:     test.bodyBytes,
+				contentConfig: defaultContentConfig(),
 				c: &RESTClient{
-					content: defaultContentConfig(),
-					Client:  client,
+					Client: client,
 				},
-				backoff: &noSleepBackOff{},
-				retry:   &withRetry{maxRetries: test.maxRetries},
+				backoff:    &noSleepBackOff{},
+				maxRetries: test.maxRetries,
+				retryFn:    defaultRequestRetryFn,
 			}
 
 			doFunc(context.Background(), req)
@@ -2935,12 +3046,1232 @@ func testRequestWithRetry(t *testing.T, key string, doFunc func(ctx context.Cont
 				t.Errorf("Expected retries: %d, but got: %d", expected.attempts, attempts)
 			}
 
-			if !reflect.DeepEqual(expected.reqCount.seeks, reqCountGot.seeks) {
-				t.Errorf("Expected request body to have seek invocation: %v, but got: %v", expected.reqCount.seeks, reqCountGot.seeks)
-			}
 			if expected.respCount.closes != respCountGot.getCloseCount() {
 				t.Errorf("Expected response body Close to be invoked %d times, but got: %d", expected.respCount.closes, respCountGot.getCloseCount())
 			}
 		})
 	}
+}
+
+type retryTestKeyType int
+
+const retryTestKey retryTestKeyType = iota
+
+// fake flowcontrol.RateLimiter so we can tap into the Wait method of the rate limiter.
+// fake BackoffManager so we can tap into backoff calls
+// fake metrics.ResultMetric to tap into the metric calls
+// we use it to verify that RateLimiter, BackoffManager, and
+// metric calls are invoked appropriately in right order.
+type withRateLimiterBackoffManagerAndMetrics struct {
+	flowcontrol.RateLimiter
+	metrics.ResultMetric
+	calculateBackoffSeq int64
+	calculateBackoffFn  func(i int64) time.Duration
+	metrics.RetryMetric
+
+	invokeOrderGot []string
+	sleepsGot      []string
+	statusCodesGot []string
+}
+
+func (lb *withRateLimiterBackoffManagerAndMetrics) Wait(ctx context.Context) error {
+	lb.invokeOrderGot = append(lb.invokeOrderGot, "RateLimiter.Wait")
+	return nil
+}
+
+func (lb *withRateLimiterBackoffManagerAndMetrics) CalculateBackoffWithContext(ctx context.Context, actualURL *url.URL) time.Duration {
+	lb.invokeOrderGot = append(lb.invokeOrderGot, "BackoffManager.CalculateBackoff")
+
+	waitFor := lb.calculateBackoffFn(lb.calculateBackoffSeq)
+	lb.calculateBackoffSeq++
+	return waitFor
+}
+
+func (lb *withRateLimiterBackoffManagerAndMetrics) UpdateBackoffWithContext(ctx context.Context, actualURL *url.URL, err error, responseCode int) {
+	lb.invokeOrderGot = append(lb.invokeOrderGot, "BackoffManager.UpdateBackoff")
+}
+
+func (lb *withRateLimiterBackoffManagerAndMetrics) SleepWithContext(ctx context.Context, d time.Duration) {
+	lb.invokeOrderGot = append(lb.invokeOrderGot, "BackoffManager.Sleep")
+	lb.sleepsGot = append(lb.sleepsGot, d.String())
+}
+
+func (lb *withRateLimiterBackoffManagerAndMetrics) Increment(ctx context.Context, code, _, _ string) {
+	// we are interested in the request context that is marked by this test
+	if marked, ok := ctx.Value(retryTestKey).(bool); ok && marked {
+		lb.invokeOrderGot = append(lb.invokeOrderGot, "RequestResult.Increment")
+		lb.statusCodesGot = append(lb.statusCodesGot, code)
+	}
+}
+
+func (lb *withRateLimiterBackoffManagerAndMetrics) IncrementRetry(ctx context.Context, code, _, _ string) {
+	// we are interested in the request context that is marked by this test
+	if marked, ok := ctx.Value(retryTestKey).(bool); ok && marked {
+		lb.invokeOrderGot = append(lb.invokeOrderGot, "RequestRetry.IncrementRetry")
+		lb.statusCodesGot = append(lb.statusCodesGot, code)
+	}
+}
+
+func (lb *withRateLimiterBackoffManagerAndMetrics) Do() {
+	lb.invokeOrderGot = append(lb.invokeOrderGot, "Client.Do")
+}
+
+func testRetryWithRateLimiterBackoffAndMetrics(t *testing.T, key string, doFunc func(ctx context.Context, r *Request)) {
+	type expected struct {
+		attempts    int
+		order       []string
+		sleeps      []string
+		statusCodes []string
+	}
+
+	// we define the expected order of how the client invokes the
+	// rate limiter, backoff, and metrics methods.
+	// scenario:
+	//  - A: original request fails with a retryable response: (500, 'Retry-After: N')
+	//  - B: retry 1: successful with a status code 200
+	// so we have a total of 2 attempts
+	invokeOrderWant := []string{
+		// before we send the request to the server:
+		// - we wait as dictated by the client rate lmiter
+		// - we wait, as dictated by the backoff manager
+		"RateLimiter.Wait",
+		"BackoffManager.CalculateBackoff",
+		"BackoffManager.Sleep",
+
+		// A: first attempt for which the server sends a retryable response
+		// status code: 500, Retry-Afer: N
+		"Client.Do",
+
+		// we got a response object, status code: 500, Retry-Afer: N
+		//  - call metrics method with appropriate status code
+		//  - update backoff parameters with the status code returned
+		"RequestResult.Increment",
+		"BackoffManager.UpdateBackoff",
+		"BackoffManager.CalculateBackoff",
+		// sleep for delay=max(BackoffManager.CalculateBackoff, Retry-After: N)
+		"BackoffManager.Sleep",
+		// wait as dictated by the client rate lmiter
+		"RateLimiter.Wait",
+
+		// B: 2nd attempt: retry, and this should return a status code=200
+		"Client.Do",
+
+		// it's a success, so do the following:
+		// count the result metric, and since it's a retry,
+		// count the retry metric, and then update backoff parameters.
+		"RequestResult.Increment",
+		"RequestRetry.IncrementRetry",
+		"BackoffManager.UpdateBackoff",
+	}
+	statusCodesWant := []string{
+		// first attempt (A): we count the result metric only
+		"500",
+		// final attempt (B): we count the result metric, and the retry metric
+		"200", "200",
+	}
+
+	tests := []struct {
+		name               string
+		maxRetries         int
+		serverReturns      []responseErr
+		calculateBackoffFn func(i int64) time.Duration
+		// expectations differ based on whether it is 'Watch', 'Stream' or 'Do'
+		expectations map[string]expected
+	}{
+		{
+			name:       "success after one retry, Retry-After: N > BackoffManager.CalculateBackoff",
+			maxRetries: 1,
+			serverReturns: []responseErr{
+				{response: retryAfterResponseWithDelay("5"), err: nil},
+				{response: &http.Response{StatusCode: http.StatusOK}, err: nil},
+			},
+			// we simulate a sleep sequence of 0s, 1s, 2s, 3s, ...
+			calculateBackoffFn: func(i int64) time.Duration { return time.Duration(i * int64(time.Second)) },
+			expectations: map[string]expected{
+				"Do": {
+					attempts:    2,
+					order:       invokeOrderWant,
+					statusCodes: statusCodesWant,
+					sleeps: []string{
+						// initial backoff.Sleep before we send the request to the server for the first time
+						"0s",
+						// maximum of:
+						//  - 'Retry-After: 5' response header from (A)
+						//  - BackoffManager.CalculateBackoff (will return 1s)
+						(5 * time.Second).String(),
+					},
+				},
+				"Watch": {
+					attempts: 2,
+					// Watch does not do 'RateLimiter.Wait' before initially sending the request to the server
+					order:       invokeOrderWant[1:],
+					statusCodes: statusCodesWant,
+					sleeps: []string{
+						"0s",
+						(5 * time.Second).String(),
+					},
+				},
+				"Stream": {
+					attempts:    2,
+					order:       invokeOrderWant,
+					statusCodes: statusCodesWant,
+					sleeps: []string{
+						"0s",
+						(5 * time.Second).String(),
+					},
+				},
+			},
+		},
+		{
+			name:       "success after one retry, Retry-After: N < BackoffManager.CalculateBackoff",
+			maxRetries: 1,
+			serverReturns: []responseErr{
+				{response: retryAfterResponseWithDelay("2"), err: nil},
+				{response: &http.Response{StatusCode: http.StatusOK}, err: nil},
+			},
+			// we simulate a sleep sequence of 0s, 4s, 8s, 16s, ...
+			calculateBackoffFn: func(i int64) time.Duration { return time.Duration(i * int64(4*time.Second)) },
+			expectations: map[string]expected{
+				"Do": {
+					attempts:    2,
+					order:       invokeOrderWant,
+					statusCodes: statusCodesWant,
+					sleeps: []string{
+						// initial backoff.Sleep before we send the request to the server for the first time
+						"0s",
+						// maximum of:
+						//  - 'Retry-After: 2' response header from (A)
+						//  - BackoffManager.CalculateBackoff (will return 4s)
+						(4 * time.Second).String(),
+					},
+				},
+				"Watch": {
+					attempts: 2,
+					// Watch does not do 'RateLimiter.Wait' before initially sending the request to the server
+					order:       invokeOrderWant[1:],
+					statusCodes: statusCodesWant,
+					sleeps: []string{
+						"0s",
+						(4 * time.Second).String(),
+					},
+				},
+				"Stream": {
+					attempts:    2,
+					order:       invokeOrderWant,
+					statusCodes: statusCodesWant,
+					sleeps: []string{
+						"0s",
+						(4 * time.Second).String(),
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			interceptor := &withRateLimiterBackoffManagerAndMetrics{
+				RateLimiter:        flowcontrol.NewFakeAlwaysRateLimiter(),
+				calculateBackoffFn: test.calculateBackoffFn,
+			}
+
+			// TODO: today this is the only site where a test overrides the
+			//  default metric interfaces, in future if we other tests want
+			//  to override as well, and we want tests to be able to run in
+			//  parallel then we will need to provide a way for tests to
+			//  register/deregister their own metric inerfaces.
+			oldRequestResult := metrics.RequestResult
+			oldRequestRetry := metrics.RequestRetry
+			metrics.RequestResult = interceptor
+			metrics.RequestRetry = interceptor
+			defer func() {
+				metrics.RequestResult = oldRequestResult
+				metrics.RequestRetry = oldRequestRetry
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// we are changing metrics.RequestResult (a global state) in
+			// this test, to avoid interference from other tests running in
+			// parallel we need to associate a key to the context so we
+			// can identify the metric calls associated with this test.
+			ctx = context.WithValue(ctx, retryTestKey, true)
+
+			var attempts int
+			client := clientForFunc(func(req *http.Request) (*http.Response, error) {
+				defer func() {
+					attempts++
+				}()
+
+				interceptor.Do()
+				resp := test.serverReturns[attempts].response
+				if resp != nil {
+					resp.Body = io.NopCloser(bytes.NewReader([]byte{}))
+				}
+				return resp, test.serverReturns[attempts].err
+			})
+
+			base, err := url.Parse("http://foo.bar")
+			if err != nil {
+				t.Fatalf("Wrong test setup - did not find expected for: %s", key)
+			}
+			req := &Request{
+				verb:          "GET",
+				bodyBytes:     []byte{},
+				contentConfig: defaultContentConfig(),
+				c: &RESTClient{
+					base:        base,
+					Client:      client,
+					rateLimiter: interceptor,
+				},
+				pathPrefix:  "/api/v1",
+				rateLimiter: interceptor,
+				backoff:     interceptor,
+				maxRetries:  test.maxRetries,
+				retryFn:     defaultRequestRetryFn,
+			}
+
+			doFunc(ctx, req)
+
+			want, ok := test.expectations[key]
+			if !ok {
+				t.Fatalf("Wrong test setup - did not find expected for: %s", key)
+			}
+			if want.attempts != attempts {
+				t.Errorf("%s: Expected retries: %d, but got: %d", key, want.attempts, attempts)
+			}
+			if !cmp.Equal(want.order, interceptor.invokeOrderGot) {
+				t.Errorf("%s: Expected invoke order to match, diff: %s", key, cmp.Diff(want.order, interceptor.invokeOrderGot))
+			}
+			if !cmp.Equal(want.sleeps, interceptor.sleepsGot) {
+				t.Errorf("%s: Expected sleep sequence to match, diff: %s", key, cmp.Diff(want.sleeps, interceptor.sleepsGot))
+			}
+			if !cmp.Equal(want.statusCodes, interceptor.statusCodesGot) {
+				t.Errorf("%s: Expected status codes to match, diff: %s", key, cmp.Diff(want.statusCodes, interceptor.statusCodesGot))
+			}
+		})
+	}
+}
+
+type retryInterceptor struct {
+	WithRetry
+	invokeOrderGot []string
+}
+
+func (ri *retryInterceptor) IsNextRetry(ctx context.Context, restReq *Request, httpReq *http.Request, resp *http.Response, err error, f IsRetryableErrorFunc) bool {
+	ri.invokeOrderGot = append(ri.invokeOrderGot, "WithRetry.IsNextRetry")
+	return ri.WithRetry.IsNextRetry(ctx, restReq, httpReq, resp, err, f)
+}
+
+func (ri *retryInterceptor) Before(ctx context.Context, request *Request) error {
+	ri.invokeOrderGot = append(ri.invokeOrderGot, "WithRetry.Before")
+	return ri.WithRetry.Before(ctx, request)
+}
+
+func (ri *retryInterceptor) After(ctx context.Context, request *Request, resp *http.Response, err error) {
+	ri.invokeOrderGot = append(ri.invokeOrderGot, "WithRetry.After")
+	ri.WithRetry.After(ctx, request, resp, err)
+}
+
+func (ri *retryInterceptor) Do() {
+	ri.invokeOrderGot = append(ri.invokeOrderGot, "Client.Do")
+}
+
+func testWithRetryInvokeOrder(t *testing.T, key string, doFunc func(ctx context.Context, r *Request)) {
+	// we define the expected order of how the client
+	// should invoke the retry interface
+	// scenario:
+	//  - A: original request fails with a retryable response: (500, 'Retry-After: 1')
+	//  - B: retry 1: successful with a status code 200
+	// so we have a total of 2 attempts
+	defaultInvokeOrderWant := []string{
+		// first attempt (A)
+		"WithRetry.Before",
+		"Client.Do",
+		"WithRetry.After",
+		// server returns a retryable response: (500, 'Retry-After: 1')
+		// IsNextRetry is expected to return true
+		"WithRetry.IsNextRetry",
+
+		// second attempt (B) - retry 1: successful with a status code 200
+		"WithRetry.Before",
+		"Client.Do",
+		"WithRetry.After",
+		// success: IsNextRetry is expected to return false
+		// Watch and Stream are an exception, they return as soon as the
+		// server sends a status code of success.
+		"WithRetry.IsNextRetry",
+	}
+
+	tests := []struct {
+		name          string
+		maxRetries    int
+		serverReturns []responseErr
+		// expectations differ based on whether it is 'Watch', 'Stream' or 'Do'
+		expectations map[string][]string
+	}{
+		{
+			name:       "success after one retry",
+			maxRetries: 1,
+			serverReturns: []responseErr{
+				{response: retryAfterResponse(), err: nil},
+				{response: &http.Response{StatusCode: http.StatusOK}, err: nil},
+			},
+			expectations: map[string][]string{
+				"Do": defaultInvokeOrderWant,
+				// Watch and Stream skip the final 'IsNextRetry' by returning
+				// as soon as they see a success from the server.
+				"Watch":  defaultInvokeOrderWant[0 : len(defaultInvokeOrderWant)-1],
+				"Stream": defaultInvokeOrderWant[0 : len(defaultInvokeOrderWant)-1],
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			interceptor := &retryInterceptor{
+				WithRetry: &withRetry{maxRetries: test.maxRetries},
+			}
+
+			var attempts int
+			client := clientForFunc(func(req *http.Request) (*http.Response, error) {
+				defer func() {
+					attempts++
+				}()
+
+				interceptor.Do()
+				resp := test.serverReturns[attempts].response
+				if resp != nil {
+					resp.Body = io.NopCloser(bytes.NewReader([]byte{}))
+				}
+				return resp, test.serverReturns[attempts].err
+			})
+
+			base, err := url.Parse("http://foo.bar")
+			if err != nil {
+				t.Fatalf("Wrong test setup - did not find expected for: %s", key)
+			}
+			req := &Request{
+				verb:          "GET",
+				bodyBytes:     []byte{},
+				contentConfig: defaultContentConfig(),
+				c: &RESTClient{
+					base:   base,
+					Client: client,
+				},
+				pathPrefix:  "/api/v1",
+				rateLimiter: flowcontrol.NewFakeAlwaysRateLimiter(),
+				backoff:     &NoBackoff{},
+				retryFn:     func(_ int) WithRetry { return interceptor },
+			}
+
+			doFunc(context.Background(), req)
+
+			if attempts != 2 {
+				t.Errorf("%s: Expected attempts: %d, but got: %d", key, 2, attempts)
+			}
+			invokeOrderWant, ok := test.expectations[key]
+			if !ok {
+				t.Fatalf("Wrong test setup - did not find expected for: %s", key)
+			}
+			if !cmp.Equal(invokeOrderWant, interceptor.invokeOrderGot) {
+				t.Errorf("%s: Expected invoke order to match, diff: %s", key, cmp.Diff(invokeOrderWant, interceptor.invokeOrderGot))
+			}
+		})
+	}
+}
+
+func testWithWrapPreviousError(t *testing.T, doFunc func(ctx context.Context, r *Request) error) {
+	var (
+		containsFormatExpected = "- error from a previous attempt: %s"
+		nonRetryableErr        = errors.New("non retryable error")
+	)
+
+	tests := []struct {
+		name             string
+		maxRetries       int
+		serverReturns    []responseErr
+		expectedErr      error
+		wrapped          bool
+		attemptsExpected int
+		contains         string
+	}{
+		{
+			name:       "success at first attempt",
+			maxRetries: 2,
+			serverReturns: []responseErr{
+				{response: &http.Response{StatusCode: http.StatusOK}, err: nil},
+			},
+			attemptsExpected: 1,
+			expectedErr:      nil,
+		},
+		{
+			name:       "success after a series of retry-after from the server",
+			maxRetries: 2,
+			serverReturns: []responseErr{
+				{response: retryAfterResponse(), err: nil},
+				{response: retryAfterResponse(), err: nil},
+				{response: &http.Response{StatusCode: http.StatusOK}, err: nil},
+			},
+			attemptsExpected: 3,
+			expectedErr:      nil,
+		},
+		{
+			name:       "success after a series of retryable errors",
+			maxRetries: 2,
+			serverReturns: []responseErr{
+				{response: nil, err: io.EOF},
+				{response: nil, err: io.EOF},
+				{response: &http.Response{StatusCode: http.StatusOK}, err: nil},
+			},
+			attemptsExpected: 3,
+			expectedErr:      nil,
+		},
+		{
+			name:       "request errors out with a non retryable error",
+			maxRetries: 2,
+			serverReturns: []responseErr{
+				{response: nil, err: nonRetryableErr},
+			},
+			attemptsExpected: 1,
+			expectedErr:      nonRetryableErr,
+		},
+		{
+			name:       "request times out after retries, but no previous error",
+			maxRetries: 2,
+			serverReturns: []responseErr{
+				{response: retryAfterResponse(), err: nil},
+				{response: retryAfterResponse(), err: nil},
+				{response: nil, err: context.Canceled},
+			},
+			attemptsExpected: 3,
+			expectedErr:      context.Canceled,
+		},
+		{
+			name:       "request times out after retries, and we have a relevant previous error",
+			maxRetries: 3,
+			serverReturns: []responseErr{
+				{response: nil, err: io.EOF},
+				{response: retryAfterResponse(), err: nil},
+				{response: retryAfterResponse(), err: nil},
+				{response: nil, err: context.Canceled},
+			},
+			attemptsExpected: 4,
+			wrapped:          true,
+			expectedErr:      context.Canceled,
+			contains:         fmt.Sprintf(containsFormatExpected, io.EOF),
+		},
+		{
+			name:       "interleaved retry-after responses with retryable errors",
+			maxRetries: 8,
+			serverReturns: []responseErr{
+				{response: retryAfterResponse(), err: nil},
+				{response: retryAfterResponse(), err: nil},
+				{response: nil, err: io.ErrUnexpectedEOF},
+				{response: retryAfterResponse(), err: nil},
+				{response: retryAfterResponse(), err: nil},
+				{response: nil, err: io.EOF},
+				{response: retryAfterResponse(), err: nil},
+				{response: retryAfterResponse(), err: nil},
+				{response: nil, err: context.Canceled},
+			},
+			attemptsExpected: 9,
+			wrapped:          true,
+			expectedErr:      context.Canceled,
+			contains:         fmt.Sprintf(containsFormatExpected, io.EOF),
+		},
+		{
+			name:       "request errors out with a retryable error, followed by a non-retryable one",
+			maxRetries: 3,
+			serverReturns: []responseErr{
+				{response: nil, err: io.EOF},
+				{response: nil, err: nonRetryableErr},
+			},
+			attemptsExpected: 2,
+			wrapped:          true,
+			expectedErr:      nonRetryableErr,
+			contains:         fmt.Sprintf(containsFormatExpected, io.EOF),
+		},
+		{
+			name:       "use the most recent error",
+			maxRetries: 2,
+			serverReturns: []responseErr{
+				{response: nil, err: io.ErrUnexpectedEOF},
+				{response: nil, err: io.EOF},
+				{response: nil, err: context.Canceled},
+			},
+			attemptsExpected: 3,
+			wrapped:          true,
+			expectedErr:      context.Canceled,
+			contains:         fmt.Sprintf(containsFormatExpected, io.EOF),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var attempts int
+			client := clientForFunc(func(req *http.Request) (*http.Response, error) {
+				defer func() {
+					attempts++
+				}()
+
+				resp := test.serverReturns[attempts].response
+				if resp != nil {
+					resp.Body = io.NopCloser(bytes.NewReader([]byte{}))
+				}
+				return resp, test.serverReturns[attempts].err
+			})
+
+			base, err := url.Parse("http://foo.bar")
+			if err != nil {
+				t.Fatalf("Failed to create new HTTP request - %v", err)
+			}
+			req := &Request{
+				verb:          "GET",
+				bodyBytes:     []byte{},
+				contentConfig: defaultContentConfig(),
+				c: &RESTClient{
+					base:   base,
+					Client: client,
+				},
+				pathPrefix:  "/api/v1",
+				rateLimiter: flowcontrol.NewFakeAlwaysRateLimiter(),
+				backoff:     &noSleepBackOff{},
+				maxRetries:  test.maxRetries,
+				retryFn:     defaultRequestRetryFn,
+			}
+
+			err = doFunc(context.Background(), req)
+			if test.attemptsExpected != attempts {
+				t.Errorf("Expected attempts: %d, but got: %d", test.attemptsExpected, attempts)
+			}
+
+			switch {
+			case test.expectedErr == nil:
+				if err != nil {
+					t.Errorf("Expected a nil error, but got: %v", err)
+					return
+				}
+			case test.expectedErr != nil:
+				if !strings.Contains(err.Error(), test.contains) {
+					t.Errorf("Expected error message to contain %q, but got: %v", test.contains, err)
+				}
+
+				urlErrGot, _ := err.(*url.Error)
+				if test.wrapped {
+					// we expect the url.Error from net/http to be wrapped by WrapPreviousError
+					unwrapper, ok := err.(interface {
+						Unwrap() error
+					})
+					if !ok {
+						t.Errorf("Expected error to implement Unwrap method, but got: %v", err)
+						return
+					}
+					urlErrGot, _ = unwrapper.Unwrap().(*url.Error)
+				}
+				// we always get a url.Error from net/http
+				if urlErrGot == nil {
+					t.Errorf("Expected error to be url.Error, but got: %v", err)
+					return
+				}
+
+				errGot := urlErrGot.Unwrap()
+				if test.expectedErr != errGot {
+					t.Errorf("Expected error %v, but got: %v", test.expectedErr, errGot)
+				}
+			}
+		})
+	}
+}
+
+func TestReuseRequest(t *testing.T) {
+	var tests = []struct {
+		name        string
+		enableHTTP2 bool
+	}{
+		{"HTTP1", false},
+		{"HTTP2", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(r.RemoteAddr))
+			}))
+			ts.EnableHTTP2 = tt.enableHTTP2
+			ts.StartTLS()
+			defer ts.Close()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			c := testRESTClient(t, ts)
+
+			req1, err := c.Verb("GET").
+				Prefix("foo").
+				DoRaw(ctx)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			req2, err := c.Verb("GET").
+				Prefix("foo").
+				DoRaw(ctx)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			if string(req1) != string(req2) {
+				t.Fatalf("Expected %v to be equal to %v", string(req1), string(req2))
+			}
+
+		})
+	}
+}
+
+func TestHTTP1DoNotReuseRequestAfterTimeout(t *testing.T) {
+	var tests = []struct {
+		name        string
+		enableHTTP2 bool
+	}{
+		{"HTTP1", false},
+		{"HTTP2", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			done := make(chan struct{})
+			ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Logf("TEST Connected from %v on %v\n", r.RemoteAddr, r.URL.Path)
+				if r.URL.Path == "/hang" {
+					t.Logf("TEST hanging %v\n", r.RemoteAddr)
+					<-done
+				}
+				w.Write([]byte(r.RemoteAddr))
+			}))
+			ts.EnableHTTP2 = tt.enableHTTP2
+			ts.StartTLS()
+			defer ts.Close()
+			// close hanging connection before shutting down the http server
+			defer close(done)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			transport, ok := ts.Client().Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("failed to assert *http.Transport")
+			}
+
+			config := &Config{
+				Host:      ts.URL,
+				Transport: utilnet.SetTransportDefaults(transport),
+				Timeout:   1 * time.Second,
+				// These fields are required to create a REST client.
+				ContentConfig: ContentConfig{
+					GroupVersion:         &schema.GroupVersion{},
+					NegotiatedSerializer: &serializer.CodecFactory{},
+				},
+			}
+			if !tt.enableHTTP2 {
+				config.TLSClientConfig.NextProtos = []string{"http/1.1"}
+			}
+			c, err := RESTClientFor(config)
+			if err != nil {
+				t.Fatalf("failed to create REST client: %v", err)
+			}
+			req1, err := c.Verb("GET").
+				Prefix("foo").
+				DoRaw(ctx)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			_, err = c.Verb("GET").
+				Prefix("/hang").
+				DoRaw(ctx)
+			if err == nil {
+				t.Fatalf("Expected error")
+			}
+
+			req2, err := c.Verb("GET").
+				Prefix("foo").
+				DoRaw(ctx)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			// http1 doesn't reuse the connection after it times
+			if tt.enableHTTP2 != (string(req1) == string(req2)) {
+				if tt.enableHTTP2 {
+					t.Fatalf("Expected %v to be the same as %v", string(req1), string(req2))
+				} else {
+					t.Fatalf("Expected %v to be different to %v", string(req1), string(req2))
+				}
+			}
+		})
+	}
+}
+
+func TestTransportConcurrency(t *testing.T) {
+	const numReqs = 10
+	var tests = []struct {
+		name        string
+		enableHTTP2 bool
+	}{
+		{"HTTP1", false},
+		{"HTTP2", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Logf("Connected from %v %v", r.RemoteAddr, r.URL)
+				fmt.Fprintf(w, "%v", r.FormValue("echo"))
+			}))
+			ts.EnableHTTP2 = tt.enableHTTP2
+			ts.StartTLS()
+			defer ts.Close()
+			var wg sync.WaitGroup
+
+			wg.Add(numReqs)
+			c := testRESTClient(t, ts)
+			reqs := make(chan string)
+			defer close(reqs)
+
+			for i := 0; i < 4; i++ {
+				go func() {
+					for req := range reqs {
+						res, err := c.Get().Param("echo", req).DoRaw(context.Background())
+						if err != nil {
+							t.Errorf("error on req %s: %v", req, err)
+							wg.Done()
+							continue
+						}
+
+						if string(res) != req {
+							t.Errorf("body of req %s = %q; want %q", req, res, req)
+						}
+
+						wg.Done()
+					}
+				}()
+			}
+			for i := 0; i < numReqs; i++ {
+				reqs <- fmt.Sprintf("request-%d", i)
+			}
+			wg.Wait()
+		})
+	}
+}
+
+func TestRetryableConditions(t *testing.T) {
+	var (
+		methods = map[string]func(ctx context.Context, r *Request){
+			"Do": func(ctx context.Context, r *Request) {
+				r.Do(ctx)
+			},
+			"DoRaw": func(ctx context.Context, r *Request) {
+				r.DoRaw(ctx)
+			},
+			"Stream": func(ctx context.Context, r *Request) {
+				r.Stream(ctx)
+			},
+			"Watch": func(ctx context.Context, r *Request) {
+				w, err := r.Watch(ctx)
+				if err == nil {
+					// we need to wait here to avoid race condition.
+					<-w.ResultChan()
+				}
+			},
+		}
+
+		alwaysRetry = map[string]bool{
+			"Do":     true,
+			"DoRaw":  true,
+			"Watch":  true,
+			"Stream": true,
+		}
+
+		neverRetry = map[string]bool{
+			"Do":     false,
+			"DoRaw":  false,
+			"Watch":  false,
+			"Stream": false,
+		}
+
+		alwaysRetryExceptStream = map[string]bool{
+			"Do":     true,
+			"DoRaw":  true,
+			"Watch":  true,
+			"Stream": false,
+		}
+	)
+
+	tests := []struct {
+		name             string
+		verbs            []string
+		serverReturns    responseErr
+		retryExpectation map[string]bool
+	}{
+		// {429, Retry-After: N} - we expect retry
+		{
+			name:             "server returns {429, Retry-After}",
+			verbs:            []string{"GET", "POST", "PUT", "DELETE", "PATCH"},
+			serverReturns:    responseErr{response: retryAfterResponseWithCodeAndDelay(http.StatusTooManyRequests, "0"), err: nil},
+			retryExpectation: alwaysRetry,
+		},
+		// {5xx, Retry-After: N} - we expect retry
+		{
+			name:             "server returns {503, Retry-After}",
+			verbs:            []string{"GET", "POST", "PUT", "DELETE", "PATCH"},
+			serverReturns:    responseErr{response: retryAfterResponseWithCodeAndDelay(http.StatusServiceUnavailable, "0"), err: nil},
+			retryExpectation: alwaysRetry,
+		},
+		// 5xx, but Retry-After: N is missing - no retry is expected
+		{
+			name:             "server returns 5xx, but no Retry-After",
+			verbs:            []string{"GET", "POST", "PUT", "DELETE", "PATCH"},
+			serverReturns:    responseErr{response: &http.Response{StatusCode: http.StatusInternalServerError}, err: nil},
+			retryExpectation: neverRetry,
+		},
+		// 429, but Retry-After: N is missing - no retry is expected
+		{
+			name:             "server returns 429 but no Retry-After",
+			verbs:            []string{"GET", "POST", "PUT", "DELETE", "PATCH"},
+			serverReturns:    responseErr{response: &http.Response{StatusCode: http.StatusTooManyRequests}, err: nil},
+			retryExpectation: neverRetry,
+		},
+		// response is nil, but error is set
+		{
+			name:             "server returns connection reset error",
+			verbs:            []string{"GET"},
+			serverReturns:    responseErr{response: nil, err: syscall.ECONNRESET},
+			retryExpectation: alwaysRetryExceptStream,
+		},
+		{
+			name:             "server returns EOF error",
+			verbs:            []string{"GET"},
+			serverReturns:    responseErr{response: nil, err: io.EOF},
+			retryExpectation: alwaysRetryExceptStream,
+		},
+		{
+			name:             "server returns unexpected EOF error",
+			verbs:            []string{"GET"},
+			serverReturns:    responseErr{response: nil, err: io.ErrUnexpectedEOF},
+			retryExpectation: alwaysRetryExceptStream,
+		},
+		{
+			name:             "server returns broken connection error",
+			verbs:            []string{"GET"},
+			serverReturns:    responseErr{response: nil, err: errors.New("http: can't write HTTP request on broken connection")},
+			retryExpectation: alwaysRetryExceptStream,
+		},
+		{
+			name:             "server returns GOAWAY error",
+			verbs:            []string{"GET"},
+			serverReturns:    responseErr{response: nil, err: errors.New("http2: server sent GOAWAY and closed the connection")},
+			retryExpectation: alwaysRetryExceptStream,
+		},
+		{
+			name:             "server returns connection reset by peer error",
+			verbs:            []string{"GET"},
+			serverReturns:    responseErr{response: nil, err: errors.New("connection reset by peer")},
+			retryExpectation: alwaysRetryExceptStream,
+		},
+		{
+			name:             "server returns use of closed network connection error",
+			verbs:            []string{"GET"},
+			serverReturns:    responseErr{response: nil, err: errors.New("use of closed network connection")},
+			retryExpectation: alwaysRetryExceptStream,
+		},
+		// connection refused error never gets retried
+		{
+			name:             "server returns connection refused error",
+			verbs:            []string{"GET"},
+			serverReturns:    responseErr{response: nil, err: syscall.ECONNREFUSED},
+			retryExpectation: neverRetry,
+		},
+		{
+			name:             "server returns connection refused error",
+			verbs:            []string{"POST"},
+			serverReturns:    responseErr{response: nil, err: syscall.ECONNREFUSED},
+			retryExpectation: neverRetry,
+		},
+		{
+			name:          "server returns EOF error",
+			verbs:         []string{"POST"},
+			serverReturns: responseErr{response: nil, err: io.EOF},
+			retryExpectation: map[string]bool{
+				"Do":     false,
+				"DoRaw":  false,
+				"Watch":  true, // not applicable, Watch should always be GET only
+				"Stream": false,
+			},
+		},
+		// Timeout error gets retries by watch only
+		{
+			name:          "server returns net.Timeout() == true error",
+			verbs:         []string{"GET"},
+			serverReturns: responseErr{response: nil, err: &net.DNSError{IsTimeout: true}},
+			retryExpectation: map[string]bool{
+				"Do":     false,
+				"DoRaw":  false,
+				"Watch":  true,
+				"Stream": false,
+			},
+		},
+		{
+			name:             "server returns OK, never retry",
+			verbs:            []string{"GET", "POST", "PUT", "DELETE", "PATCH"},
+			serverReturns:    responseErr{response: &http.Response{StatusCode: http.StatusOK}, err: nil},
+			retryExpectation: neverRetry,
+		},
+		{
+			name:             "server returns {3xx, Retry-After}",
+			verbs:            []string{"GET", "POST", "PUT", "DELETE", "PATCH"},
+			serverReturns:    responseErr{response: &http.Response{StatusCode: http.StatusMovedPermanently, Header: http.Header{"Retry-After": []string{"0"}}}, err: nil},
+			retryExpectation: neverRetry,
+		},
+	}
+
+	for _, test := range tests {
+		for method, retryExpected := range test.retryExpectation {
+			fn, ok := methods[method]
+			if !ok {
+				t.Fatalf("Wrong test setup, unknown method: %s", method)
+			}
+
+			for _, verb := range test.verbs {
+				t.Run(fmt.Sprintf("%s/%s/%s", test.name, method, verb), func(t *testing.T) {
+					var attemptsGot int
+					client := clientForFunc(func(req *http.Request) (*http.Response, error) {
+						attemptsGot++
+						return test.serverReturns.response, test.serverReturns.err
+					})
+
+					u, _ := url.Parse("http://localhost:123" + "/apis")
+					req := &Request{
+						verb:          verb,
+						contentConfig: defaultContentConfig(),
+						c: &RESTClient{
+							base:   u,
+							Client: client,
+						},
+						backoff:    &noSleepBackOff{},
+						maxRetries: 2,
+						retryFn:    defaultRequestRetryFn,
+					}
+
+					fn(context.Background(), req)
+
+					if retryExpected {
+						if attemptsGot != 3 {
+							t.Errorf("Expected attempt count: %d, but got: %d", 3, attemptsGot)
+						}
+						return
+					}
+					// we don't expect retry, so we should see the first attempt only.
+					if attemptsGot > 1 {
+						t.Errorf("Expected no retry, but got %d attempts", attemptsGot)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRequestConcurrencyWithRetry(t *testing.T) {
+	var attempts int32
+	client := clientForFunc(func(req *http.Request) (*http.Response, error) {
+		defer func() {
+			atomic.AddInt32(&attempts, 1)
+		}()
+
+		// always send a retry-after response
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Header:     http.Header{"Retry-After": []string{"1"}},
+		}, nil
+	})
+
+	req := &Request{
+		verb:          "POST",
+		contentConfig: defaultContentConfig(),
+		c: &RESTClient{
+			Client: client,
+		},
+		backoff:    &noSleepBackOff{},
+		maxRetries: 9, // 10 attempts in total, including the first
+		retryFn:    defaultRequestRetryFn,
+	}
+
+	concurrency := 20
+	wg := sync.WaitGroup{}
+	wg.Add(concurrency)
+	startCh := make(chan struct{})
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			<-startCh
+			req.Do(context.Background())
+		}()
+	}
+
+	close(startCh)
+	wg.Wait()
+
+	// we expect (concurrency*req.maxRetries+1) attempts to be recorded
+	expected := concurrency * (req.maxRetries + 1)
+	if atomic.LoadInt32(&attempts) != int32(expected) {
+		t.Errorf("Expected attempts: %d, but got: %d", expected, attempts)
+	}
+}
+
+func TestRequestLogging(t *testing.T) {
+	testcases := map[string]struct {
+		v              int
+		body           any
+		response       *http.Response
+		expectedOutput string
+	}{
+		"no-output": {
+			v:    7,
+			body: []byte("ping"),
+			response: &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("pong")),
+			},
+		},
+		"output": {
+			v:    8,
+			body: []byte("ping"),
+			response: &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("pong")),
+			},
+			expectedOutput: `<location>] "Request Body" logger="TestLogger" body="ping"
+<location>] "Response Body" logger="TestLogger" body="pong"
+`,
+		},
+		"io-reader": {
+			v:    8,
+			body: strings.NewReader("ping"),
+			response: &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("pong")),
+			},
+			// Cannot log the request body!
+			expectedOutput: `<location>] "Response Body" logger="TestLogger" body="pong"
+`,
+		},
+		"truncate": {
+			v:    8,
+			body: []byte(strings.Repeat("a", 2000)),
+			response: &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("pong")),
+			},
+			expectedOutput: fmt.Sprintf(`<location>] "Request Body" logger="TestLogger" body="%s [truncated 976 chars]"
+<location>] "Response Body" logger="TestLogger" body="pong"
+`, strings.Repeat("a", 1024)),
+		},
+		"warnings": {
+			v:    8,
+			body: []byte("ping"),
+			response: &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Warning": []string{
+						`299 request-test "warning 1"`,
+						`299 request-test-2 "warning 2"`,
+						`300 request-test-3 "ignore code 300"`,
+					},
+				},
+				Body: io.NopCloser(strings.NewReader("pong")),
+			},
+			expectedOutput: `<location>] "Request Body" logger="TestLogger" body="ping"
+<location>] "Response Body" logger="TestLogger" body="pong"
+warnings.go] "Warning: warning 1" logger="TestLogger"
+warnings.go] "Warning: warning 2" logger="TestLogger"
+`,
+		},
+	}
+
+	for name, tc := range testcases {
+		//nolint:logcheck // Intentionally testing with plain klog here.
+		t.Run(name, func(t *testing.T) {
+			state := klog.CaptureState()
+			defer state.Restore()
+
+			var buffer bytes.Buffer
+			klog.SetOutput(&buffer)
+			klog.LogToStderr(false)
+			var fs flag.FlagSet
+			klog.InitFlags(&fs)
+			require.NoError(t, fs.Set("v", fmt.Sprintf("%d", tc.v)), "set verbosity")
+			require.NoError(t, fs.Set("one_output", "true"), "set one_output")
+
+			client := clientForFunc(func(req *http.Request) (*http.Response, error) {
+				return tc.response, nil
+			})
+
+			req := NewRequestWithClient(nil, "", defaultContentConfig(), client).
+				Body(tc.body)
+
+			logger := klog.Background()
+			logger = klog.LoggerWithName(logger, "TestLogger")
+			ctx := klog.NewContext(context.Background(), logger)
+
+			_, file, line, _ := goruntime.Caller(0)
+			result := req.Do(ctx)
+			require.NoError(t, result.Error(), "request.Do")
+
+			// Compare log output:
+			// - strip date/time/pid from each line (fixed length header)
+			// - replace <location> with the actual call location
+			// - strip line number from warnings.go (might change)
+			state.Restore()
+			expectedOutput := strings.ReplaceAll(tc.expectedOutput, "<location>", fmt.Sprintf("%s:%d", path.Base(file), line+1))
+			actualOutput := buffer.String()
+			actualOutput = regexp.MustCompile(`(?m)^.{30}`).ReplaceAllString(actualOutput, "")
+			actualOutput = regexp.MustCompile(`(?m)^warnings\.go:\d+`).ReplaceAllString(actualOutput, "warnings.go")
+			assert.Equal(t, expectedOutput, actualOutput)
+		})
+	}
+}
+
+func TestRequestWarningHandler(t *testing.T) {
+	t.Run("no-context", func(t *testing.T) {
+		request := &Request{}
+		handler := &fakeWarningHandlerWithLogging{}
+		//nolint:logcheck
+		assert.Equal(t, request, request.WarningHandler(handler))
+		assert.NotNil(t, request.warningHandler)
+		request.warningHandler.HandleWarningHeaderWithContext(context.Background(), 0, "", "message")
+		assert.Equal(t, []string{"message"}, handler.messages)
+	})
+
+	t.Run("with-context", func(t *testing.T) {
+		request := &Request{}
+		handler := &fakeWarningHandlerWithContext{}
+		assert.Equal(t, request, request.WarningHandlerWithContext(handler))
+		assert.Equal(t, request.warningHandler, handler)
+	})
+
+	t.Run("nil-no-context", func(t *testing.T) {
+		request := &Request{
+			warningHandler: &fakeWarningHandlerWithContext{},
+		}
+		//nolint:logcheck
+		assert.Equal(t, request, request.WarningHandler(nil))
+		assert.Nil(t, request.warningHandler)
+	})
+
+	t.Run("nil-with-context", func(t *testing.T) {
+		request := &Request{
+			warningHandler: &fakeWarningHandlerWithContext{},
+		}
+		assert.Equal(t, request, request.WarningHandlerWithContext(nil))
+		assert.Nil(t, request.warningHandler)
+	})
 }

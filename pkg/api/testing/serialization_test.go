@@ -20,13 +20,12 @@ import (
 	"bytes"
 	"encoding/hex"
 	gojson "encoding/json"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"reflect"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	jsoniter "github.com/json-iterator/go"
 
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -38,7 +37,6 @@ import (
 	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/runtime/serializer/streaming"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/watch"
@@ -53,7 +51,7 @@ import (
 // fuzzInternalObject fuzzes an arbitrary runtime object using the appropriate
 // fuzzer registered with the apitesting package.
 func fuzzInternalObject(t *testing.T, forVersion schema.GroupVersion, item runtime.Object, seed int64) runtime.Object {
-	fuzzer.FuzzerFor(FuzzerFuncs, rand.NewSource(seed), legacyscheme.Codecs).Fuzz(item)
+	fuzzer.FuzzerFor(FuzzerFuncs, rand.NewSource(seed), legacyscheme.Codecs).Fill(item)
 
 	j, err := meta.TypeAccessor(item)
 	if err != nil {
@@ -151,7 +149,7 @@ func TestSpecificKind(t *testing.T) {
 	roundtrip.RoundTripSpecificKind(t, internalGVK, legacyscheme.Scheme, legacyscheme.Codecs, fuzzer, nil)
 }
 
-var nonRoundTrippableTypes = sets.NewString(
+var nonRoundTrippableTypes = sets.New[string](
 	"ExportOptions",
 	"GetOptions",
 	// WatchEvent does not include kind and version and can only be deserialized
@@ -333,7 +331,7 @@ func TestUnversionedTypes(t *testing.T) {
 func TestObjectWatchFraming(t *testing.T) {
 	f := fuzzer.FuzzerFor(FuzzerFuncs, rand.NewSource(benchmarkSeed), legacyscheme.Codecs)
 	secret := &api.Secret{}
-	f.Fuzz(secret)
+	f.Fill(secret)
 	if secret.Data == nil {
 		secret.Data = map[string][]byte{}
 	}
@@ -365,7 +363,7 @@ func TestObjectWatchFraming(t *testing.T) {
 		if n, err := w.Write(obj.Bytes()); err != nil || n != len(obj.Bytes()) {
 			t.Fatal(err)
 		}
-		sr := streaming.NewDecoder(framer.NewFrameReader(ioutil.NopCloser(out)), s)
+		sr := streaming.NewDecoder(framer.NewFrameReader(io.NopCloser(out)), s)
 		resultSecret := &v1.Secret{}
 		res, _, err := sr.Decode(nil, resultSecret)
 		if err != nil {
@@ -394,7 +392,7 @@ func TestObjectWatchFraming(t *testing.T) {
 		if n, err := w.Write(obj.Bytes()); err != nil || n != len(obj.Bytes()) {
 			t.Fatal(err)
 		}
-		sr = streaming.NewDecoder(framer.NewFrameReader(ioutil.NopCloser(out)), s)
+		sr = streaming.NewDecoder(framer.NewFrameReader(io.NopCloser(out)), s)
 		outEvent := &metav1.WatchEvent{}
 		_, _, err = sr.Decode(nil, outEvent)
 		if err != nil || outEvent.Type != string(watch.Added) {
@@ -420,7 +418,7 @@ func benchmarkItems(b *testing.B) []v1.Pod {
 	items := make([]v1.Pod, 10)
 	for i := range items {
 		var pod api.Pod
-		apiObjectFuzzer.Fuzz(&pod)
+		apiObjectFuzzer.Fill(&pod)
 		pod.Spec.InitContainers, pod.Status.InitContainerStatuses = nil, nil
 		out, err := legacyscheme.Scheme.ConvertToVersion(&pod, v1.SchemeGroupVersion)
 		if err != nil {
@@ -436,7 +434,7 @@ func benchmarkItemsList(b *testing.B, numItems int) v1.PodList {
 	items := make([]v1.Pod, numItems)
 	for i := range items {
 		var pod api.Pod
-		apiObjectFuzzer.Fuzz(&pod)
+		apiObjectFuzzer.Fill(&pod)
 		pod.Spec.InitContainers, pod.Status.InitContainerStatuses = nil, nil
 		out, err := legacyscheme.Scheme.ConvertToVersion(&pod, v1.SchemeGroupVersion)
 		if err != nil {
@@ -583,59 +581,6 @@ func BenchmarkDecodeIntoJSON(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		obj := v1.Pod{}
 		if err := gojson.Unmarshal(encoded[i%width], &obj); err != nil {
-			b.Fatal(err)
-		}
-	}
-	b.StopTimer()
-}
-
-// BenchmarkDecodeIntoJSONCodecGenConfigFast provides a baseline
-// for JSON decode performance with jsoniter.ConfigFast
-func BenchmarkDecodeIntoJSONCodecGenConfigFast(b *testing.B) {
-	kcodec := legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion)
-	items := benchmarkItems(b)
-	width := len(items)
-	encoded := make([][]byte, width)
-	for i := range items {
-		data, err := runtime.Encode(kcodec, &items[i])
-		if err != nil {
-			b.Fatal(err)
-		}
-		encoded[i] = data
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		obj := v1.Pod{}
-		if err := jsoniter.ConfigFastest.Unmarshal(encoded[i%width], &obj); err != nil {
-			b.Fatal(err)
-		}
-	}
-	b.StopTimer()
-}
-
-// BenchmarkDecodeIntoJSONCodecGenConfigCompatibleWithStandardLibrary provides a
-// baseline for JSON decode performance with
-// jsoniter.ConfigCompatibleWithStandardLibrary, but with case sensitivity set
-// to true
-func BenchmarkDecodeIntoJSONCodecGenConfigCompatibleWithStandardLibrary(b *testing.B) {
-	kcodec := legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion)
-	items := benchmarkItems(b)
-	width := len(items)
-	encoded := make([][]byte, width)
-	for i := range items {
-		data, err := runtime.Encode(kcodec, &items[i])
-		if err != nil {
-			b.Fatal(err)
-		}
-		encoded[i] = data
-	}
-
-	b.ResetTimer()
-	iter := json.CaseSensitiveJSONIterator()
-	for i := 0; i < b.N; i++ {
-		obj := v1.Pod{}
-		if err := iter.Unmarshal(encoded[i%width], &obj); err != nil {
 			b.Fatal(err)
 		}
 	}

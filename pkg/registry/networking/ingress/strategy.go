@@ -18,17 +18,21 @@ package ingress
 
 import (
 	"context"
+	"fmt"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/networking"
 	"k8s.io/kubernetes/pkg/apis/networking/validation"
 	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+)
+
+const (
+	annotationIngressClass = "kubernetes.io/ingress.class"
 )
 
 // ingressStrategy implements verification logic for Replication Ingress.
@@ -90,16 +94,20 @@ func (ingressStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Ob
 
 // Validate validates ingresses on create.
 func (ingressStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
-	var requestGV schema.GroupVersion
-	if requestInfo, ok := request.RequestInfoFrom(ctx); ok {
-		requestGV = schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-	}
 	ingress := obj.(*networking.Ingress)
-	return validation.ValidateIngressCreate(ingress, requestGV)
+	return validation.ValidateIngressCreate(ingress)
 }
 
 // WarningsOnCreate returns warnings for the creation of the given object.
-func (ingressStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string { return nil }
+func (ingressStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	var warnings []string
+	ingress := obj.(*networking.Ingress)
+	_, annotationIsSet := ingress.Annotations[annotationIngressClass]
+	if annotationIsSet && ingress.Spec.IngressClassName == nil {
+		warnings = append(warnings, fmt.Sprintf("annotation %q is deprecated, please use 'spec.ingressClassName' instead", annotationIngressClass))
+	}
+	return warnings
+}
 
 // Canonicalize normalizes the object after validation.
 func (ingressStrategy) Canonicalize(obj runtime.Object) {
@@ -112,11 +120,7 @@ func (ingressStrategy) AllowCreateOnUpdate() bool {
 
 // ValidateUpdate validates ingresses on update.
 func (ingressStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	var requestGV schema.GroupVersion
-	if requestInfo, ok := request.RequestInfoFrom(ctx); ok {
-		requestGV = schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-	}
-	return validation.ValidateIngressUpdate(obj.(*networking.Ingress), old.(*networking.Ingress), requestGV)
+	return validation.ValidateIngressUpdate(obj.(*networking.Ingress), old.(*networking.Ingress))
 }
 
 // WarningsOnUpdate returns warnings for the given update.
@@ -169,5 +173,17 @@ func (ingressStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtim
 
 // WarningsOnUpdate returns warnings for the given update.
 func (ingressStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
-	return nil
+	newIngress := obj.(*networking.Ingress)
+	var warnings []string
+
+	if len(newIngress.Status.LoadBalancer.Ingress) > 0 {
+		fieldPath := field.NewPath("status", "loadBalancer", "ingress")
+		for i, ingress := range newIngress.Status.LoadBalancer.Ingress {
+			if len(ingress.IP) > 0 {
+				warnings = append(warnings, utilvalidation.GetWarningsForIP(fieldPath.Index(i), ingress.IP)...)
+			}
+		}
+	}
+
+	return warnings
 }

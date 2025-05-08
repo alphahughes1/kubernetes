@@ -28,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	resourcecli "k8s.io/cli-runtime/pkg/resource"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
@@ -39,13 +39,13 @@ import (
 
 var (
 	quotaLong = templates.LongDesc(i18n.T(`
-		Create a resourcequota with the specified name, hard limits and optional scopes`))
+		Create a resource quota with the specified name, hard limits, and optional scopes.`))
 
 	quotaExample = templates.Examples(i18n.T(`
-		# Create a new resourcequota named my-quota
+		# Create a new resource quota named my-quota
 		kubectl create quota my-quota --hard=cpu=1,memory=1G,pods=2,services=3,replicationcontrollers=2,resourcequotas=1,secrets=5,persistentvolumeclaims=10
 
-		# Create a new resourcequota named best-effort
+		# Create a new resource quota named best-effort
 		kubectl create quota best-effort --hard=pods=100 --scopes=BestEffort`))
 )
 
@@ -65,15 +65,15 @@ type QuotaOpts struct {
 	Namespace        string
 	EnforceNamespace bool
 
-	Client         *coreclient.CoreV1Client
-	DryRunStrategy cmdutil.DryRunStrategy
-	DryRunVerifier *resourcecli.DryRunVerifier
+	Client              *coreclient.CoreV1Client
+	DryRunStrategy      cmdutil.DryRunStrategy
+	ValidationDirective string
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 // NewQuotaOpts creates a new *QuotaOpts with sane defaults
-func NewQuotaOpts(ioStreams genericclioptions.IOStreams) *QuotaOpts {
+func NewQuotaOpts(ioStreams genericiooptions.IOStreams) *QuotaOpts {
 	return &QuotaOpts{
 		PrintFlags: genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme),
 		IOStreams:  ioStreams,
@@ -81,14 +81,14 @@ func NewQuotaOpts(ioStreams genericclioptions.IOStreams) *QuotaOpts {
 }
 
 // NewCmdCreateQuota is a macro command to create a new quota
-func NewCmdCreateQuota(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdCreateQuota(f cmdutil.Factory, ioStreams genericiooptions.IOStreams) *cobra.Command {
 	o := NewQuotaOpts(ioStreams)
 
 	cmd := &cobra.Command{
 		Use:                   "quota NAME [--hard=key1=value1,key2=value2] [--scopes=Scope1,Scope2] [--dry-run=server|client|none]",
 		DisableFlagsInUseLine: true,
 		Aliases:               []string{"resourcequota"},
-		Short:                 i18n.T("Create a quota with the specified name."),
+		Short:                 i18n.T("Create a quota with the specified name"),
 		Long:                  quotaLong,
 		Example:               quotaExample,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -132,11 +132,6 @@ func (o *QuotaOpts) Complete(f cmdutil.Factory, cmd *cobra.Command, args []strin
 	if err != nil {
 		return err
 	}
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resourcecli.NewDryRunVerifier(dynamicClient, f.OpenAPIGetter())
 
 	o.Namespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
@@ -152,6 +147,11 @@ func (o *QuotaOpts) Complete(f cmdutil.Factory, cmd *cobra.Command, args []strin
 
 	o.PrintObj = func(obj runtime.Object) error {
 		return printer.PrintObj(obj, o.Out)
+	}
+
+	o.ValidationDirective, err = cmdutil.GetValidationDirective(cmd)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -181,10 +181,8 @@ func (o *QuotaOpts) Run() error {
 		if o.FieldManager != "" {
 			createOptions.FieldManager = o.FieldManager
 		}
+		createOptions.FieldValidation = o.ValidationDirective
 		if o.DryRunStrategy == cmdutil.DryRunServer {
-			if err := o.DryRunVerifier.HasSupport(resourceQuota.GroupVersionKind()); err != nil {
-				return err
-			}
 			createOptions.DryRun = []string{metav1.DryRunAll}
 		}
 		resourceQuota, err = o.Client.ResourceQuotas(o.Namespace).Create(context.TODO(), resourceQuota, createOptions)

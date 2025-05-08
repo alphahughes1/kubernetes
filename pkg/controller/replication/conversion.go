@@ -29,7 +29,7 @@ import (
 
 	apps "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -69,12 +69,12 @@ type conversionInformer struct {
 	cache.SharedIndexInformer
 }
 
-func (i conversionInformer) AddEventHandler(handler cache.ResourceEventHandler) {
-	i.SharedIndexInformer.AddEventHandler(conversionEventHandler{handler})
+func (i conversionInformer) AddEventHandler(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	return i.SharedIndexInformer.AddEventHandler(conversionEventHandler{handler})
 }
 
-func (i conversionInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, resyncPeriod time.Duration) {
-	i.SharedIndexInformer.AddEventHandlerWithResyncPeriod(conversionEventHandler{handler}, resyncPeriod)
+func (i conversionInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, resyncPeriod time.Duration) (cache.ResourceEventHandlerRegistration, error) {
+	return i.SharedIndexInformer.AddEventHandlerWithResyncPeriod(conversionEventHandler{handler}, resyncPeriod)
 }
 
 type conversionLister struct {
@@ -125,13 +125,13 @@ type conversionEventHandler struct {
 	handler cache.ResourceEventHandler
 }
 
-func (h conversionEventHandler) OnAdd(obj interface{}) {
+func (h conversionEventHandler) OnAdd(obj interface{}, isInInitialList bool) {
 	rs, err := convertRCtoRS(obj.(*v1.ReplicationController), nil)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("dropping RC OnAdd event: can't convert object %#v to RS: %v", obj, err))
 		return
 	}
-	h.handler.OnAdd(rs)
+	h.handler.OnAdd(rs, isInInitialList)
 }
 
 func (h conversionEventHandler) OnUpdate(oldObj, newObj interface{}) {
@@ -224,7 +224,7 @@ func (c conversionClient) UpdateStatus(ctx context.Context, rs *apps.ReplicaSet,
 }
 
 func (c conversionClient) Get(ctx context.Context, name string, options metav1.GetOptions) (*apps.ReplicaSet, error) {
-	rc, err := c.ReplicationControllerInterface.Get(context.TODO(), name, options)
+	rc, err := c.ReplicationControllerInterface.Get(ctx, name, options)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +232,7 @@ func (c conversionClient) Get(ctx context.Context, name string, options metav1.G
 }
 
 func (c conversionClient) List(ctx context.Context, opts metav1.ListOptions) (*apps.ReplicaSetList, error) {
-	rcList, err := c.ReplicationControllerInterface.List(context.TODO(), opts)
+	rcList, err := c.ReplicationControllerInterface.List(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -337,18 +337,18 @@ type podControlAdapter struct {
 	controller.PodControlInterface
 }
 
-func (pc podControlAdapter) CreatePods(namespace string, template *v1.PodTemplateSpec, object runtime.Object, controllerRef *metav1.OwnerReference) error {
+func (pc podControlAdapter) CreatePods(ctx context.Context, namespace string, template *v1.PodTemplateSpec, object runtime.Object, controllerRef *metav1.OwnerReference) error {
 	rc, err := convertRStoRC(object.(*apps.ReplicaSet))
 	if err != nil {
 		return err
 	}
-	return pc.PodControlInterface.CreatePods(namespace, template, rc, controllerRef)
+	return pc.PodControlInterface.CreatePods(ctx, namespace, template, rc, controllerRef)
 }
 
-func (pc podControlAdapter) DeletePod(namespace string, podID string, object runtime.Object) error {
+func (pc podControlAdapter) DeletePod(ctx context.Context, namespace string, podID string, object runtime.Object) error {
 	rc, err := convertRStoRC(object.(*apps.ReplicaSet))
 	if err != nil {
 		return err
 	}
-	return pc.PodControlInterface.DeletePod(namespace, podID, rc)
+	return pc.PodControlInterface.DeletePod(ctx, namespace, podID, rc)
 }

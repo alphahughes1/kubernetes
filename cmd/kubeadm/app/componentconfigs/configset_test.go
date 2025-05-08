@@ -43,7 +43,7 @@ func TestDefault(t *testing.T) {
 	Default(clusterCfg, localAPIEndpoint, nodeRegOps)
 
 	if len(clusterCfg.ComponentConfigs) != len(known) {
-		t.Errorf("missmatch between supported and defaulted type numbers:\n\tgot: %d\n\texpected: %d", len(clusterCfg.ComponentConfigs), len(known))
+		t.Errorf("mismatch between supported and defaulted type numbers:\n\tgot: %d\n\texpected: %d", len(clusterCfg.ComponentConfigs), len(known))
 	}
 }
 
@@ -66,7 +66,7 @@ func TestFromCluster(t *testing.T) {
 	}
 
 	if len(clusterCfg.ComponentConfigs) != len(objects) {
-		t.Fatalf("missmatch between supplied and loaded type numbers:\n\tgot: %d\n\texpected: %d", len(clusterCfg.ComponentConfigs), len(objects))
+		t.Fatalf("mismatch between supplied and loaded type numbers:\n\tgot: %d\n\texpected: %d", len(clusterCfg.ComponentConfigs), len(objects))
 	}
 }
 
@@ -78,9 +78,9 @@ func TestFetchFromDocumentMap(t *testing.T) {
 	apiVersion: kubelet.config.k8s.io/v1beta1
 	kind: KubeletConfiguration
 	`)
-	gvkmap, err := kubeadmutil.SplitYAMLDocuments([]byte(test))
+	gvkmap, err := kubeadmutil.SplitConfigDocuments([]byte(test))
 	if err != nil {
-		t.Fatalf("unexpected failure of SplitYAMLDocuments: %v", err)
+		t.Fatalf("unexpected failure of SplitConfigDocuments: %v", err)
 	}
 
 	clusterCfg := testClusterCfg()
@@ -89,6 +89,6 @@ func TestFetchFromDocumentMap(t *testing.T) {
 	}
 
 	if len(clusterCfg.ComponentConfigs) != len(gvkmap) {
-		t.Fatalf("missmatch between supplied and loaded type numbers:\n\tgot: %d\n\texpected: %d", len(clusterCfg.ComponentConfigs), len(gvkmap))
+		t.Fatalf("mismatch between supplied and loaded type numbers:\n\tgot: %d\n\texpected: %d", len(clusterCfg.ComponentConfigs), len(gvkmap))
 	}
 }

@@ -17,6 +17,7 @@ limitations under the License.
 package fc
 
 import (
+	"errors"
 	"os"
 	"reflect"
 	"testing"
@@ -66,7 +67,22 @@ func (handler *fakeIOHandler) ReadDir(dirname string) ([]os.FileInfo, error) {
 		f3 := &fakeFileInfo{
 			name: "abc-0000:41:00.0-fc-0x5005076810213404-lun-0",
 		}
-		return []os.FileInfo{f1, f2, f3}, nil
+		f4 := &fakeFileInfo{
+			name: "pci-0000:41:00.0-fc-0x500a0981891b8dc5-lun-12",
+		}
+		f5 := &fakeFileInfo{
+			name: "pci-0000:41:00.0-fc-0x500a0981891b8dc5-lun-1",
+		}
+		f6 := &fakeFileInfo{
+			name: "fc-0x5005076810213b32-lun-25",
+		}
+		f7 := &fakeFileInfo{
+			name: "fc-0x500507681021a537-lun-0",
+		}
+		f8 := &fakeFileInfo{
+			name: "fc-0x500507681022a554-lun-2",
+		}
+		return []os.FileInfo{f4, f5, f6, f1, f2, f3, f7, f8}, nil
 	case "/sys/block/":
 		f := &fakeFileInfo{
 			name: "dm-1",
@@ -82,15 +98,49 @@ func (handler *fakeIOHandler) ReadDir(dirname string) ([]os.FileInfo, error) {
 }
 
 func (handler *fakeIOHandler) Lstat(name string) (os.FileInfo, error) {
-	return nil, nil
+	links := map[string]string{
+		"/sys/block/dm-1/slaves/sde": "sde",
+		"/sys/block/dm-1/slaves/sdf": "sdf",
+		"/sys/block/dm-1/slaves/sdg": "sdg",
+	}
+	if dev, ok := links[name]; ok {
+		return &fakeFileInfo{name: dev}, nil
+	}
+	return nil, errors.New("device not found for mock")
 }
 
 func (handler *fakeIOHandler) EvalSymlinks(path string) (string, error) {
-	return "/dev/sda", nil
+	switch path {
+	case "/dev/disk/by-path/pci-0000:41:00.0-fc-0x500a0981891b8dc5-lun-0":
+		return "/dev/sda", nil
+	case "/dev/disk/by-path/pci-0000:41:00.0-fc-0x500a0981891b8dc5-lun-1":
+		return "/dev/sdb", nil
+	case "/dev/disk/by-path/fc-0x5005076810213b32-lun-2":
+		return "/dev/sdc", nil
+	case "/dev/disk/by-path/pci-0000:41:00.0-fc-0x500a0981891b8dc5-lun-12":
+		return "/dev/sdl", nil
+	case "/dev/disk/by-path/fc-0x5005076810213b32-lun-25":
+		return "/dev/sdx", nil
+	case "/dev/disk/by-id/scsi-3600508b400105e210000900000490000":
+		return "/dev/sdd", nil
+	case "/dev/disk/by-path/fc-0x500507681021a537-lun-0":
+		return "/dev/sde", nil
+	case "/dev/disk/by-path/fc-0x500507681022a554-lun-2":
+		return "/dev/sdf", nil
+	case "/dev/sde":
+		return "/dev/sde", nil
+	case "/dev/sdf":
+		return "/dev/sdf", nil
+	}
+	return "", nil
 }
 
 func (handler *fakeIOHandler) WriteFile(filename string, data []byte, perm os.FileMode) error {
 	return nil
+}
+
+func (handler *fakeIOHandler) ReadFile(filename string) ([]byte, error) {
+	return nil, nil
 }
 
 func TestSearchDisk(t *testing.T) {
@@ -98,17 +148,26 @@ func TestSearchDisk(t *testing.T) {
 		name        string
 		wwns        []string
 		lun         string
+		disk        string
 		expectError bool
 	}{
 		{
-			name: "PCI disk",
+			name: "PCI disk 0",
 			wwns: []string{"500a0981891b8dc5"},
 			lun:  "0",
+			disk: "/dev/sda",
+		},
+		{
+			name: "PCI disk 1",
+			wwns: []string{"500a0981891b8dc5"},
+			lun:  "1",
+			disk: "/dev/sdb",
 		},
 		{
 			name: "Non PCI disk",
 			wwns: []string{"5005076810213b32"},
 			lun:  "2",
+			disk: "/dev/sdc",
 		},
 		{
 			name:        "Invalid Storage Controller",
@@ -132,7 +191,7 @@ func TestSearchDisk(t *testing.T) {
 					lun:  test.lun,
 					io:   &fakeIOHandler{},
 				},
-				deviceUtil: util.NewDeviceHandler(util.NewIOHandler()),
+				deviceUtil: util.NewDeviceHandler(&fakeIOHandler{}),
 			}
 			devicePath, err := searchDisk(fakeMounter)
 			if test.expectError && err == nil {
@@ -144,6 +203,9 @@ func TestSearchDisk(t *testing.T) {
 			// if no disk matches input wwn and lun, exit
 			if devicePath == "" && !test.expectError {
 				t.Errorf("no fc disk found")
+			}
+			if devicePath != test.disk {
+				t.Errorf("matching wrong disk, expected: %s, actual: %s", test.disk, devicePath)
 			}
 		})
 	}

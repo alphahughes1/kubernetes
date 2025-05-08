@@ -47,14 +47,15 @@ type Reconciler interface {
 
 // NewReconciler returns a new instance of Reconciler.
 //
-// loopSleepDuration - the amount of time the reconciler loop sleeps between
-//   successive executions
-//   syncDuration - the amount of time the syncStates sleeps between
-//   successive executions
 // operationExecutor - used to trigger register/unregister operations safely
-//   (prevents more than one operation from being triggered on the same
-//   socket path)
+// (prevents more than one operation from being triggered on the same
+// socket path)
+//
+// loopSleepDuration - the amount of time the reconciler loop sleeps between
+// successive executions
+//
 // desiredStateOfWorld - cache containing the desired state of the world
+//
 // actualStateOfWorld - cache containing the actual state of the world
 func NewReconciler(
 	operationExecutor operationexecutor.OperationExecutor,
@@ -121,7 +122,7 @@ func (rc *reconciler) reconcile() {
 			// Iterate through desired state of world plugins and see if there's any plugin
 			// with the same socket path but different timestamp.
 			for _, dswPlugin := range rc.desiredStateOfWorld.GetPluginsToRegister() {
-				if dswPlugin.SocketPath == registeredPlugin.SocketPath && dswPlugin.Timestamp != registeredPlugin.Timestamp {
+				if dswPlugin.SocketPath == registeredPlugin.SocketPath && dswPlugin.UUID != registeredPlugin.UUID {
 					klog.V(5).InfoS("An updated version of plugin has been found, unregistering the plugin first before reregistering", "plugin", registeredPlugin)
 					unregisterPlugin = true
 					break
@@ -147,9 +148,9 @@ func (rc *reconciler) reconcile() {
 
 	// Ensure plugins that should be registered are registered
 	for _, pluginToRegister := range rc.desiredStateOfWorld.GetPluginsToRegister() {
-		if !rc.actualStateOfWorld.PluginExistsWithCorrectTimestamp(pluginToRegister) {
+		if !rc.actualStateOfWorld.PluginExistsWithCorrectUUID(pluginToRegister) {
 			klog.V(5).InfoS("Starting operationExecutor.RegisterPlugin", "plugin", pluginToRegister)
-			err := rc.operationExecutor.RegisterPlugin(pluginToRegister.SocketPath, pluginToRegister.Timestamp, rc.getHandlers(), rc.actualStateOfWorld)
+			err := rc.operationExecutor.RegisterPlugin(pluginToRegister.SocketPath, pluginToRegister.UUID, rc.getHandlers(), rc.actualStateOfWorld)
 			if err != nil &&
 				!goroutinemap.IsAlreadyExists(err) &&
 				!exponentialbackoff.IsExponentialBackoff(err) {

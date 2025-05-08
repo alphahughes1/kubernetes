@@ -29,7 +29,7 @@ func TestNewCmdCompletion(t *testing.T) {
 	var out bytes.Buffer
 	shells := GetSupportedShells()
 	if len(shells) == 0 {
-		t.Errorf(shellsError)
+		t.Error(shellsError)
 	}
 	// test newCmdCompletion with a valid shell.
 	// use a dummy parent command as newCmdCompletion needs it.
@@ -39,7 +39,7 @@ func TestNewCmdCompletion(t *testing.T) {
 	cmd := newCmdCompletion(&out, "")
 	parentCmd.AddCommand(cmd)
 	if err := parentCmd.Execute(); err != nil {
-		t.Errorf("Cannot exectute newCmdCompletion: %v", err)
+		t.Errorf("Cannot execute newCmdCompletion: %v", err)
 	}
 }
 
@@ -72,7 +72,7 @@ func TestRunCompletion(t *testing.T) {
 	// test all supported shells
 	shells := GetSupportedShells()
 	if len(shells) == 0 {
-		t.Errorf(shellsError)
+		t.Error(shellsError)
 	}
 	for _, shell := range shells {
 		test := TestCase{

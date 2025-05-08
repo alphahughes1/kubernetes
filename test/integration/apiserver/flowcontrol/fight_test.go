@@ -25,10 +25,7 @@ import (
 	"testing"
 	"time"
 
-	flowcontrol "k8s.io/api/flowcontrol/v1beta1"
-	"k8s.io/apimachinery/pkg/util/clock"
-	genericfeatures "k8s.io/apiserver/pkg/features"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	flowcontrol "k8s.io/api/flowcontrol/v1"
 	utilfc "k8s.io/apiserver/pkg/util/flowcontrol"
 	fqtesting "k8s.io/apiserver/pkg/util/flowcontrol/fairqueuing/testing"
 	"k8s.io/apiserver/pkg/util/flowcontrol/metrics"
@@ -36,25 +33,28 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/clock"
+	testclocks "k8s.io/utils/clock/testing"
 )
 
-/* fightTest configures a test of how API Priority and Fairness config
-   controllers fight when they disagree on how to set FlowSchemaStatus.
-   In particular, they set the condition that indicates integrity of
-   the reference to the PriorityLevelConfiguration.  The scenario tested is
-   two teams of controllers, where the controllers in one team set the
-   condition normally and the controllers in the other team set the condition
-   to the opposite value.
+/*
+fightTest configures a test of how API Priority and Fairness config
 
-   This is a behavioral test: it instantiates these controllers and runs them
-   almost normally.  The test aims to run the controllers for a little under
-   2 minutes.  The test takes clock readings to get upper and lower bounds on
-   how long each controller ran, and calculates consequent bounds on the number
-   of writes that should happen to each FlowSchemaStatus.  The test creates
-   an informer to observe the writes.  The calculated lower bound on the
-   number of writes is very lax, assuming only that one write can be done
-   every 10 seconds.
+	controllers fight when they disagree on how to set FlowSchemaStatus.
+	In particular, they set the condition that indicates integrity of
+	the reference to the PriorityLevelConfiguration.  The scenario tested is
+	two teams of controllers, where the controllers in one team set the
+	condition normally and the controllers in the other team set the condition
+	to the opposite value.
+
+	This is a behavioral test: it instantiates these controllers and runs them
+	almost normally.  The test aims to run the controllers for a little under
+	2 minutes.  The test takes clock readings to get upper and lower bounds on
+	how long each controller ran, and calculates consequent bounds on the number
+	of writes that should happen to each FlowSchemaStatus.  The test creates
+	an informer to observe the writes.  The calculated lower bound on the
+	number of writes is very lax, assuming only that one write can be done
+	every 10 seconds.
 */
 type fightTest struct {
 	t              *testing.T
@@ -63,7 +63,7 @@ type fightTest struct {
 	teamSize       int
 	stopCh         chan struct{}
 	now            time.Time
-	clk            *clock.FakeClock
+	clk            *testclocks.FakeClock
 	ctlrs          map[bool][]utilfc.Interface
 
 	countsMutex sync.Mutex
@@ -81,7 +81,7 @@ func newFightTest(t *testing.T, loopbackConfig *rest.Config, teamSize int) *figh
 		teamSize:       teamSize,
 		stopCh:         make(chan struct{}),
 		now:            now,
-		clk:            clock.NewFakeClock(now),
+		clk:            testclocks.NewFakeClock(now),
 		ctlrs: map[bool][]utilfc.Interface{
 			false: make([]utilfc.Interface, teamSize),
 			true:  make([]utilfc.Interface, teamSize)},
@@ -95,7 +95,7 @@ func (ft *fightTest) createMainInformer() {
 	myConfig = rest.AddUserAgent(myConfig, "audience")
 	myClientset := clientset.NewForConfigOrDie(myConfig)
 	informerFactory := informers.NewSharedInformerFactory(myClientset, 0)
-	inf := informerFactory.Flowcontrol().V1beta1().FlowSchemas().Informer()
+	inf := informerFactory.Flowcontrol().V1().FlowSchemas().Informer()
 	inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			fs := obj.(*flowcontrol.FlowSchema)
@@ -123,7 +123,7 @@ func (ft *fightTest) createController(invert bool, i int) {
 	myConfig := rest.CopyConfig(ft.loopbackConfig)
 	myConfig = rest.AddUserAgent(myConfig, fieldMgr)
 	myClientset := clientset.NewForConfigOrDie(myConfig)
-	fcIfc := myClientset.FlowcontrolV1beta1()
+	fcIfc := myClientset.FlowcontrolV1()
 	informerFactory := informers.NewSharedInformerFactory(myClientset, 0)
 	foundToDangling := func(found bool) bool { return !found }
 	if invert {
@@ -136,9 +136,9 @@ func (ft *fightTest) createController(invert bool, i int) {
 		AsFieldManager:         fieldMgr,
 		InformerFactory:        informerFactory,
 		FlowcontrolClient:      fcIfc,
-		ServerConcurrencyLimit: 200,             // server concurrency limit
-		RequestWaitLimit:       time.Minute / 4, // request wait limit
-		ObsPairGenerator:       metrics.PriorityLevelConcurrencyObserverPairGenerator,
+		ServerConcurrencyLimit: 200, // server concurrency limit
+		ReqsGaugeVec:           metrics.PriorityLevelConcurrencyGaugeVec,
+		ExecSeatsGaugeVec:      metrics.PriorityLevelExecutionSeatsGaugeVec,
 		QueueSetFactory:        fqtesting.NewNoRestraintFactory(),
 	})
 	ft.ctlrs[invert][i] = ctlr
@@ -167,11 +167,10 @@ func (ft *fightTest) evaluate(tBeforeCreate, tAfterCreate time.Time) {
 	}
 }
 func TestConfigConsumerFight(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.APIPriorityAndFairness, true)()
-	_, loopbackConfig, closeFn := setup(t, 100, 100)
+	_, kubeConfig, closeFn := setup(t, 100, 100)
 	defer closeFn()
 	const teamSize = 3
-	ft := newFightTest(t, loopbackConfig, teamSize)
+	ft := newFightTest(t, kubeConfig, teamSize)
 	tBeforeCreate := time.Now()
 	ft.createMainInformer()
 	ft.foreach(ft.createController)

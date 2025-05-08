@@ -20,7 +20,6 @@ import (
 	"reflect"
 	"testing"
 
-	fuzz "github.com/google/gofuzz"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metafuzzer "k8s.io/apimachinery/pkg/apis/meta/fuzzer"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/randfill"
 )
 
 func TestAPIObjectMeta(t *testing.T) {
@@ -147,7 +147,7 @@ func TestGenericTypeMeta(t *testing.T) {
 		Name              string                  `json:"name,omitempty"`
 		GenerateName      string                  `json:"generateName,omitempty"`
 		UID               string                  `json:"uid,omitempty"`
-		CreationTimestamp metav1.Time             `json:"creationTimestamp,omitempty"`
+		CreationTimestamp metav1.Time             `json:"creationTimestamp,omitempty,omitzero"`
 		SelfLink          string                  `json:"selfLink,omitempty"`
 		ResourceVersion   string                  `json:"resourceVersion,omitempty"`
 		APIVersion        string                  `json:"apiVersion,omitempty"`
@@ -298,51 +298,6 @@ func TestResourceVersionerOfAPI(t *testing.T) {
 	}
 }
 
-func TestTypeMetaSelfLinker(t *testing.T) {
-	table := map[string]struct {
-		obj     runtime.Object
-		expect  string
-		try     string
-		succeed bool
-	}{
-		"normal": {
-			obj:     &MyAPIObject{TypeMeta: InternalTypeMeta{SelfLink: "foobar"}},
-			expect:  "foobar",
-			try:     "newbar",
-			succeed: true,
-		},
-		"fail": {
-			obj:     &MyIncorrectlyMarkedAsAPIObject{},
-			succeed: false,
-		},
-	}
-
-	linker := runtime.SelfLinker(meta.NewAccessor())
-	for name, item := range table {
-		got, err := linker.SelfLink(item.obj)
-		if e, a := item.succeed, err == nil; e != a {
-			t.Errorf("%v: expected %v, got %v", name, e, a)
-		}
-		if e, a := item.expect, got; item.succeed && e != a {
-			t.Errorf("%v: expected %v, got %v", name, e, a)
-		}
-
-		err = linker.SetSelfLink(item.obj, item.try)
-		if e, a := item.succeed, err == nil; e != a {
-			t.Errorf("%v: expected %v, got %v", name, e, a)
-		}
-		if item.succeed {
-			got, err := linker.SelfLink(item.obj)
-			if err != nil {
-				t.Errorf("%v: expected no err, got %v", name, err)
-			}
-			if e, a := item.try, got; e != a {
-				t.Errorf("%v: expected %v, got %v", name, e, a)
-			}
-		}
-	}
-}
-
 type MyAPIObject2 struct {
 	metav1.TypeMeta
 	metav1.ObjectMeta
@@ -351,7 +306,7 @@ type MyAPIObject2 struct {
 func getObjectMetaAndOwnerReferences() (myAPIObject2 MyAPIObject2, metaOwnerReferences []metav1.OwnerReference) {
 	scheme := runtime.NewScheme()
 	codecs := serializer.NewCodecFactory(scheme)
-	fuzz.New().NilChance(.5).NumElements(1, 5).Funcs(metafuzzer.Funcs(codecs)...).MaxDepth(10).Fuzz(&myAPIObject2)
+	randfill.New().NilChance(.5).NumElements(1, 5).Funcs(metafuzzer.Funcs(codecs)...).MaxDepth(10).Fill(&myAPIObject2)
 	references := myAPIObject2.ObjectMeta.OwnerReferences
 	// This is necessary for the test to pass because the getter will return a
 	// non-nil slice.

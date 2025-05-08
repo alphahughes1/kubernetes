@@ -21,7 +21,9 @@ import (
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/flowcontrol"
@@ -47,10 +49,16 @@ func (priorityLevelConfigurationStrategy) NamespaceScoped() bool {
 // and should not be modified by the user.
 func (priorityLevelConfigurationStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
 	fields := map[fieldpath.APIVersion]*fieldpath.Set{
-		"flowcontrol.apiserver.k8s.io/v1alpha1": fieldpath.NewSet(
+		"flowcontrol.apiserver.k8s.io/v1beta1": fieldpath.NewSet(
 			fieldpath.MakePathOrDie("status"),
 		),
-		"flowcontrol.apiserver.k8s.io/v1beta1": fieldpath.NewSet(
+		"flowcontrol.apiserver.k8s.io/v1beta2": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+		"flowcontrol.apiserver.k8s.io/v1beta3": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+		"flowcontrol.apiserver.k8s.io/v1": fieldpath.NewSet(
 			fieldpath.MakePathOrDie("status"),
 		),
 	}
@@ -79,7 +87,15 @@ func (priorityLevelConfigurationStrategy) PrepareForUpdate(ctx context.Context, 
 
 // Validate validates a new priority-level.
 func (priorityLevelConfigurationStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
-	return validation.ValidatePriorityLevelConfiguration(obj.(*flowcontrol.PriorityLevelConfiguration))
+	// 1.28 server is not aware of the roundtrip annotation, and will
+	// default any 0 value persisted (for the NominalConcurrencyShares
+	// field of a priority level configuration object) back to 30 when
+	// reading from etcd.
+	// That means we should not allow 0 values to be introduced, either
+	// via v1 or v1beta3(with the roundtrip annotation) until we know
+	// all servers are at 1.29+ and will honor the zero value correctly.
+	opts := validation.PriorityLevelValidationOptions{}
+	return validation.ValidatePriorityLevelConfiguration(obj.(*flowcontrol.PriorityLevelConfiguration), getRequestGroupVersion(ctx), opts)
 }
 
 // WarningsOnCreate returns warnings for the creation of the given object.
@@ -102,7 +118,17 @@ func (priorityLevelConfigurationStrategy) AllowCreateOnUpdate() bool {
 
 // ValidateUpdate is the default update validation for an end user.
 func (priorityLevelConfigurationStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
-	return validation.ValidatePriorityLevelConfiguration(obj.(*flowcontrol.PriorityLevelConfiguration))
+	newPL := obj.(*flowcontrol.PriorityLevelConfiguration)
+
+	// 1.28 server is not aware of the roundtrip annotation, and will
+	// default any 0 value persisted (for the NominalConcurrencyShares
+	// field of a priority level configuration object) back to 30 when
+	// reading from etcd.
+	// That means we should not allow 0 values to be introduced, either
+	// via v1 or v1beta3(with the roundtrip annotation) until we know
+	// all servers are at 1.29+ and will honor the zero value correctly.
+	opts := validation.PriorityLevelValidationOptions{}
+	return validation.ValidatePriorityLevelConfiguration(newPL, getRequestGroupVersion(ctx), opts)
 }
 
 // WarningsOnUpdate returns warnings for the given update.
@@ -121,11 +147,19 @@ var StatusStrategy = priorityLevelConfigurationStatusStrategy{Strategy}
 // and should not be modified by the user.
 func (priorityLevelConfigurationStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
 	fields := map[fieldpath.APIVersion]*fieldpath.Set{
-		"flowcontrol.apiserver.k8s.io/v1alpha1": fieldpath.NewSet(
+		"flowcontrol.apiserver.k8s.io/v1beta1": fieldpath.NewSet(
 			fieldpath.MakePathOrDie("spec"),
 			fieldpath.MakePathOrDie("metadata"),
 		),
-		"flowcontrol.apiserver.k8s.io/v1beta1": fieldpath.NewSet(
+		"flowcontrol.apiserver.k8s.io/v1beta2": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+			fieldpath.MakePathOrDie("metadata"),
+		),
+		"flowcontrol.apiserver.k8s.io/v1beta3": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+			fieldpath.MakePathOrDie("metadata"),
+		),
+		"flowcontrol.apiserver.k8s.io/v1": fieldpath.NewSet(
 			fieldpath.MakePathOrDie("spec"),
 			fieldpath.MakePathOrDie("metadata"),
 		),
@@ -153,4 +187,11 @@ func (priorityLevelConfigurationStatusStrategy) ValidateUpdate(ctx context.Conte
 // WarningsOnUpdate returns warnings for the given update.
 func (priorityLevelConfigurationStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
 	return nil
+}
+
+func getRequestGroupVersion(ctx context.Context) schema.GroupVersion {
+	if requestInfo, exists := genericapirequest.RequestInfoFrom(ctx); exists {
+		return schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
+	}
+	return schema.GroupVersion{}
 }

@@ -23,8 +23,8 @@ import (
 
 	"k8s.io/klog/v2"
 
-	autoscaling "k8s.io/api/autoscaling/v2beta2"
-	"k8s.io/api/core/v1"
+	autoscaling "k8s.io/api/autoscaling/v2"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -48,8 +48,8 @@ func NewRESTMetricsClient(resourceClient resourceclient.PodMetricsesGetter, cust
 }
 
 // restMetricsClient is a client which supports fetching
-// metrics from both the resource metrics API and the
-// custom metrics API.
+// metrics from the resource metrics API, the
+// custom metrics API and the external metrics API.
 type restMetricsClient struct {
 	*resourceMetricsClient
 	*customMetricsClient
@@ -64,8 +64,8 @@ type resourceMetricsClient struct {
 
 // GetResourceMetric gets the given resource metric (and an associated oldest timestamp)
 // for all pods matching the specified selector in the given namespace
-func (c *resourceMetricsClient) GetResourceMetric(resource v1.ResourceName, namespace string, selector labels.Selector, container string) (PodMetricsInfo, time.Time, error) {
-	metrics, err := c.client.PodMetricses(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
+func (c *resourceMetricsClient) GetResourceMetric(ctx context.Context, resource v1.ResourceName, namespace string, selector labels.Selector, container string) (PodMetricsInfo, time.Time, error) {
+	metrics, err := c.client.PodMetricses(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("unable to fetch metrics from resource metrics API: %v", err)
 	}
@@ -75,18 +75,15 @@ func (c *resourceMetricsClient) GetResourceMetric(resource v1.ResourceName, name
 	}
 	var res PodMetricsInfo
 	if container != "" {
-		res, err = getContainerMetrics(metrics.Items, resource, container)
-		if err != nil {
-			return nil, time.Time{}, fmt.Errorf("failed to get container metrics: %v", err)
-		}
+		res = getContainerMetrics(ctx, metrics.Items, resource, container)
 	} else {
-		res = getPodMetrics(metrics.Items, resource)
+		res = getPodMetrics(ctx, metrics.Items, resource)
 	}
 	timestamp := metrics.Items[0].Timestamp.Time
 	return res, timestamp, nil
 }
 
-func getContainerMetrics(rawMetrics []metricsapi.PodMetrics, resource v1.ResourceName, container string) (PodMetricsInfo, error) {
+func getContainerMetrics(ctx context.Context, rawMetrics []metricsapi.PodMetrics, resource v1.ResourceName, container string) PodMetricsInfo {
 	res := make(PodMetricsInfo, len(rawMetrics))
 	for _, m := range rawMetrics {
 		containerFound := false
@@ -104,13 +101,13 @@ func getContainerMetrics(rawMetrics []metricsapi.PodMetrics, resource v1.Resourc
 			}
 		}
 		if !containerFound {
-			return nil, fmt.Errorf("container %s not present in metrics for pod %s/%s", container, m.Namespace, m.Name)
+			klog.FromContext(ctx).V(2).Info("Missing container metric", "container", container, "pod", klog.KRef(m.Namespace, m.Name))
 		}
 	}
-	return res, nil
+	return res
 }
 
-func getPodMetrics(rawMetrics []metricsapi.PodMetrics, resource v1.ResourceName) PodMetricsInfo {
+func getPodMetrics(ctx context.Context, rawMetrics []metricsapi.PodMetrics, resource v1.ResourceName) PodMetricsInfo {
 	res := make(PodMetricsInfo, len(rawMetrics))
 	for _, m := range rawMetrics {
 		podSum := int64(0)
@@ -119,7 +116,7 @@ func getPodMetrics(rawMetrics []metricsapi.PodMetrics, resource v1.ResourceName)
 			resValue, found := c.Usage[resource]
 			if !found {
 				missing = true
-				klog.V(2).Infof("missing resource metric %v for %s/%s", resource, m.Namespace, m.Name)
+				klog.FromContext(ctx).V(2).Info("Missing resource metric", "resourceMetric", resource, "pod", klog.KRef(m.Namespace, m.Name))
 				break
 			}
 			podSum += resValue.MilliValue()

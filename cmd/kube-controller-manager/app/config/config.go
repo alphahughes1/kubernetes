@@ -21,21 +21,24 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
+	basecompatibility "k8s.io/component-base/compatibility"
+	"k8s.io/component-base/zpages/flagz"
 	kubectrlmgrconfig "k8s.io/kubernetes/pkg/controller/apis/config"
 )
 
 // Config is the main context object for the controller manager.
 type Config struct {
+	// Flagz is the Reader interface to get flags for the flagz page.
+	Flagz flagz.Reader
+
 	ComponentConfig kubectrlmgrconfig.KubeControllerManagerConfiguration
 
 	SecureServing *apiserver.SecureServingInfo
 	// LoopbackClientConfig is a config for a privileged loopback connection
 	LoopbackClientConfig *restclient.Config
 
-	// TODO: remove deprecated insecure serving
-	InsecureServing *apiserver.DeprecatedInsecureServingInfo
-	Authentication  apiserver.AuthenticationInfo
-	Authorization   apiserver.AuthorizationInfo
+	Authentication apiserver.AuthenticationInfo
+	Authorization  apiserver.AuthorizationInfo
 
 	// the general kube client
 	Client *clientset.Clientset
@@ -43,8 +46,11 @@ type Config struct {
 	// the rest config for the master
 	Kubeconfig *restclient.Config
 
-	// the event sink
-	EventRecorder record.EventRecorder
+	EventBroadcaster record.EventBroadcaster
+	EventRecorder    record.EventRecorder
+
+	// ComponentGlobalsRegistry is the registry where the effective versions and feature gates for all components are stored.
+	ComponentGlobalsRegistry basecompatibility.ComponentGlobalsRegistry
 }
 
 type completedConfig struct {

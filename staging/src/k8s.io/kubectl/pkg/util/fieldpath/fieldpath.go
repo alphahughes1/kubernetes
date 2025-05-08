@@ -30,11 +30,11 @@ import (
 // FormatMap formats map[string]string to a string.
 func FormatMap(m map[string]string) (fmtStr string) {
 	// output with keys in sorted order to provide stable output
-	keys := sets.NewString()
+	keys := sets.New[string]()
 	for key := range m {
 		keys.Insert(key)
 	}
-	for _, key := range keys.List() {
+	for _, key := range sets.List(keys) {
 		fmtStr += fmt.Sprintf("%v=%q\n", key, m[key])
 	}
 	fmtStr = strings.TrimSuffix(fmtStr, "\n")
@@ -86,15 +86,16 @@ func ExtractFieldPathAsString(obj interface{}, fieldPath string) (string, error)
 
 // SplitMaybeSubscriptedPath checks whether the specified fieldPath is
 // subscripted, and
-//  - if yes, this function splits the fieldPath into path and subscript, and
-//    returns (path, subscript, true).
-//  - if no, this function returns (fieldPath, "", false).
+//   - if yes, this function splits the fieldPath into path and subscript, and
+//     returns (path, subscript, true).
+//   - if no, this function returns (fieldPath, "", false).
 //
 // Example inputs and outputs:
-//  - "metadata.annotations['myKey']" --> ("metadata.annotations", "myKey", true)
-//  - "metadata.annotations['a[b]c']" --> ("metadata.annotations", "a[b]c", true)
-//  - "metadata.labels['']"           --> ("metadata.labels", "", true)
-//  - "metadata.labels"               --> ("metadata.labels", "", false)
+//
+//	"metadata.annotations['myKey']" --> ("metadata.annotations", "myKey", true)
+//	"metadata.annotations['a[b]c']" --> ("metadata.annotations", "a[b]c", true)
+//	"metadata.labels['']"           --> ("metadata.labels", "", true)
+//	"metadata.labels"               --> ("metadata.labels", "", false)
 func SplitMaybeSubscriptedPath(fieldPath string) (string, string, bool) {
 	if !strings.HasSuffix(fieldPath, "']") {
 		return fieldPath, "", false

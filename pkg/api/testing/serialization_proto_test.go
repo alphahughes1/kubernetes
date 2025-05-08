@@ -80,7 +80,7 @@ func TestAllFieldsHaveTags(t *testing.T) {
 
 func fieldsHaveProtobufTags(obj reflect.Type) error {
 	switch obj.Kind() {
-	case reflect.Slice, reflect.Map, reflect.Ptr, reflect.Array:
+	case reflect.Slice, reflect.Map, reflect.Pointer, reflect.Array:
 		return fieldsHaveProtobufTags(obj.Elem())
 	case reflect.Struct:
 		for i := 0; i < obj.NumField(); i++ {
@@ -99,7 +99,7 @@ func fieldsHaveProtobufTags(obj reflect.Type) error {
 
 func TestProtobufRoundTrip(t *testing.T) {
 	obj := &v1.Pod{}
-	fuzzer.FuzzerFor(FuzzerFuncs, rand.NewSource(benchmarkSeed), legacyscheme.Codecs).Fuzz(obj)
+	fuzzer.FuzzerFor(FuzzerFuncs, rand.NewSource(benchmarkSeed), legacyscheme.Codecs).Fill(obj)
 	// InitContainers are turned into annotations by conversion.
 	obj.Spec.InitContainers = nil
 	obj.Status.InitContainerStatuses = nil

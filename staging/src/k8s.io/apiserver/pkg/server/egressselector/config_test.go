@@ -18,10 +18,12 @@ package egressselector
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
+
+	utiltesting "k8s.io/client-go/util/testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/apis/apiserver"
@@ -51,7 +53,39 @@ func TestReadEgressSelectorConfiguration(t *testing.T) {
 			createFile:     false,
 			contents:       ``,
 			expectedResult: nil,
-			expectedError:  strptr("unable to read egress selector configuration from \"test-egress-selector-config-absent\" [open test-egress-selector-config-absent: no such file or directory]"),
+			expectedError:  strptr("errors.errorString{s:\"unable to read egress selector configuration"),
+		},
+		{
+			name:       "unknown field causes error",
+			createFile: false,
+			contents: `
+apiVersion: apiserver.k8s.io/v1beta1
+kind: EgressSelectorConfiguration
+egressSelections:
+- name: "etcd"
+  connection:
+    proxyProtocol: "Direct"
+  foo:
+    bar: "baz"
+`,
+			expectedResult: nil,
+			expectedError:  strptr("runtime.strictDecodingError"),
+		},
+		{
+			name:       "duplicate field causes error",
+			createFile: false,
+			contents: `
+apiVersion: apiserver.k8s.io/v1beta1
+kind: EgressSelectorConfiguration
+egressSelections:
+- name: "etcd"
+  connection:
+    proxyProtocol: "Direct"
+  connection:
+    proxyProtocol: "Indirect"
+`,
+			expectedResult: nil,
+			expectedError:  strptr("runtime.strictDecodingError"),
 		},
 		{
 			name:       "v1beta1",
@@ -188,7 +222,7 @@ egressSelections:
 						},
 					},
 					{
-						Name: "master",
+						Name: "controlplane",
 						Connection: apiserver.Connection{
 							ProxyProtocol: "HTTPConnect",
 							Transport: &apiserver.Transport{
@@ -244,7 +278,7 @@ spec:
           hostPath:
             path: /etc/srv/kubernetes/pki/konnectivity-agent
       containers:
-        - image: k8s.gcr.io/proxy-agent:v0.0.3
+        - image: registry.k8s.io/proxy-agent:v0.0.3
           name: proxy-agent
           command: ["/proxy-agent"]
           args: ["--caCert=/etc/srv/kubernetes/pki/proxy-agent/ca.crt", "--agentCert=/etc/srv/kubernetes/pki/proxy-agent/client.crt", "--agentKey=/etc/srv/kubernetes/pki/proxy-agent/client.key", "--proxyServerHost=127.0.0.1", "--proxyServerPort=8132"]
@@ -277,12 +311,12 @@ spec:
 		t.Run(tc.name, func(t *testing.T) {
 			proxyConfig := fmt.Sprintf("test-egress-selector-config-%s", tc.name)
 			if tc.createFile {
-				f, err := ioutil.TempFile("", proxyConfig)
+				f, err := os.CreateTemp("", proxyConfig)
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer os.Remove(f.Name())
-				if err := ioutil.WriteFile(f.Name(), []byte(tc.contents), os.FileMode(0755)); err != nil {
+				defer utiltesting.CloseAndRemove(t, f)
+				if err := os.WriteFile(f.Name(), []byte(tc.contents), os.FileMode(0755)); err != nil {
 					t.Fatal(err)
 				}
 				proxyConfig = f.Name()
@@ -294,7 +328,7 @@ spec:
 			if err != nil && tc.expectedError == nil {
 				t.Errorf("unexpected error calling ReadEgressSelectorConfiguration got: %#v", err)
 			}
-			if err != nil && tc.expectedError != nil && err.Error() != *tc.expectedError {
+			if err != nil && tc.expectedError != nil && strings.Contains(err.Error(), *tc.expectedError) {
 				t.Errorf("calling ReadEgressSelectorConfiguration expected error: %s, got %#v", *tc.expectedError, err)
 			}
 			if !reflect.DeepEqual(config, tc.expectedResult) {
@@ -338,7 +372,7 @@ func TestValidateEgressSelectorConfiguration(t *testing.T) {
 				},
 				EgressSelections: []apiserver.EgressSelection{
 					{
-						Name: "master",
+						Name: "controlplane",
 						Connection: apiserver.Connection{
 							ProxyProtocol: apiserver.ProtocolDirect,
 							Transport:     &apiserver.Transport{},
@@ -512,7 +546,7 @@ func TestValidateEgressSelectorConfiguration(t *testing.T) {
 			},
 		},
 		{
-			name:        "both master and controlplane egress selection configured",
+			name:        "duplicate egress selections configured",
 			expectError: true,
 			contents: &apiserver.EgressSelectorConfiguration{
 				TypeMeta: metav1.TypeMeta{
@@ -527,7 +561,7 @@ func TestValidateEgressSelectorConfiguration(t *testing.T) {
 						},
 					},
 					{
-						Name: "master",
+						Name: "controlplane",
 						Connection: apiserver.Connection{
 							ProxyProtocol: apiserver.ProtocolDirect,
 						},
@@ -540,9 +574,9 @@ func TestValidateEgressSelectorConfiguration(t *testing.T) {
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
 			errs := ValidateEgressSelectorConfiguration(tc.contents)
-			if tc.expectError == false && len(errs) != 0 {
+			if !tc.expectError && len(errs) != 0 {
 				t.Errorf("Calling ValidateEgressSelectorConfiguration expected no error, got %v", errs)
-			} else if tc.expectError == true && len(errs) == 0 {
+			} else if tc.expectError && len(errs) == 0 {
 				t.Errorf("Calling ValidateEgressSelectorConfiguration expected error, got no error")
 			}
 		})

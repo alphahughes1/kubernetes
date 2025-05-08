@@ -1,0 +1,19 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
+reviewers:
+  - dims
+  - spiffxp
+  - bentheelder
+  - johnSchnake
+approvers:
+  - dims
+  - spiffxp
+  - bentheelder
+emeritus_approvers:
+  - ixdy
+  - timothysc
+  - neolit123
+labels:
+  - sig/release
+  - sig/testing
+  - area/conformance

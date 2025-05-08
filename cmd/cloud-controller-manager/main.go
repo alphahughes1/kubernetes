@@ -18,44 +18,39 @@ limitations under the License.
 // are cloud provider dependent. It uses the API to listen to new events on resources.
 
 // This file should be written by each cloud provider.
-// For an minimal working example, please refer to k8s.io/cloud-provider/sample/basic_main.go
+// For a minimal working example, please refer to k8s.io/cloud-provider/sample/basic_main.go
 // For more details, please refer to k8s.io/kubernetes/cmd/cloud-controller-manager/main.go
 // The current file demonstrate how other cloud provider should leverage CCM and it uses fake parameters. Please modify for your own use.
 
 package main
 
 import (
-	"math/rand"
 	"os"
-	"time"
-
-	"github.com/spf13/pflag"
 
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/cloud-provider"
+	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/cloud-provider/app"
 	cloudcontrollerconfig "k8s.io/cloud-provider/app/config"
+	"k8s.io/cloud-provider/names"
 	"k8s.io/cloud-provider/options"
+	"k8s.io/component-base/cli"
 	cliflag "k8s.io/component-base/cli/flag"
-	"k8s.io/component-base/logs"
 	_ "k8s.io/component-base/metrics/prometheus/clientgo" // load all the prometheus client-go plugins
 	_ "k8s.io/component-base/metrics/prometheus/version"  // for version metric registration
 	"k8s.io/klog/v2"
+	kcmnames "k8s.io/kubernetes/cmd/kube-controller-manager/names"
 	// For existing cloud providers, the option to import legacy providers is still available.
 	// e.g. _"k8s.io/legacy-cloud-providers/<provider>"
 )
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
-	pflag.CommandLine.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
-
 	ccmOptions, err := options.NewCloudControllerManagerOptions()
 	if err != nil {
 		klog.Fatalf("unable to initialize command options: %v", err)
 	}
 
 	controllerInitializers := app.DefaultInitFuncConstructors
+	controllerAliases := names.CCMControllerAliases()
 	// Here is an example to remove the controller which is not needed.
 	// e.g. remove the cloud-node-lifecycle controller which current cloud provider does not need.
 	//delete(controllerInitializers, "cloud-node-lifecycle")
@@ -67,17 +62,21 @@ func main() {
 	nodeIpamController := nodeIPAMController{}
 	nodeIpamController.nodeIPAMControllerOptions.NodeIPAMControllerConfiguration = &nodeIpamController.nodeIPAMControllerConfiguration
 	fss := cliflag.NamedFlagSets{}
-	nodeIpamController.nodeIPAMControllerOptions.AddFlags(fss.FlagSet("nodeipam controller"))
-	controllerInitializers["nodeipam"] = nodeIpamController.startNodeIpamControllerWrapper
+	nodeIpamController.nodeIPAMControllerOptions.AddFlags(fss.FlagSet(kcmnames.NodeIpamController))
 
-	command := app.NewCloudControllerManagerCommand(ccmOptions, cloudInitializer, controllerInitializers, fss, wait.NeverStop)
-
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
-	if err := command.Execute(); err != nil {
-		os.Exit(1)
+	controllerInitializers[kcmnames.NodeIpamController] = app.ControllerInitFuncConstructor{
+		// "node-controller" is the shared identity of all node controllers, including node, node lifecycle, and node ipam.
+		// See https://github.com/kubernetes/kubernetes/pull/72764#issuecomment-453300990 for more context.
+		InitContext: app.ControllerInitContext{
+			ClientName: "node-controller",
+		},
+		Constructor: nodeIpamController.StartNodeIpamControllerWrapper,
 	}
+	controllerAliases["nodeipam"] = kcmnames.NodeIpamController
+
+	command := app.NewCloudControllerManagerCommand(ccmOptions, cloudInitializer, controllerInitializers, controllerAliases, fss, wait.NeverStop)
+	code := cli.Run(command)
+	os.Exit(code)
 }
 
 func cloudInitializer(config *cloudcontrollerconfig.CompletedConfig) cloudprovider.Interface {

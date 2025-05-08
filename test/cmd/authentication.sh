@@ -19,10 +19,17 @@ set -o nounset
 set -o pipefail
 
 run_exec_credentials_tests() {
+  run_exec_credentials_tests_version client.authentication.k8s.io/v1beta1
+  run_exec_credentials_tests_version client.authentication.k8s.io/v1
+}
+
+run_exec_credentials_tests_version() {
   set -o nounset
   set -o errexit
 
-  kube::log::status "Testing kubectl with configured exec credentials plugin"
+  local -r apiVersion="$1"
+
+  kube::log::status "Testing kubectl with configured ${apiVersion} exec credentials plugin"
 
   cat > "${TMPDIR:-/tmp}"/invalid_exec_plugin.yaml << EOF
 apiVersion: v1
@@ -41,9 +48,10 @@ users:
 - name: invalid_token_user
   user:
     exec:
-      apiVersion: client.authentication.k8s.io/v1beta1
+      apiVersion: ${apiVersion}
       # Any invalid exec credential plugin will do to demonstrate
       command: ls
+      interactiveMode: IfAvailable
 EOF
 
   ### Provided --token should take precedence, thus not triggering the (invalid) exec credential plugin
@@ -56,7 +64,7 @@ EOF
     kube::log::status "exec credential plugin not triggered since kubectl was called with provided --token"
   else
     kube::log::status "Unexpected output when providing --token for authentication - exec credential plugin likely triggered. Output: ${output}"
-    exit 1    
+    exit 1
   fi
   # Post-condition: None
 
@@ -74,7 +82,7 @@ EOF
   fi
   # Post-condition: None
 
-  cat > "${TMPDIR:-/tmp}"/valid_exec_plugin.yaml << EOF
+  cat >"${TMPDIR:-/tmp}"/valid_exec_plugin.yaml <<EOF
 apiVersion: v1
 clusters:
 - cluster:
@@ -91,10 +99,11 @@ users:
 - name: valid_token_user
   user:
     exec:
-      apiVersion: client.authentication.k8s.io/v1beta1
+      apiVersion: ${apiVersion}
       command: echo
       args:
-        - '{"apiVersion":"client.authentication.k8s.io/v1beta1","status":{"token":"admin-token"}}'
+        - '{"apiVersion":"${apiVersion}","status":{"token":"admin-token"}}'
+      interactiveMode: IfAvailable
 EOF
 
   ### Valid exec plugin should authenticate user properly
@@ -125,6 +134,54 @@ EOF
   fi
   # Post-condition: None
 
+  ### Provided --client-certificate/--client-key should take precedence on the cli, thus not triggering the (invalid) exec credential plugin
+  # contained in the kubeconfig.
+
+  # Use CSR to get a valid certificate
+  cat <<EOF | kubectl create -f -
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: testuser
+spec:
+  request: $(base64 < hack/testdata/auth/testuser.csr | tr -d '\n')
+  signerName: kubernetes.io/kube-apiserver-client
+  usages: [client auth]
+EOF
+
+  kube::test::wait_object_assert 'csr/testuser' '{{range.status.conditions}}{{.type}}{{end}}' ''
+  kubectl certificate approve testuser
+  kube::test::wait_object_assert 'csr/testuser' '{{range.status.conditions}}{{.type}}{{end}}' 'Approved'
+  # wait for certificate to not be empty
+  kube::test::wait_object_assert 'csr/testuser' '{{.status.certificate}}' '.+'
+  kubectl get csr testuser -o jsonpath='{.status.certificate}' | base64 -d > "${TMPDIR:-/tmp}"/testuser.crt
+
+  output5=$(kubectl  "${kube_flags_without_token[@]:?}" --client-certificate="${TMPDIR:-/tmp}"/testuser.crt --client-key="hack/testdata/auth/testuser.key" --kubeconfig="${TMPDIR:-/tmp}"/invalid_exec_plugin.yaml get namespace kube-system -o name)
+  if [[ "${output5}" =~ "Unauthorized" ]]; then
+    kube::log::status "Unexpected output when providing --client-certificate/--client-key for authentication - exec credential plugin likely triggered. Output: ${output5}"
+    exit 1
+  else
+    kube::log::status "exec credential plugin not triggered since kubectl was called with provided --client-certificate/--client-key"
+  fi
+
+    ### Provided --client-certificate/--client-key should take precedence in the kubeconfig, thus not triggering the (invalid) exec credential plugin.
+  cat >"${TMPDIR:-/tmp}"/invalid_execcredential.sh <<EOF
+#!/bin/bash
+echo '{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1beta1","status":{"clientKeyData":"bad","clientCertificateData":"bad"}}'
+EOF
+  chmod +x "${TMPDIR:-/tmp}"/invalid_execcredential.sh
+
+  kubectl config set-credentials testuser --client-certificate="${TMPDIR:-/tmp}"/testuser.crt --client-key="hack/testdata/auth/testuser.key" --exec-api-version=client.authentication.k8s.io/v1beta1 --exec-command=/tmp/invalid_execcredential.sh
+  output6=$(kubectl  "${kube_flags_without_token[@]:?}" --user testuser get namespace kube-system -o name)
+  if [[ "${output6}" =~ "Unauthorized" ]]; then
+    kube::log::status "Unexpected output when kubeconfig was configured with --client-certificate/--client-key for authentication - exec credential plugin likely triggered. Output: ${output6}"
+    exit 1
+  else
+    kube::log::status "exec credential plugin not triggered since kubeconfig was configured with --client-certificate/--client-key for authentication"
+  fi
+
+  kubectl delete csr testuser
+  rm "${TMPDIR:-/tmp}"/invalid_execcredential.sh
   rm "${TMPDIR:-/tmp}"/invalid_exec_plugin.yaml
   rm "${TMPDIR:-/tmp}"/valid_exec_plugin.yaml
 
@@ -133,12 +190,19 @@ EOF
 }
 
 run_exec_credentials_interactive_tests() {
+  run_exec_credentials_interactive_tests_version client.authentication.k8s.io/v1beta1
+  run_exec_credentials_interactive_tests_version client.authentication.k8s.io/v1
+}
+
+run_exec_credentials_interactive_tests_version() {
   set -o nounset
   set -o errexit
 
-  kube::log::status "Testing kubectl with configured interactive exec credentials plugin"
+  local -r apiVersion="$1"
 
-  cat > "${TMPDIR:-/tmp}"/always_interactive_exec_plugin.yaml << EOF
+  kube::log::status "Testing kubectl with configured ${apiVersion} interactive exec credentials plugin"
+
+  cat >"${TMPDIR:-/tmp}"/always_interactive_exec_plugin.yaml <<EOF
 apiVersion: v1
 clusters:
 - cluster:
@@ -155,10 +219,10 @@ users:
 - name: always_interactive_token_user
   user:
     exec:
-      apiVersion: client.authentication.k8s.io/v1beta1
+      apiVersion: ${apiVersion}
       command: echo
       args:
-        - '{"apiVersion":"client.authentication.k8s.io/v1beta1","status":{"token":"admin-token"}}'
+        - '{"apiVersion":"${apiVersion}","status":{"token":"admin-token"}}'
       interactiveMode: Always
 EOF
 
@@ -209,10 +273,55 @@ EOF
   if [[ -n "$failure" ]]; then
     exit 1
   fi
+  # Post-condition: None
 
+  cat >"${TMPDIR:-/tmp}"/missing_interactive_exec_plugin.yaml <<EOF
+apiVersion: v1
+clusters:
+- cluster:
+  name: test
+contexts:
+- context:
+    cluster: test
+    user: missing_interactive_token_user
+  name: test
+current-context: test
+kind: Config
+preferences: {}
+users:
+- name: missing_interactive_token_user
+  user:
+    exec:
+      apiVersion: ${apiVersion}
+      command: echo
+      args:
+        - '{"apiVersion":"${apiVersion}","status":{"token":"admin-token"}}'
+EOF
+
+  ### The kubeconfig will fail to be loaded if a v1 exec credential plugin is missing an interactiveMode field, otherwise it will default to IfAvailable
+  # Pre-condition: The exec credential plugin is missing an interactiveMode setting
+
+  output2=$(kubectl "${kube_flags_without_token[@]:?}" --kubeconfig="${TMPDIR:-/tmp}"/missing_interactive_exec_plugin.yaml get namespace kube-system -o name 2>&1 || true)
+
+  if [[ "$apiVersion" == "client.authentication.k8s.io/v1" ]]; then
+    if [[ "${output2}" =~ "error: interactiveMode must be specified for missing_interactive_token_user to use exec authentication plugin" ]]; then
+      kube::log::status "kubeconfig was not loaded successfully because ${apiVersion} exec credential plugin is missing interactiveMode"
+    else
+      kube::log::status "Unexpected output when running kubectl command that uses a ${apiVersion} exec credential plugin without an interactiveMode. Output: ${output2}"
+      exit 1
+    fi
+  else
+    if [[ "${output2}" == "namespace/kube-system" ]]; then
+      kube::log::status "${apiVersion} exec credential plugin triggered and provided valid credentials"
+    else
+      kube::log::status "Unexpected output when using valid exec credential plugin for authentication. Output: ${output2}"
+      exit 1
+    fi
+  fi
   # Post-condition: None
 
   rm "${TMPDIR:-/tmp}"/always_interactive_exec_plugin.yaml
+  rm "${TMPDIR:-/tmp}"/missing_interactive_exec_plugin.yaml
 
   set +o nounset
   set +o errexit

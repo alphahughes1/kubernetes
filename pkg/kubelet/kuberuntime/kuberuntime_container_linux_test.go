@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -19,37 +20,53 @@ limitations under the License.
 package kuberuntime
 
 import (
+	"context"
+	"fmt"
+	"math"
+	"os"
 	"reflect"
+	"strconv"
 	"testing"
+	"time"
+
+	"k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/kubernetes/pkg/kubelet/types"
 
 	"github.com/google/go-cmp/cmp"
-	cgroupfs "github.com/opencontainers/runc/libcontainer/cgroups/fs"
+	libcontainercgroups "github.com/opencontainers/cgroups"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/kubernetes/pkg/apis/scheduling"
 	"k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	"k8s.io/utils/ptr"
 )
 
-func makeExpectedConfig(m *kubeGenericRuntimeManager, pod *v1.Pod, containerIndex int) *runtimeapi.ContainerConfig {
+func makeExpectedConfig(m *kubeGenericRuntimeManager, pod *v1.Pod, containerIndex int, enforceMemoryQoS bool) *runtimeapi.ContainerConfig {
+	ctx := context.Background()
 	container := &pod.Spec.Containers[containerIndex]
 	podIP := ""
 	restartCount := 0
-	opts, _, _ := m.runtimeHelper.GenerateRunContainerOptions(pod, container, podIP, []string{podIP})
+	opts, _, _ := m.runtimeHelper.GenerateRunContainerOptions(ctx, pod, container, podIP, []string{podIP}, nil)
 	containerLogsPath := buildContainerLogsPath(container.Name, restartCount)
+	stopsignal := getContainerConfigStopSignal(container)
 	restartCountUint32 := uint32(restartCount)
 	envs := make([]*runtimeapi.KeyValue, len(opts.Envs))
+
+	l, _ := m.generateLinuxContainerConfig(container, pod, new(int64), "", nil, enforceMemoryQoS)
 
 	expectedConfig := &runtimeapi.ContainerConfig{
 		Metadata: &runtimeapi.ContainerMetadata{
 			Name:    container.Name,
 			Attempt: restartCountUint32,
 		},
-		Image:       &runtimeapi.ImageSpec{Image: container.Image},
+		Image:       &runtimeapi.ImageSpec{Image: container.Image, UserSpecifiedImage: container.Image},
 		Command:     container.Command,
 		Args:        []string(nil),
 		WorkingDir:  container.WorkingDir,
@@ -61,13 +78,18 @@ func makeExpectedConfig(m *kubeGenericRuntimeManager, pod *v1.Pod, containerInde
 		Stdin:       container.Stdin,
 		StdinOnce:   container.StdinOnce,
 		Tty:         container.TTY,
-		Linux:       m.generateLinuxContainerConfig(container, pod, new(int64), "", nil),
+		Linux:       l,
 		Envs:        envs,
+		CDIDevices:  makeCDIDevices(opts),
+	}
+	if stopsignal != nil {
+		expectedConfig.StopSignal = *stopsignal
 	}
 	return expectedConfig
 }
 
 func TestGenerateContainerConfig(t *testing.T) {
+	ctx := context.Background()
 	_, imageService, m, err := createTestRuntimeManager()
 	assert.NoError(t, err)
 
@@ -96,8 +118,8 @@ func TestGenerateContainerConfig(t *testing.T) {
 		},
 	}
 
-	expectedConfig := makeExpectedConfig(m, pod, 0)
-	containerConfig, _, err := m.generateContainerConfig(&pod.Spec.Containers[0], pod, 0, "", pod.Spec.Containers[0].Image, []string{}, nil)
+	expectedConfig := makeExpectedConfig(m, pod, 0, false)
+	containerConfig, _, err := m.generateContainerConfig(ctx, &pod.Spec.Containers[0], pod, 0, "", pod.Spec.Containers[0].Image, []string{}, nil, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, expectedConfig, containerConfig, "generate container config for kubelet runtime v1.")
 	assert.Equal(t, runAsUser, containerConfig.GetLinux().GetSecurityContext().GetRunAsUser().GetValue(), "RunAsUser should be set")
@@ -128,27 +150,386 @@ func TestGenerateContainerConfig(t *testing.T) {
 		},
 	}
 
-	_, _, err = m.generateContainerConfig(&podWithContainerSecurityContext.Spec.Containers[0], podWithContainerSecurityContext, 0, "", podWithContainerSecurityContext.Spec.Containers[0].Image, []string{}, nil)
+	_, _, err = m.generateContainerConfig(ctx, &podWithContainerSecurityContext.Spec.Containers[0], podWithContainerSecurityContext, 0, "", podWithContainerSecurityContext.Spec.Containers[0].Image, []string{}, nil, nil)
 	assert.Error(t, err)
 
-	imageID, _ := imageService.PullImage(&runtimeapi.ImageSpec{Image: "busybox"}, nil, nil)
-	image, _ := imageService.ImageStatus(&runtimeapi.ImageSpec{Image: imageID})
+	imageID, _ := imageService.PullImage(ctx, &runtimeapi.ImageSpec{Image: "busybox"}, nil, nil)
+	resp, _ := imageService.ImageStatus(ctx, &runtimeapi.ImageSpec{Image: imageID}, false)
 
-	image.Uid = nil
-	image.Username = "test"
+	resp.Image.Uid = nil
+	resp.Image.Username = "test"
 
 	podWithContainerSecurityContext.Spec.Containers[0].SecurityContext.RunAsUser = nil
 	podWithContainerSecurityContext.Spec.Containers[0].SecurityContext.RunAsNonRoot = &runAsNonRootTrue
 
-	_, _, err = m.generateContainerConfig(&podWithContainerSecurityContext.Spec.Containers[0], podWithContainerSecurityContext, 0, "", podWithContainerSecurityContext.Spec.Containers[0].Image, []string{}, nil)
+	_, _, err = m.generateContainerConfig(ctx, &podWithContainerSecurityContext.Spec.Containers[0], podWithContainerSecurityContext, 0, "", podWithContainerSecurityContext.Spec.Containers[0].Image, []string{}, nil, nil)
 	assert.Error(t, err, "RunAsNonRoot should fail for non-numeric username")
+}
+
+func TestGenerateLinuxContainerConfigResources(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	m.cpuCFSQuota = true
+
+	assert.NoError(t, err)
+
+	tests := []struct {
+		name               string
+		containerResources v1.ResourceRequirements
+		podResources       *v1.ResourceRequirements
+		expected           *runtimeapi.LinuxContainerResources
+	}{
+		{
+			name: "Request 128M/1C, Limit 256M/3C",
+			containerResources: v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("128Mi"),
+					v1.ResourceCPU:    resource.MustParse("1"),
+				},
+				Limits: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("256Mi"),
+					v1.ResourceCPU:    resource.MustParse("3"),
+				},
+			},
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           300000,
+				CpuShares:          1024,
+				MemoryLimitInBytes: 256 * 1024 * 1024,
+			},
+		},
+		{
+			name: "Request 128M/2C, No Limit",
+			containerResources: v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("128Mi"),
+					v1.ResourceCPU:    resource.MustParse("2"),
+				},
+			},
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           0,
+				CpuShares:          2048,
+				MemoryLimitInBytes: 0,
+			},
+		},
+		{
+			name: "Container Level Request 128M/1C, Pod Level Limit 256M/3C",
+			containerResources: v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("128Mi"),
+					v1.ResourceCPU:    resource.MustParse("1"),
+				},
+			},
+			podResources: &v1.ResourceRequirements{
+				Limits: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("256Mi"),
+					v1.ResourceCPU:    resource.MustParse("3"),
+				},
+			},
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           300000,
+				CpuShares:          1024,
+				MemoryLimitInBytes: 256 * 1024 * 1024,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:       "12345678",
+				Name:      "bar",
+				Namespace: "new",
+			},
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{
+						Name:            "foo",
+						Image:           "busybox",
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Command:         []string{"testCommand"},
+						WorkingDir:      "testWorkingDir",
+						Resources:       test.containerResources,
+					},
+				},
+			},
+		}
+
+		if test.podResources != nil {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, true)
+			pod.Spec.Resources = test.podResources
+		}
+
+		linuxConfig, err := m.generateLinuxContainerConfig(&pod.Spec.Containers[0], pod, new(int64), "", nil, false)
+		assert.NoError(t, err)
+		assert.Equal(t, test.expected.CpuPeriod, linuxConfig.GetResources().CpuPeriod, test.name)
+		assert.Equal(t, test.expected.CpuQuota, linuxConfig.GetResources().CpuQuota, test.name)
+		assert.Equal(t, test.expected.CpuShares, linuxConfig.GetResources().CpuShares, test.name)
+		assert.Equal(t, test.expected.MemoryLimitInBytes, linuxConfig.GetResources().MemoryLimitInBytes, test.name)
+	}
+}
+
+func TestCalculateLinuxResources(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	m.cpuCFSQuota = true
+
+	assert.NoError(t, err)
+
+	generateResourceQuantity := func(str string) *resource.Quantity {
+		quantity := resource.MustParse(str)
+		return &quantity
+	}
+
+	tests := []struct {
+		name                 string
+		cpuReq               *resource.Quantity
+		cpuLim               *resource.Quantity
+		memLim               *resource.Quantity
+		expected             *runtimeapi.LinuxContainerResources
+		cgroupVersion        CgroupVersion
+		singleProcessOOMKill bool
+	}{
+		{
+			name:   "Request128MBLimit256MB",
+			cpuReq: generateResourceQuantity("1"),
+			cpuLim: generateResourceQuantity("2"),
+			memLim: generateResourceQuantity("128Mi"),
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           200000,
+				CpuShares:          1024,
+				MemoryLimitInBytes: 134217728,
+			},
+			cgroupVersion: cgroupV1,
+		},
+		{
+			name:   "RequestNoMemory",
+			cpuReq: generateResourceQuantity("2"),
+			cpuLim: generateResourceQuantity("8"),
+			memLim: generateResourceQuantity("0"),
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           800000,
+				CpuShares:          2048,
+				MemoryLimitInBytes: 0,
+			},
+			cgroupVersion: cgroupV1,
+		},
+		{
+			name:   "RequestNilCPU",
+			cpuLim: generateResourceQuantity("2"),
+			memLim: generateResourceQuantity("0"),
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           200000,
+				CpuShares:          2048,
+				MemoryLimitInBytes: 0,
+			},
+			cgroupVersion: cgroupV1,
+		},
+		{
+			name:   "RequestZeroCPU",
+			cpuReq: generateResourceQuantity("0"),
+			cpuLim: generateResourceQuantity("2"),
+			memLim: generateResourceQuantity("0"),
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           200000,
+				CpuShares:          2,
+				MemoryLimitInBytes: 0,
+			},
+			cgroupVersion: cgroupV1,
+		},
+		{
+			name:   "Request128MBLimit256MB",
+			cpuReq: generateResourceQuantity("1"),
+			cpuLim: generateResourceQuantity("2"),
+			memLim: generateResourceQuantity("128Mi"),
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           200000,
+				CpuShares:          1024,
+				MemoryLimitInBytes: 134217728,
+				Unified:            map[string]string{"memory.oom.group": "1"},
+			},
+			cgroupVersion: cgroupV2,
+		},
+		{
+			name:   "Request128MBLimit256MBSingleProcess",
+			cpuReq: generateResourceQuantity("1"),
+			cpuLim: generateResourceQuantity("2"),
+			memLim: generateResourceQuantity("128Mi"),
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           200000,
+				CpuShares:          1024,
+				MemoryLimitInBytes: 134217728,
+			},
+			cgroupVersion:        cgroupV2,
+			singleProcessOOMKill: true,
+		},
+		{
+			name:   "RequestNoMemory",
+			cpuReq: generateResourceQuantity("2"),
+			cpuLim: generateResourceQuantity("8"),
+			memLim: generateResourceQuantity("0"),
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           800000,
+				CpuShares:          2048,
+				MemoryLimitInBytes: 0,
+				Unified:            map[string]string{"memory.oom.group": "1"},
+			},
+			cgroupVersion: cgroupV2,
+		},
+		{
+			name:   "RequestNilCPU",
+			cpuLim: generateResourceQuantity("2"),
+			memLim: generateResourceQuantity("0"),
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           200000,
+				CpuShares:          2048,
+				MemoryLimitInBytes: 0,
+				Unified:            map[string]string{"memory.oom.group": "1"},
+			},
+			cgroupVersion: cgroupV2,
+		},
+		{
+			name:   "RequestZeroCPU",
+			cpuReq: generateResourceQuantity("0"),
+			cpuLim: generateResourceQuantity("2"),
+			memLim: generateResourceQuantity("0"),
+			expected: &runtimeapi.LinuxContainerResources{
+				CpuPeriod:          100000,
+				CpuQuota:           200000,
+				CpuShares:          2,
+				MemoryLimitInBytes: 0,
+				Unified:            map[string]string{"memory.oom.group": "1"},
+			},
+			cgroupVersion: cgroupV2,
+		},
+	}
+	for _, test := range tests {
+		setCgroupVersionDuringTest(test.cgroupVersion)
+		m.singleProcessOOMKill = ptr.To(test.singleProcessOOMKill)
+		linuxContainerResources := m.calculateLinuxResources(test.cpuReq, test.cpuLim, test.memLim, false)
+		assert.Equal(t, test.expected, linuxContainerResources)
+	}
+}
+
+func TestGenerateContainerConfigWithMemoryQoSEnforced(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	assert.NoError(t, err)
+
+	podRequestMemory := resource.MustParse("128Mi")
+	pod1LimitMemory := resource.MustParse("256Mi")
+	pod1 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "12345678",
+			Name:      "bar",
+			Namespace: "new",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:            "foo",
+					Image:           "busybox",
+					ImagePullPolicy: v1.PullIfNotPresent,
+					Command:         []string{"testCommand"},
+					WorkingDir:      "testWorkingDir",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceMemory: podRequestMemory,
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceMemory: pod1LimitMemory,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pod2 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "12345678",
+			Name:      "bar",
+			Namespace: "new",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:            "foo",
+					Image:           "busybox",
+					ImagePullPolicy: v1.PullIfNotPresent,
+					Command:         []string{"testCommand"},
+					WorkingDir:      "testWorkingDir",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceMemory: podRequestMemory,
+						},
+					},
+				},
+			},
+		},
+	}
+	pageSize := int64(os.Getpagesize())
+	memoryNodeAllocatable := resource.MustParse(fakeNodeAllocatableMemory)
+	pod1MemoryHigh := int64(math.Floor(
+		float64(podRequestMemory.Value())+
+			(float64(pod1LimitMemory.Value())-float64(podRequestMemory.Value()))*float64(m.memoryThrottlingFactor))/float64(pageSize)) * pageSize
+	pod2MemoryHigh := int64(math.Floor(
+		float64(podRequestMemory.Value())+
+			(float64(memoryNodeAllocatable.Value())-float64(podRequestMemory.Value()))*float64(m.memoryThrottlingFactor))/float64(pageSize)) * pageSize
+
+	type expectedResult struct {
+		containerConfig *runtimeapi.LinuxContainerConfig
+		memoryLow       int64
+		memoryHigh      int64
+	}
+	l1, _ := m.generateLinuxContainerConfig(&pod1.Spec.Containers[0], pod1, new(int64), "", nil, true)
+	l2, _ := m.generateLinuxContainerConfig(&pod2.Spec.Containers[0], pod2, new(int64), "", nil, true)
+	tests := []struct {
+		name     string
+		pod      *v1.Pod
+		expected *expectedResult
+	}{
+		{
+			name: "Request128MBLimit256MB",
+			pod:  pod1,
+			expected: &expectedResult{
+				l1,
+				128 * 1024 * 1024,
+				int64(pod1MemoryHigh),
+			},
+		},
+		{
+			name: "Request128MBWithoutLimit",
+			pod:  pod2,
+			expected: &expectedResult{
+				l2,
+				128 * 1024 * 1024,
+				int64(pod2MemoryHigh),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		linuxConfig, err := m.generateLinuxContainerConfig(&test.pod.Spec.Containers[0], test.pod, new(int64), "", nil, true)
+		assert.NoError(t, err)
+		assert.Equal(t, test.expected.containerConfig, linuxConfig, test.name)
+		assert.Equal(t, linuxConfig.GetResources().GetUnified()["memory.min"], strconv.FormatInt(test.expected.memoryLow, 10), test.name)
+		assert.Equal(t, linuxConfig.GetResources().GetUnified()["memory.high"], strconv.FormatInt(test.expected.memoryHigh, 10), test.name)
+	}
 }
 
 func TestGetHugepageLimitsFromResources(t *testing.T) {
 	var baseHugepage []*runtimeapi.HugepageLimit
 
 	// For each page size, limit to 0.
-	for _, pageSize := range cgroupfs.HugePageSizes {
+	for _, pageSize := range libcontainercgroups.HugePageSizes() {
 		baseHugepage = append(baseHugepage, &runtimeapi.HugepageLimit{
 			PageSize: pageSize,
 			Limit:    uint64(0),
@@ -263,7 +644,7 @@ func TestGetHugepageLimitsFromResources(t *testing.T) {
 		machineHugepageSupport := true
 		for _, hugepageLimit := range test.expected {
 			hugepageSupport := false
-			for _, pageSize := range cgroupfs.HugePageSizes {
+			for _, pageSize := range libcontainercgroups.HugePageSizes() {
 				if pageSize == hugepageLimit.PageSize {
 					hugepageSupport = true
 					break
@@ -302,7 +683,6 @@ func TestGetHugepageLimitsFromResources(t *testing.T) {
 }
 
 func TestGenerateLinuxContainerConfigNamespaces(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EphemeralContainers, true)()
 	_, _, m, err := createTestRuntimeManager()
 	if err != nil {
 		t.Fatalf("error creating test RuntimeManager: %v", err)
@@ -360,10 +740,1132 @@ func TestGenerateLinuxContainerConfigNamespaces(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := m.generateLinuxContainerConfig(&tc.pod.Spec.Containers[0], tc.pod, nil, "", tc.target)
+			got, err := m.generateLinuxContainerConfig(&tc.pod.Spec.Containers[0], tc.pod, nil, "", tc.target, false)
+			assert.NoError(t, err)
 			if diff := cmp.Diff(tc.want, got.SecurityContext.NamespaceOptions); diff != "" {
 				t.Errorf("%v: diff (-want +got):\n%v", t.Name(), diff)
 			}
 		})
+	}
+}
+
+var (
+	supplementalGroupsPolicyUnSupported = v1.SupplementalGroupsPolicy("UnSupported")
+	supplementalGroupsPolicyMerge       = v1.SupplementalGroupsPolicyMerge
+	supplementalGroupsPolicyStrict      = v1.SupplementalGroupsPolicyStrict
+)
+
+func TestGenerateLinuxConfigSupplementalGroupsPolicy(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	if err != nil {
+		t.Fatalf("error creating test RuntimeManager: %v", err)
+	}
+
+	containerName := "test"
+	for _, tc := range []struct {
+		name           string
+		pod            *v1.Pod
+		expected       runtimeapi.SupplementalGroupsPolicy
+		expectErr      bool
+		expectedErrMsg string
+	}{{
+		name: "Merge SupplementalGroupsPolicy should convert to Merge",
+		pod: &v1.Pod{
+			Spec: v1.PodSpec{
+				SecurityContext: &v1.PodSecurityContext{
+					SupplementalGroupsPolicy: &supplementalGroupsPolicyMerge,
+				},
+				Containers: []v1.Container{
+					{Name: containerName},
+				},
+			},
+		},
+		expected: runtimeapi.SupplementalGroupsPolicy_Merge,
+	}, {
+		name: "Strict SupplementalGroupsPolicy should convert to Strict",
+		pod: &v1.Pod{
+			Spec: v1.PodSpec{
+				SecurityContext: &v1.PodSecurityContext{
+					SupplementalGroupsPolicy: &supplementalGroupsPolicyStrict,
+				},
+				Containers: []v1.Container{
+					{Name: containerName},
+				},
+			},
+		},
+		expected: runtimeapi.SupplementalGroupsPolicy_Strict,
+	}, {
+		name: "nil SupplementalGroupsPolicy should convert to Merge",
+		pod: &v1.Pod{
+			Spec: v1.PodSpec{
+				SecurityContext: &v1.PodSecurityContext{},
+				Containers: []v1.Container{
+					{Name: containerName},
+				},
+			},
+		},
+		expected: runtimeapi.SupplementalGroupsPolicy_Merge,
+	}, {
+		name: "unsupported SupplementalGroupsPolicy should raise an error",
+		pod: &v1.Pod{
+			Spec: v1.PodSpec{
+				SecurityContext: &v1.PodSecurityContext{
+					SupplementalGroupsPolicy: &supplementalGroupsPolicyUnSupported,
+				},
+				Containers: []v1.Container{
+					{Name: containerName},
+				},
+			},
+		},
+		expectErr:      true,
+		expectedErrMsg: "unsupported supplementalGroupsPolicy: UnSupported",
+	},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := m.generateLinuxContainerConfig(&tc.pod.Spec.Containers[0], tc.pod, nil, "", nil, false)
+			if !tc.expectErr {
+				assert.Emptyf(t, err, "Unexpected error")
+				assert.EqualValuesf(t, tc.expected, actual.SecurityContext.SupplementalGroupsPolicy, "SupplementalGroupPolicy for %s", tc.name)
+			} else {
+				assert.NotEmpty(t, err, "Unexpected success")
+				assert.Empty(t, actual, "Unexpected non empty value")
+				assert.ErrorContainsf(t, err, tc.expectedErrMsg, "Error for %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestGenerateLinuxContainerResources(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	assert.NoError(t, err)
+	m.machineInfo.MemoryCapacity = 17179860387 // 16GB
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "12345678",
+			Name:      "foo",
+			Namespace: "bar",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:  "c1",
+					Image: "busybox",
+				},
+			},
+		},
+	}
+
+	for _, tc := range []struct {
+		name                 string
+		limits               v1.ResourceList
+		requests             v1.ResourceList
+		singleProcessOOMKill bool
+		expected             *runtimeapi.LinuxContainerResources
+		cgroupVersion        CgroupVersion
+	}{
+		{
+			"requests & limits, cpu & memory, guaranteed qos",
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("250m"), v1.ResourceMemory: resource.MustParse("500Mi")},
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("250m"), v1.ResourceMemory: resource.MustParse("500Mi")},
+			true,
+			&runtimeapi.LinuxContainerResources{CpuShares: 256, MemoryLimitInBytes: 524288000, OomScoreAdj: -997},
+			cgroupV1,
+		},
+		{
+			"requests & limits, cpu & memory, burstable qos",
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("500m"), v1.ResourceMemory: resource.MustParse("750Mi")},
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("250m"), v1.ResourceMemory: resource.MustParse("500Mi")},
+			true,
+			&runtimeapi.LinuxContainerResources{CpuShares: 256, MemoryLimitInBytes: 786432000, OomScoreAdj: 970},
+			cgroupV1,
+		},
+		{
+			"best-effort qos",
+			nil,
+			nil,
+			true,
+			&runtimeapi.LinuxContainerResources{CpuShares: 2, OomScoreAdj: 1000},
+			cgroupV1,
+		},
+		{
+			"requests & limits, cpu & memory, guaranteed qos",
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("250m"), v1.ResourceMemory: resource.MustParse("500Mi")},
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("250m"), v1.ResourceMemory: resource.MustParse("500Mi")},
+			false,
+			&runtimeapi.LinuxContainerResources{CpuShares: 256, MemoryLimitInBytes: 524288000, OomScoreAdj: -997, Unified: map[string]string{"memory.oom.group": "1"}},
+			cgroupV2,
+		},
+		{
+			"requests & limits, cpu & memory, burstable qos",
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("500m"), v1.ResourceMemory: resource.MustParse("750Mi")},
+			v1.ResourceList{v1.ResourceCPU: resource.MustParse("250m"), v1.ResourceMemory: resource.MustParse("500Mi")},
+			false,
+			&runtimeapi.LinuxContainerResources{CpuShares: 256, MemoryLimitInBytes: 786432000, OomScoreAdj: 970, Unified: map[string]string{"memory.oom.group": "1"}},
+			cgroupV2,
+		},
+		{
+			"best-effort qos",
+			nil,
+			nil,
+			false,
+			&runtimeapi.LinuxContainerResources{CpuShares: 2, OomScoreAdj: 1000, Unified: map[string]string{"memory.oom.group": "1"}},
+			cgroupV2,
+		},
+	} {
+		t.Run(fmt.Sprintf("cgroup%s:%s", tc.cgroupVersion, tc.name), func(t *testing.T) {
+			defer setSwapControllerAvailableDuringTest(false)()
+			setCgroupVersionDuringTest(tc.cgroupVersion)
+
+			pod.Spec.Containers[0].Resources = v1.ResourceRequirements{Limits: tc.limits, Requests: tc.requests}
+
+			m.singleProcessOOMKill = ptr.To(tc.singleProcessOOMKill)
+
+			resources := m.generateLinuxContainerResources(pod, &pod.Spec.Containers[0], false)
+			tc.expected.HugepageLimits = resources.HugepageLimits
+			assert.Equal(t, tc.expected, resources)
+		})
+	}
+}
+
+func TestGetContainerSwapBehavior(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	require.NoError(t, err)
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "12345678",
+			Name:      "foo",
+			Namespace: "bar",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name: "c1",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceMemory: resource.MustParse("1Gi")},
+						Limits:   v1.ResourceList{v1.ResourceMemory: resource.MustParse("2Gi")},
+					},
+				},
+			},
+		},
+		Status: v1.PodStatus{},
+	}
+	tests := []struct {
+		name                       string
+		configuredMemorySwap       types.SwapBehavior
+		nodeSwapFeatureGateEnabled bool
+		isSwapControllerAvailable  bool
+		cgroupVersion              CgroupVersion
+		isCriticalPod              bool
+		qosClass                   v1.PodQOSClass
+		containerResourceOverride  func(container *v1.Container)
+		expected                   types.SwapBehavior
+	}{
+		{
+			name:                       "NoSwap, user set NoSwap behavior",
+			configuredMemorySwap:       types.NoSwap,
+			nodeSwapFeatureGateEnabled: false,
+			expected:                   types.NoSwap,
+		},
+		{
+			name:                       "NoSwap, feature gate turned off",
+			configuredMemorySwap:       types.LimitedSwap,
+			nodeSwapFeatureGateEnabled: false,
+			expected:                   types.NoSwap,
+		},
+		{
+			name:                       "NoSwap, swap controller unavailable",
+			configuredMemorySwap:       types.LimitedSwap,
+			nodeSwapFeatureGateEnabled: true,
+			isSwapControllerAvailable:  false,
+			expected:                   types.NoSwap,
+		},
+		{
+			name:                       "NoSwap, cgroup v1",
+			configuredMemorySwap:       types.LimitedSwap,
+			nodeSwapFeatureGateEnabled: true,
+			isSwapControllerAvailable:  true,
+			cgroupVersion:              cgroupV1,
+			expected:                   types.NoSwap,
+		},
+		{
+			name:                       "NoSwap, qos is Best-Effort",
+			configuredMemorySwap:       types.LimitedSwap,
+			nodeSwapFeatureGateEnabled: true,
+			isSwapControllerAvailable:  true,
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBestEffort,
+			expected:                   types.NoSwap,
+		},
+		{
+			name:                       "NoSwap, qos is Guaranteed",
+			configuredMemorySwap:       types.LimitedSwap,
+			nodeSwapFeatureGateEnabled: true,
+			isSwapControllerAvailable:  true,
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSGuaranteed,
+			expected:                   types.NoSwap,
+		},
+		{
+			name:                       "NoSwap, zero memory",
+			configuredMemorySwap:       types.LimitedSwap,
+			nodeSwapFeatureGateEnabled: true,
+			isSwapControllerAvailable:  true,
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBurstable,
+			containerResourceOverride: func(c *v1.Container) {
+				c.Resources.Requests = v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("0"),
+				}
+				c.Resources.Limits = v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("0"),
+				}
+			},
+			expected: types.NoSwap,
+		},
+		{
+			name:                       "NoSwap, memory request equal to limit",
+			configuredMemorySwap:       types.LimitedSwap,
+			nodeSwapFeatureGateEnabled: true,
+			isSwapControllerAvailable:  true,
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBurstable,
+			containerResourceOverride: func(c *v1.Container) {
+				c.Resources.Requests = v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				}
+				c.Resources.Limits = v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				}
+			},
+			expected: types.NoSwap,
+		},
+		{
+			name:                       "LimitedSwap, cgroup v2",
+			configuredMemorySwap:       types.LimitedSwap,
+			nodeSwapFeatureGateEnabled: true,
+			isSwapControllerAvailable:  true,
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBurstable,
+			expected:                   types.LimitedSwap,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m.memorySwapBehavior = string(tt.configuredMemorySwap)
+			setCgroupVersionDuringTest(tt.cgroupVersion)
+			defer setSwapControllerAvailableDuringTest(tt.isSwapControllerAvailable)()
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeSwap, tt.nodeSwapFeatureGateEnabled)
+			testpod := pod.DeepCopy()
+			testpod.Status.QOSClass = tt.qosClass
+			if tt.containerResourceOverride != nil {
+				tt.containerResourceOverride(&testpod.Spec.Containers[0])
+			}
+			assert.Equal(t, tt.expected, m.GetContainerSwapBehavior(testpod, &testpod.Spec.Containers[0]))
+		})
+	}
+}
+
+func TestGenerateLinuxContainerResourcesWithSwap(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	assert.NoError(t, err)
+	m.machineInfo.MemoryCapacity = 42949672960 // 40Gb == 40 * 1024^3
+	m.machineInfo.SwapCapacity = 5368709120    // 5Gb == 5 * 1024^3
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "12345678",
+			Name:      "foo",
+			Namespace: "bar",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name: "c1",
+				},
+				{
+					Name: "c2",
+				},
+			},
+		},
+		Status: v1.PodStatus{},
+	}
+
+	expectSwapDisabled := func(cgroupVersion CgroupVersion, resources ...*runtimeapi.LinuxContainerResources) {
+		const msg = "container is expected to not have swap configured"
+
+		for _, r := range resources {
+			switch cgroupVersion {
+			case cgroupV1:
+				assert.Equal(t, int64(0), r.MemorySwapLimitInBytes, msg)
+			case cgroupV2:
+				assert.NotContains(t, r.Unified, cm.Cgroup2MaxSwapFilename, msg)
+			}
+		}
+	}
+
+	expectNoSwap := func(cgroupVersion CgroupVersion, resources ...*runtimeapi.LinuxContainerResources) {
+		const msg = "container is expected to not have swap access"
+
+		for _, r := range resources {
+			switch cgroupVersion {
+			case cgroupV1:
+				assert.Equal(t, r.MemoryLimitInBytes, r.MemorySwapLimitInBytes, msg)
+			case cgroupV2:
+				assert.Equal(t, "0", r.Unified[cm.Cgroup2MaxSwapFilename], msg)
+			}
+		}
+	}
+
+	expectSwap := func(cgroupVersion CgroupVersion, swapBytesExpected int64, resources *runtimeapi.LinuxContainerResources) {
+		msg := fmt.Sprintf("container swap is expected to be limited by %d bytes", swapBytesExpected)
+
+		switch cgroupVersion {
+		case cgroupV1:
+			assert.Equal(t, resources.MemoryLimitInBytes+swapBytesExpected, resources.MemorySwapLimitInBytes, msg)
+		case cgroupV2:
+			assert.Equal(t, fmt.Sprintf("%d", swapBytesExpected), resources.Unified[cm.Cgroup2MaxSwapFilename], msg)
+		}
+	}
+
+	calcSwapForBurstablePods := func(containerMemoryRequest int64) int64 {
+		swapSize, err := calcSwapForBurstablePods(containerMemoryRequest, int64(m.machineInfo.MemoryCapacity), int64(m.machineInfo.SwapCapacity))
+		assert.NoError(t, err)
+
+		return swapSize
+	}
+
+	for _, tc := range []struct {
+		name                        string
+		cgroupVersion               CgroupVersion
+		qosClass                    v1.PodQOSClass
+		swapDisabledOnNode          bool
+		nodeSwapFeatureGateEnabled  bool
+		swapBehavior                types.SwapBehavior
+		addContainerWithoutRequests bool
+		addGuaranteedContainer      bool
+		isCriticalPod               bool
+	}{
+		// With cgroup v1
+		{
+			name:                       "cgroups v1, LimitedSwap, Burstable QoS",
+			cgroupVersion:              cgroupV1,
+			qosClass:                   v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               types.LimitedSwap,
+		},
+		{
+			name:                       "cgroups v1, LimitedSwap, Best-effort QoS",
+			cgroupVersion:              cgroupV1,
+			qosClass:                   v1.PodQOSBestEffort,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               types.LimitedSwap,
+		},
+
+		// With feature gate turned off
+		{
+			name:                       "NodeSwap feature gate turned off, cgroups v2, LimitedSwap",
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled: false,
+			swapBehavior:               types.LimitedSwap,
+		},
+
+		// With no swapBehavior, NoSwap should be the default
+		{
+			name:                       "With no swapBehavior - NoSwap should be the default",
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBestEffort,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               "",
+		},
+
+		// With Guaranteed and Best-effort QoS
+		{
+			name:                       "Best-effort QoS, cgroups v2, NoSwap",
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBestEffort,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               "NoSwap",
+		},
+		{
+			name:                       "Best-effort QoS, cgroups v2, LimitedSwap",
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               types.LimitedSwap,
+		},
+		{
+			name:                       "Guaranteed QoS, cgroups v2, LimitedSwap",
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSGuaranteed,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               types.LimitedSwap,
+		},
+
+		// With a "guaranteed" container (when memory requests equal to limits)
+		{
+			name:                        "Burstable QoS, cgroups v2, LimitedSwap, with a guaranteed container",
+			cgroupVersion:               cgroupV2,
+			qosClass:                    v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled:  true,
+			swapBehavior:                types.LimitedSwap,
+			addContainerWithoutRequests: false,
+			addGuaranteedContainer:      true,
+		},
+
+		// Swap is expected to be allocated
+		{
+			name:                        "Burstable QoS, cgroups v2, LimitedSwap",
+			cgroupVersion:               cgroupV2,
+			qosClass:                    v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled:  true,
+			swapBehavior:                types.LimitedSwap,
+			addContainerWithoutRequests: false,
+			addGuaranteedContainer:      false,
+		},
+		{
+			name:                        "Burstable QoS, cgroups v2, LimitedSwap, with a container with no requests",
+			cgroupVersion:               cgroupV2,
+			qosClass:                    v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled:  true,
+			swapBehavior:                types.LimitedSwap,
+			addContainerWithoutRequests: true,
+			addGuaranteedContainer:      false,
+		},
+		// All the above examples with Swap disabled on node
+		{
+			name:                       "Swap disabled on node, cgroups v1, LimitedSwap, Burstable QoS",
+			swapDisabledOnNode:         true,
+			cgroupVersion:              cgroupV1,
+			qosClass:                   v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               types.LimitedSwap,
+		},
+		{
+			name:                       "Swap disabled on node, cgroups v1, LimitedSwap, Best-effort QoS",
+			swapDisabledOnNode:         true,
+			cgroupVersion:              cgroupV1,
+			qosClass:                   v1.PodQOSBestEffort,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               types.LimitedSwap,
+		},
+
+		// With feature gate turned off
+		{
+			name:                       "Swap disabled on node, NodeSwap feature gate turned off, cgroups v2, LimitedSwap",
+			swapDisabledOnNode:         true,
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled: false,
+			swapBehavior:               types.LimitedSwap,
+		},
+
+		// With no swapBehavior, NoSwap should be the default
+		{
+			name:                       "Swap disabled on node, With no swapBehavior - NoSwap should be the default",
+			swapDisabledOnNode:         true,
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBestEffort,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               "",
+		},
+
+		// With Guaranteed and Best-effort QoS
+		{
+			name:                       "Swap disabled on node, Best-effort QoS, cgroups v2, LimitedSwap",
+			swapDisabledOnNode:         true,
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               types.LimitedSwap,
+		},
+		{
+			name:                       "Swap disabled on node, Guaranteed QoS, cgroups v2, LimitedSwap",
+			swapDisabledOnNode:         true,
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSGuaranteed,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               types.LimitedSwap,
+		},
+
+		// With a "guaranteed" container (when memory requests equal to limits)
+		{
+			name:                        "Swap disabled on node, Burstable QoS, cgroups v2, LimitedSwap, with a guaranteed container",
+			swapDisabledOnNode:          true,
+			cgroupVersion:               cgroupV2,
+			qosClass:                    v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled:  true,
+			swapBehavior:                types.LimitedSwap,
+			addContainerWithoutRequests: false,
+			addGuaranteedContainer:      true,
+		},
+
+		// Swap is expected to be allocated
+		{
+			name:                        "Swap disabled on node, Burstable QoS, cgroups v2, LimitedSwap",
+			swapDisabledOnNode:          true,
+			cgroupVersion:               cgroupV2,
+			qosClass:                    v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled:  true,
+			swapBehavior:                types.LimitedSwap,
+			addContainerWithoutRequests: false,
+			addGuaranteedContainer:      false,
+		},
+		{
+			name:                        "Swap disabled on node, Burstable QoS, cgroups v2, LimitedSwap, with a container with no requests",
+			swapDisabledOnNode:          true,
+			cgroupVersion:               cgroupV2,
+			qosClass:                    v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled:  true,
+			swapBehavior:                types.LimitedSwap,
+			addContainerWithoutRequests: true,
+			addGuaranteedContainer:      false,
+		},
+
+		// When the pod is considered critical, disallow swap access
+		{
+			name:                       "Best-effort QoS, cgroups v2, LimitedSwap, critical pod",
+			cgroupVersion:              cgroupV2,
+			qosClass:                   v1.PodQOSBurstable,
+			nodeSwapFeatureGateEnabled: true,
+			swapBehavior:               types.LimitedSwap,
+			isCriticalPod:              true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setCgroupVersionDuringTest(tc.cgroupVersion)
+			defer setSwapControllerAvailableDuringTest(!tc.swapDisabledOnNode)()
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeSwap, tc.nodeSwapFeatureGateEnabled)
+			m.memorySwapBehavior = string(tc.swapBehavior)
+
+			var resourceReqsC1, resourceReqsC2 v1.ResourceRequirements
+			switch tc.qosClass {
+			case v1.PodQOSBurstable:
+				resourceReqsC1 = v1.ResourceRequirements{
+					Requests: v1.ResourceList{v1.ResourceMemory: resource.MustParse("1Gi")},
+				}
+
+				if !tc.addContainerWithoutRequests {
+					resourceReqsC2 = v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceMemory: resource.MustParse("2Gi")},
+					}
+
+					if tc.addGuaranteedContainer {
+						resourceReqsC2.Limits = v1.ResourceList{v1.ResourceMemory: resource.MustParse("2Gi")}
+					}
+				}
+			case v1.PodQOSGuaranteed:
+				resourceReqsC1 = v1.ResourceRequirements{
+					Requests: v1.ResourceList{v1.ResourceMemory: resource.MustParse("1Gi"), v1.ResourceCPU: resource.MustParse("1")},
+					Limits:   v1.ResourceList{v1.ResourceMemory: resource.MustParse("1Gi"), v1.ResourceCPU: resource.MustParse("1")},
+				}
+				resourceReqsC2 = v1.ResourceRequirements{
+					Requests: v1.ResourceList{v1.ResourceMemory: resource.MustParse("2Gi"), v1.ResourceCPU: resource.MustParse("1")},
+					Limits:   v1.ResourceList{v1.ResourceMemory: resource.MustParse("2Gi"), v1.ResourceCPU: resource.MustParse("1")},
+				}
+			}
+			pod.Spec.Containers[0].Resources = resourceReqsC1
+			pod.Spec.Containers[1].Resources = resourceReqsC2
+
+			if tc.isCriticalPod {
+				pod.Spec.Priority = ptr.To(scheduling.SystemCriticalPriority)
+				assert.True(t, types.IsCriticalPod(pod), "pod is expected to be critical")
+			}
+
+			resourcesC1 := m.generateLinuxContainerResources(pod, &pod.Spec.Containers[0], false)
+			resourcesC2 := m.generateLinuxContainerResources(pod, &pod.Spec.Containers[1], false)
+
+			if tc.swapDisabledOnNode {
+				expectSwapDisabled(tc.cgroupVersion, resourcesC1, resourcesC2)
+				return
+			}
+
+			if tc.isCriticalPod || !tc.nodeSwapFeatureGateEnabled || tc.cgroupVersion == cgroupV1 || (tc.swapBehavior == types.LimitedSwap && tc.qosClass != v1.PodQOSBurstable) {
+				expectNoSwap(tc.cgroupVersion, resourcesC1, resourcesC2)
+				return
+			}
+
+			if tc.swapBehavior == types.NoSwap || tc.swapBehavior == "" {
+				expectNoSwap(tc.cgroupVersion, resourcesC1, resourcesC2)
+				return
+			}
+
+			c1ExpectedSwap := calcSwapForBurstablePods(resourceReqsC1.Requests.Memory().Value())
+			c2ExpectedSwap := int64(0)
+			if !tc.addContainerWithoutRequests && !tc.addGuaranteedContainer {
+				c2ExpectedSwap = calcSwapForBurstablePods(resourceReqsC2.Requests.Memory().Value())
+			}
+
+			expectSwap(tc.cgroupVersion, c1ExpectedSwap, resourcesC1)
+			expectSwap(tc.cgroupVersion, c2ExpectedSwap, resourcesC2)
+		})
+	}
+}
+
+func TestGenerateUpdatePodSandboxResourcesRequest(t *testing.T) {
+	_, _, m, err := createTestRuntimeManager()
+	require.NoError(t, err)
+
+	podRequestCPU := resource.MustParse("400m")
+	podLimitCPU := resource.MustParse("800m")
+	podRequestMemory := resource.MustParse("128Mi")
+	podLimitMemory := resource.MustParse("256Mi")
+	podOverheadCPU := resource.MustParse("100m")
+	podOverheadMemory := resource.MustParse("64Mi")
+	enforceCPULimits := true
+	m.cpuCFSQuota = true
+
+	for _, tc := range []struct {
+		name             string
+		qosClass         v1.PodQOSClass
+		pod              *v1.Pod
+		sandboxID        string
+		enforceCPULimits bool
+	}{
+		// Best effort pod (no resources defined)
+		{
+			name:             "Best effort",
+			qosClass:         v1.PodQOSBestEffort,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "1",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{},
+								Limits:   v1.ResourceList{},
+							},
+						},
+					},
+					Overhead: v1.ResourceList{},
+				},
+			},
+		},
+		{
+			name:             "Best effort with overhead",
+			qosClass:         v1.PodQOSBestEffort,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "2",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{},
+								Limits:   v1.ResourceList{},
+							},
+						},
+					},
+					Overhead: v1.ResourceList{
+						v1.ResourceCPU:    podOverheadCPU,
+						v1.ResourceMemory: podOverheadMemory,
+					},
+				},
+			},
+		},
+		// Guaranteed pod
+		{
+			name:             "Guaranteed",
+			qosClass:         v1.PodQOSGuaranteed,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "3",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:             "Guaranteed with overhead",
+			qosClass:         v1.PodQOSGuaranteed,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "4",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+					},
+					Overhead: v1.ResourceList{
+						v1.ResourceCPU:    podOverheadCPU,
+						v1.ResourceMemory: podOverheadMemory,
+					},
+				},
+			},
+		},
+		// Burstable pods that leave some resources unspecified (e.g. only CPU/Mem requests)
+		{
+			name:             "Burstable only cpu",
+			qosClass:         v1.PodQOSBurstable,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "5",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU: podRequestCPU,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU: podLimitCPU,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:             "Burstable only cpu with overhead",
+			qosClass:         v1.PodQOSBurstable,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "6",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU: podRequestCPU,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU: podLimitCPU,
+								},
+							},
+						},
+					},
+					Overhead: v1.ResourceList{
+						v1.ResourceCPU: podOverheadCPU,
+					},
+				},
+			},
+		},
+		{
+			name:             "Burstable only memory",
+			qosClass:         v1.PodQOSBurstable,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "7",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceMemory: podRequestMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:             "Burstable only memory with overhead",
+			qosClass:         v1.PodQOSBurstable,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "8",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceMemory: podRequestMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+					},
+					Overhead: v1.ResourceList{
+						v1.ResourceMemory: podOverheadMemory,
+					},
+				},
+			},
+		},
+		// With init container
+		{
+			name:             "Pod with init container",
+			qosClass:         v1.PodQOSGuaranteed,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "9",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					InitContainers: []v1.Container{
+						{
+							Name: "init",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podOverheadCPU,
+									v1.ResourceMemory: podOverheadMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podOverheadCPU,
+									v1.ResourceMemory: podOverheadMemory,
+								},
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:             "Pod with init container and overhead",
+			qosClass:         v1.PodQOSGuaranteed,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "10",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					InitContainers: []v1.Container{
+						{
+							Name: "init",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podOverheadCPU,
+									v1.ResourceMemory: podOverheadMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podOverheadCPU,
+									v1.ResourceMemory: podOverheadMemory,
+								},
+							},
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+					},
+					Overhead: v1.ResourceList{
+						v1.ResourceCPU:    podOverheadCPU,
+						v1.ResourceMemory: podOverheadMemory,
+					},
+				},
+			},
+		},
+		// With a sidecar container
+		{
+			name:             "Pod with sidecar container",
+			qosClass:         v1.PodQOSBurstable,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "11",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podRequestMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podLimitCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+						{
+							Name: "bar",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podRequestMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podLimitCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:             "Pod with sidecar container and overhead",
+			qosClass:         v1.PodQOSBurstable,
+			enforceCPULimits: enforceCPULimits,
+			sandboxID:        "11",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "foo",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podRequestMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podLimitCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+						{
+							Name: "bar",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    podRequestCPU,
+									v1.ResourceMemory: podRequestMemory,
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    podLimitCPU,
+									v1.ResourceMemory: podLimitMemory,
+								},
+							},
+						},
+					},
+					Overhead: v1.ResourceList{
+						v1.ResourceCPU:    podOverheadCPU,
+						v1.ResourceMemory: podOverheadMemory,
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expectedLcr := m.calculateSandboxResources(tc.pod)
+			expectedLcrOverhead := m.convertOverheadToLinuxResources(tc.pod)
+
+			podResourcesCfg := cm.ResourceConfigForPod(tc.pod, tc.enforceCPULimits, uint64((m.cpuCFSQuotaPeriod.Duration)/time.Microsecond), false)
+			assert.NotNil(t, podResourcesCfg, "podResourcesCfg is expected to be not nil")
+
+			if podResourcesCfg.CPUPeriod == nil {
+				expectedLcr.CpuPeriod = 0
+			}
+
+			updatePodSandboxRequest := m.generateUpdatePodSandboxResourcesRequest("123", tc.pod, podResourcesCfg)
+			assert.NotNil(t, updatePodSandboxRequest, "updatePodSandboxRequest is expected to be not nil")
+
+			assert.Equal(t, expectedLcr, updatePodSandboxRequest.Resources, "expectedLcr need to be equal then updatePodSandboxRequest.Resources")
+			assert.Equal(t, expectedLcrOverhead, updatePodSandboxRequest.Overhead, "expectedLcrOverhead need to be equal then updatePodSandboxRequest.Overhead")
+		})
+	}
+}
+
+func TestUpdatePodSandboxResources(t *testing.T) {
+	fakeRuntime, _, m, errCreate := createTestRuntimeManager()
+	require.NoError(t, errCreate)
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "12345678",
+			Name:      "bar",
+			Namespace: "new",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:            "foo",
+					Image:           "busybox",
+					ImagePullPolicy: v1.PullIfNotPresent,
+				},
+			},
+		},
+	}
+
+	// Create fake sandbox and container
+	fakeSandbox, fakeContainers := makeAndSetFakePod(t, m, fakeRuntime, pod)
+	assert.Len(t, fakeContainers, 1)
+
+	ctx := context.Background()
+	_, _, err := m.getPodContainerStatuses(ctx, pod.UID, pod.Name, pod.Namespace, "")
+	require.NoError(t, err)
+
+	resourceConfig := &cm.ResourceConfig{}
+
+	err = m.updatePodSandboxResources(fakeSandbox.Id, pod, resourceConfig)
+	require.NoError(t, err)
+
+	// Verify sandbox is updated
+	assert.Contains(t, fakeRuntime.Called, "UpdatePodSandboxResources")
+}
+
+type CgroupVersion string
+
+const (
+	cgroupV1 CgroupVersion = "v1"
+	cgroupV2 CgroupVersion = "v2"
+)
+
+func setCgroupVersionDuringTest(version CgroupVersion) {
+	isCgroup2UnifiedMode = func() bool {
+		return version == cgroupV2
+	}
+}
+
+func setSwapControllerAvailableDuringTest(available bool) func() {
+	original := swapControllerAvailable
+	swapControllerAvailable = func() bool {
+		return available
+	}
+
+	return func() {
+		swapControllerAvailable = original
 	}
 }

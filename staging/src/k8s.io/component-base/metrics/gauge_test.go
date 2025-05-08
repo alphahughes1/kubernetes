@@ -20,9 +20,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/blang/semver"
+	"github.com/blang/semver/v4"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	apimachineryversion "k8s.io/apimachinery/pkg/version"
 )
@@ -31,14 +32,14 @@ func TestGauge(t *testing.T) {
 	v115 := semver.MustParse("1.15.0")
 	var tests = []struct {
 		desc string
-		GaugeOpts
+		*GaugeOpts
 		registryVersion     *semver.Version
 		expectedMetricCount int
 		expectedHelp        string
 	}{
 		{
 			desc: "Test non deprecated",
-			GaugeOpts: GaugeOpts{
+			GaugeOpts: &GaugeOpts{
 				Namespace: "namespace",
 				Name:      "metric_test_name",
 				Subsystem: "subsystem",
@@ -50,7 +51,7 @@ func TestGauge(t *testing.T) {
 		},
 		{
 			desc: "Test deprecated",
-			GaugeOpts: GaugeOpts{
+			GaugeOpts: &GaugeOpts{
 				Namespace:         "namespace",
 				Name:              "metric_test_name",
 				Subsystem:         "subsystem",
@@ -63,7 +64,7 @@ func TestGauge(t *testing.T) {
 		},
 		{
 			desc: "Test hidden",
-			GaugeOpts: GaugeOpts{
+			GaugeOpts: &GaugeOpts{
 				Namespace:         "namespace",
 				Name:              "metric_test_name",
 				Subsystem:         "subsystem",
@@ -83,12 +84,12 @@ func TestGauge(t *testing.T) {
 				Minor:      "15",
 				GitVersion: "v1.15.0-alpha-1.12345",
 			})
-			c := NewGauge(&test.GaugeOpts)
+			c := NewGauge(test.GaugeOpts)
 			registry.MustRegister(c)
 
 			ms, err := registry.Gather()
-			assert.Equalf(t, test.expectedMetricCount, len(ms), "Got %v metrics, Want: %v metrics", len(ms), test.expectedMetricCount)
-			assert.Nil(t, err, "Gather failed %v", err)
+			assert.Lenf(t, ms, test.expectedMetricCount, "Got %v metrics, Want: %v metrics", len(ms), test.expectedMetricCount)
+			require.NoError(t, err, "Gather failed %v", err)
 
 			for _, metric := range ms {
 				assert.Equalf(t, test.expectedHelp, metric.GetHelp(), "Got %s as help message, want %s", metric.GetHelp(), test.expectedHelp)
@@ -99,7 +100,7 @@ func TestGauge(t *testing.T) {
 			c.Set(101)
 			expected := 101
 			ms, err = registry.Gather()
-			assert.Nil(t, err, "Gather failed %v", err)
+			require.NoError(t, err, "Gather failed %v", err)
 
 			for _, mf := range ms {
 				for _, m := range mf.GetMetric() {
@@ -115,7 +116,7 @@ func TestGaugeVec(t *testing.T) {
 	v115 := semver.MustParse("1.15.0")
 	var tests = []struct {
 		desc string
-		GaugeOpts
+		*GaugeOpts
 		labels              []string
 		registryVersion     *semver.Version
 		expectedMetricCount int
@@ -123,7 +124,7 @@ func TestGaugeVec(t *testing.T) {
 	}{
 		{
 			desc: "Test non deprecated",
-			GaugeOpts: GaugeOpts{
+			GaugeOpts: &GaugeOpts{
 				Namespace: "namespace",
 				Name:      "metric_test_name",
 				Subsystem: "subsystem",
@@ -136,7 +137,7 @@ func TestGaugeVec(t *testing.T) {
 		},
 		{
 			desc: "Test deprecated",
-			GaugeOpts: GaugeOpts{
+			GaugeOpts: &GaugeOpts{
 				Namespace:         "namespace",
 				Name:              "metric_test_name",
 				Subsystem:         "subsystem",
@@ -150,7 +151,7 @@ func TestGaugeVec(t *testing.T) {
 		},
 		{
 			desc: "Test hidden",
-			GaugeOpts: GaugeOpts{
+			GaugeOpts: &GaugeOpts{
 				Namespace:         "namespace",
 				Name:              "metric_test_name",
 				Subsystem:         "subsystem",
@@ -171,12 +172,12 @@ func TestGaugeVec(t *testing.T) {
 				Minor:      "15",
 				GitVersion: "v1.15.0-alpha-1.12345",
 			})
-			c := NewGaugeVec(&test.GaugeOpts, test.labels)
+			c := NewGaugeVec(test.GaugeOpts, test.labels)
 			registry.MustRegister(c)
 			c.WithLabelValues("1", "2").Set(1.0)
 			ms, err := registry.Gather()
-			assert.Equalf(t, test.expectedMetricCount, len(ms), "Got %v metrics, Want: %v metrics", len(ms), test.expectedMetricCount)
-			assert.Nil(t, err, "Gather failed %v", err)
+			assert.Lenf(t, ms, test.expectedMetricCount, "Got %v metrics, Want: %v metrics", len(ms), test.expectedMetricCount)
+			require.NoError(t, err, "Gather failed %v", err)
 			for _, metric := range ms {
 				assert.Equalf(t, test.expectedHelp, metric.GetHelp(), "Got %s as help message, want %s", metric.GetHelp(), test.expectedHelp)
 			}
@@ -185,10 +186,10 @@ func TestGaugeVec(t *testing.T) {
 			c.WithLabelValues("1", "3").Set(1.0)
 			c.WithLabelValues("2", "3").Set(1.0)
 			ms, err = registry.Gather()
-			assert.Nil(t, err, "Gather failed %v", err)
+			require.NoError(t, err, "Gather failed %v", err)
 
 			for _, mf := range ms {
-				assert.Equalf(t, 3, len(mf.GetMetric()), "Got %v metrics, wanted 3 as the count", len(mf.GetMetric()))
+				assert.Lenf(t, mf.GetMetric(), 3, "Got %v metrics, wanted 3 as the count", len(mf.GetMetric()))
 			}
 		})
 	}
@@ -207,12 +208,12 @@ func TestGaugeFunc(t *testing.T) {
 
 	var tests = []struct {
 		desc string
-		GaugeOpts
+		*GaugeOpts
 		expectedMetrics string
 	}{
 		{
 			desc: "Test non deprecated",
-			GaugeOpts: GaugeOpts{
+			GaugeOpts: &GaugeOpts{
 				Namespace: "namespace",
 				Subsystem: "subsystem",
 				Name:      "metric_non_deprecated",
@@ -226,7 +227,7 @@ namespace_subsystem_metric_non_deprecated 1
 		},
 		{
 			desc: "Test deprecated",
-			GaugeOpts: GaugeOpts{
+			GaugeOpts: &GaugeOpts{
 				Namespace:         "namespace",
 				Subsystem:         "subsystem",
 				Name:              "metric_deprecated",
@@ -241,7 +242,7 @@ namespace_subsystem_metric_deprecated 1
 		},
 		{
 			desc: "Test hidden",
-			GaugeOpts: GaugeOpts{
+			GaugeOpts: &GaugeOpts{
 				Namespace:         "namespace",
 				Subsystem:         "subsystem",
 				Name:              "metric_hidden",
@@ -304,7 +305,8 @@ func TestGaugeWithLabelValueAllowList(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			SetLabelAllowListFromCLI(labelAllowValues)
+			labelValueAllowLists = map[string]*MetricLabelAllowList{}
+
 			registry := newKubeRegistry(apimachineryversion.Info{
 				Major:      "1",
 				Minor:      "15",
@@ -312,12 +314,12 @@ func TestGaugeWithLabelValueAllowList(t *testing.T) {
 			})
 			g := NewGaugeVec(opts, labels)
 			registry.MustRegister(g)
-
+			SetLabelAllowListFromCLI(labelAllowValues)
 			for _, lv := range test.labelValues {
 				g.WithLabelValues(lv...).Set(100.0)
 			}
 			mfs, err := registry.Gather()
-			assert.Nil(t, err, "Gather failed %v", err)
+			require.NoError(t, err, "Gather failed %v", err)
 
 			for _, mf := range mfs {
 				if *mf.Name != BuildFQName(opts.Namespace, opts.Subsystem, opts.Name) {
@@ -339,7 +341,7 @@ func TestGaugeWithLabelValueAllowList(t *testing.T) {
 					expectedValue, ok := test.expectMetricValues[labelValuePair]
 					assert.True(t, ok, "Got unexpected label values, lable_a is %v, label_b is %v", aValue, bValue)
 					actualValue := m.GetGauge().GetValue()
-					assert.Equalf(t, expectedValue, actualValue, "Got %v, wanted %v as the gauge while setting label_a to %v and label b to %v", actualValue, expectedValue, aValue, bValue)
+					assert.InDeltaf(t, expectedValue, actualValue, 0.01, "Got %v, wanted %v as the gauge while setting label_a to %v and label b to %v", actualValue, expectedValue, aValue, bValue)
 				}
 			}
 		})

@@ -19,18 +19,17 @@ package config
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/helper"
-	"k8s.io/kubernetes/pkg/features"
 
 	// TODO: remove this import if
 	// api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String() is changed
@@ -82,8 +81,6 @@ func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName types.Node
 	// Set the Host field to indicate this pod is scheduled on the current node.
 	pod.Spec.NodeName = string(nodeName)
 
-	pod.ObjectMeta.SelfLink = getSelfLink(pod.Name, pod.Namespace)
-
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
@@ -104,16 +101,10 @@ func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName types.Node
 	return nil
 }
 
-func getSelfLink(name, namespace string) string {
-	var selfLink string
-	if len(namespace) == 0 {
-		namespace = metav1.NamespaceDefault
-	}
-	selfLink = fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", namespace, name)
-	return selfLink
-}
-
 type defaultFunc func(pod *api.Pod) error
+
+// A static pod tried to use a ClusterTrustBundle projected volume source.
+var ErrStaticPodTriedToUseClusterTrustBundle = errors.New("static pods may not use ClusterTrustBundle projected volume sources")
 
 // tryDecodeSinglePod takes data and tries to extract valid Pod config information from it.
 func tryDecodeSinglePod(data []byte, defaultFn defaultFunc) (parsed bool, pod *v1.Pod, err error) {
@@ -133,14 +124,15 @@ func tryDecodeSinglePod(data []byte, defaultFn defaultFunc) (parsed bool, pod *v
 		return false, pod, fmt.Errorf("invalid pod: %#v", obj)
 	}
 
+	if newPod.Name == "" {
+		return true, pod, fmt.Errorf("invalid pod: name is needed for the pod")
+	}
+
 	// Apply default values and validate the pod.
 	if err = defaultFn(newPod); err != nil {
 		return true, pod, err
 	}
-	opts := validation.PodValidationOptions{
-		AllowMultipleHugePageResources: utilfeature.DefaultFeatureGate.Enabled(features.HugePageStorageMediumSize),
-	}
-	if errs := validation.ValidatePodCreate(newPod, opts); len(errs) > 0 {
+	if errs := validation.ValidatePodCreate(newPod, validation.PodValidationOptions{}); len(errs) > 0 {
 		return true, pod, fmt.Errorf("invalid pod: %v", errs)
 	}
 	v1Pod := &v1.Pod{}
@@ -148,6 +140,19 @@ func tryDecodeSinglePod(data []byte, defaultFn defaultFunc) (parsed bool, pod *v
 		klog.ErrorS(err, "Pod failed to convert to v1", "pod", klog.KObj(newPod))
 		return true, nil, err
 	}
+
+	for _, v := range v1Pod.Spec.Volumes {
+		if v.Projected == nil {
+			continue
+		}
+
+		for _, s := range v.Projected.Sources {
+			if s.ClusterTrustBundle != nil {
+				return true, nil, ErrStaticPodTriedToUseClusterTrustBundle
+			}
+		}
+	}
+
 	return true, v1Pod, nil
 }
 
@@ -164,17 +169,16 @@ func tryDecodePodList(data []byte, defaultFn defaultFunc) (parsed bool, pods v1.
 		return false, pods, err
 	}
 
-	opts := validation.PodValidationOptions{
-		AllowMultipleHugePageResources: utilfeature.DefaultFeatureGate.Enabled(features.HugePageStorageMediumSize),
-	}
-
 	// Apply default values and validate pods.
 	for i := range newPods.Items {
 		newPod := &newPods.Items[i]
+		if newPod.Name == "" {
+			return true, pods, fmt.Errorf("invalid pod: name is needed for the pod")
+		}
 		if err = defaultFn(newPod); err != nil {
 			return true, pods, err
 		}
-		if errs := validation.ValidatePodCreate(newPod, opts); len(errs) > 0 {
+		if errs := validation.ValidatePodCreate(newPod, validation.PodValidationOptions{}); len(errs) > 0 {
 			err = fmt.Errorf("invalid pod: %v", errs)
 			return true, pods, err
 		}

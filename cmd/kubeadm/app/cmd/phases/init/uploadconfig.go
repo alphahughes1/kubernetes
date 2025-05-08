@@ -20,14 +20,17 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/features"
 	kubeletphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubelet"
 	patchnodephase "k8s.io/kubernetes/cmd/kubeadm/app/phases/patchnode"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/uploadconfig"
@@ -43,12 +46,12 @@ var (
 
 	uploadKubeadmConfigExample = cmdutil.Examples(`
 		# upload the configuration of your cluster
-		kubeadm init phase upload-config --config=myConfig.yaml
+		kubeadm init phase upload-config kubeadm --config=myConfig.yaml
 		`)
 
 	uploadKubeletConfigLongDesc = cmdutil.LongDesc(`
-		Upload kubelet configuration extracted from the kubeadm InitConfiguration object to a ConfigMap
-		of the form kubelet-config-1.X in the cluster, where X is the minor version of the current (API Server) Kubernetes version.
+		Upload the kubelet configuration extracted from the kubeadm InitConfiguration object
+		to a kubelet-config ConfigMap in the cluster
 		`)
 
 	uploadKubeletConfigExample = cmdutil.Examples(`
@@ -63,7 +66,6 @@ func NewUploadConfigPhase() workflow.Phase {
 		Name:    "upload-config",
 		Aliases: []string{"uploadconfig"},
 		Short:   "Upload the kubeadm and kubelet configuration to a ConfigMap",
-		Long:    cmdutil.MacroCommandLongDescription,
 		Phases: []workflow.Phase{
 			{
 				Name:           "all",
@@ -94,7 +96,9 @@ func NewUploadConfigPhase() workflow.Phase {
 func getUploadConfigPhaseFlags() []string {
 	return []string{
 		options.CfgPath,
+		options.NodeCRISocket,
 		options.KubeconfigPath,
+		options.DryRun,
 	}
 }
 
@@ -124,9 +128,11 @@ func runUploadKubeletConfig(c workflow.RunData) error {
 		return errors.Wrap(err, "error creating kubelet configuration ConfigMap")
 	}
 
-	klog.V(1).Infoln("[upload-config] Preserving the CRISocket information for the control-plane node")
-	if err := patchnodephase.AnnotateCRISocket(client, cfg.NodeRegistration.Name, cfg.NodeRegistration.CRISocket); err != nil {
-		return errors.Wrap(err, "Error writing Crisocket information for the control-plane node")
+	if !features.Enabled(cfg.FeatureGates, features.NodeLocalCRISocket) {
+		klog.V(1).Infoln("[upload-config] Preserving the CRISocket information for the control-plane node")
+		if err := patchnodephase.AnnotateCRISocket(client, cfg.NodeRegistration.Name, cfg.NodeRegistration.CRISocket); err != nil {
+			return errors.Wrap(err, "error writing CRISocket for this node")
+		}
 	}
 	return nil
 }

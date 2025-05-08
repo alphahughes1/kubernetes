@@ -14,23 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package node implements phases of 'kubeadm upgrade node'.
 package node
 
 import (
-	"k8s.io/apimachinery/pkg/util/sets"
-	clientset "k8s.io/client-go/kubernetes"
-	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/upgrade"
 )
 
 // Data is the interface to use for kubeadm upgrade node phases.
 // The "nodeData" type from "cmd/upgrade/node.go" must satisfy this interface.
 type Data interface {
-	EtcdUpgrade() bool
-	RenewCerts() bool
-	DryRun() bool
-	Cfg() *kubeadmapi.InitConfiguration
-	IsControlPlaneNode() bool
-	Client() clientset.Interface
-	IgnorePreflightErrors() sets.String
-	PatchesDir() string
+	upgrade.Data
+
+	KubeConfigPath() string
 }

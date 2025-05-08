@@ -18,7 +18,7 @@ package top
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -30,7 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/rest/fake"
 	core "k8s.io/client-go/testing"
 	cmdtesting "k8s.io/kubectl/pkg/cmd/testing"
@@ -107,8 +107,14 @@ func TestTopPod(t *testing.T) {
 		},
 		{
 			name:          "pod with label selector",
-			options:       &TopPodOptions{Selector: "key=value"},
+			options:       &TopPodOptions{LabelSelector: "key=value"},
 			expectedQuery: "labelSelector=" + url.QueryEscape("key=value"),
+			namespaces:    []string{testNS, testNS},
+		},
+		{
+			name:          "pod with field selector",
+			options:       &TopPodOptions{FieldSelector: "key=value"},
+			expectedQuery: "fieldSelector=" + url.QueryEscape("key=value"),
 			namespaces:    []string{testNS, testNS},
 		},
 		{
@@ -209,9 +215,9 @@ func TestTopPod(t *testing.T) {
 				Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 					switch p := req.URL.Path; {
 					case p == "/api":
-						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: ioutil.NopCloser(bytes.NewReader([]byte(apibody)))}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apibody)))}, nil
 					case p == "/apis":
-						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: ioutil.NopCloser(bytes.NewReader([]byte(apisbodyWithMetrics)))}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apisbodyWithMetrics)))}, nil
 					default:
 						t.Fatalf("%s: unexpected request: %#v\nGot URL: %#v",
 							testCase.name, req, req.URL)
@@ -220,7 +226,7 @@ func TestTopPod(t *testing.T) {
 				}),
 			}
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
-			streams, _, buf, _ := genericclioptions.NewTestIOStreams()
+			streams, _, buf, _ := genericiooptions.NewTestIOStreams()
 
 			cmd := NewCmdTopPod(tf, nil, streams)
 			var cmdOptions *TopPodOptions
@@ -340,9 +346,9 @@ func TestTopPodNoResourcesFound(t *testing.T) {
 				Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 					switch p := req.URL.Path; {
 					case p == "/api":
-						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: ioutil.NopCloser(bytes.NewReader([]byte(apibody)))}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apibody)))}, nil
 					case p == "/apis":
-						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: ioutil.NopCloser(bytes.NewReader([]byte(apisbodyWithMetrics)))}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: io.NopCloser(bytes.NewReader([]byte(apisbodyWithMetrics)))}, nil
 					case p == "/api/v1/namespaces/"+testNS+"/pods":
 						// Top Pod calls this endpoint to check if there are pods whenever it gets no metrics,
 						// so we need to return no pods for this test scenario
@@ -361,7 +367,7 @@ func TestTopPodNoResourcesFound(t *testing.T) {
 				}),
 			}
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
-			streams, _, buf, errbuf := genericclioptions.NewTestIOStreams()
+			streams, _, buf, errbuf := genericiooptions.NewTestIOStreams()
 
 			cmd := NewCmdTopPod(tf, nil, streams)
 			var cmdOptions *TopPodOptions

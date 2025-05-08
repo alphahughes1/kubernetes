@@ -22,25 +22,17 @@ limitations under the License.
 package main
 
 import (
-	"math/rand"
 	"os"
-	"time"
 
-	"k8s.io/component-base/logs"
-	_ "k8s.io/component-base/logs/json/register" // for JSON log format registration
-	_ "k8s.io/component-base/metrics/prometheus/restclient"
-	_ "k8s.io/component-base/metrics/prometheus/version" // for version metric registration
+	"k8s.io/component-base/cli"
+	_ "k8s.io/component-base/logs/json/register"          // for JSON log format registration
+	_ "k8s.io/component-base/metrics/prometheus/clientgo" // for client metric registration
+	_ "k8s.io/component-base/metrics/prometheus/version"  // for version metric registration
 	"k8s.io/kubernetes/cmd/kubelet/app"
 )
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	command := app.NewKubeletCommand()
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
-	if err := command.Execute(); err != nil {
-		os.Exit(1)
-	}
+	code := cli.Run(command)
+	os.Exit(code)
 }

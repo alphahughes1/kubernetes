@@ -21,12 +21,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/rest/fake"
 	cmdtesting "k8s.io/kubectl/pkg/cmd/testing"
 	"k8s.io/kubectl/pkg/scheme"
@@ -66,7 +68,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector: map[string]string{"app": "go"},
@@ -97,7 +99,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector: map[string]string{"func": "stream"},
@@ -129,7 +131,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolTCP,
 							Port:       80,
-							TargetPort: intstr.FromInt(80),
+							TargetPort: intstr.FromInt32(80),
 						},
 					},
 					Selector: map[string]string{"run": "this"},
@@ -160,7 +162,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector: map[string]string{"func": "stream"},
@@ -192,7 +194,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector:        map[string]string{"func": "stream"},
@@ -225,7 +227,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector:  map[string]string{"func": "stream"},
@@ -257,7 +259,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector:  map[string]string{"func": "stream"},
@@ -315,7 +317,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector: map[string]string{"func": "stream"},
@@ -343,7 +345,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolTCP,
 							Port:       90,
-							TargetPort: intstr.FromInt(90),
+							TargetPort: intstr.FromInt32(90),
 						},
 					},
 					Selector: map[string]string{"svc": "frompod"},
@@ -367,12 +369,12 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolTCP,
 							Port:       80,
-							TargetPort: intstr.FromInt(80),
+							TargetPort: intstr.FromInt32(80),
 						},
 						{
 							Protocol:   corev1.ProtocolTCP,
 							Port:       443,
-							TargetPort: intstr.FromInt(443),
+							TargetPort: intstr.FromInt32(443),
 						},
 					},
 				},
@@ -386,13 +388,13 @@ func TestRunExposeService(t *testing.T) {
 							Name:       "port-1",
 							Protocol:   corev1.ProtocolTCP,
 							Port:       80,
-							TargetPort: intstr.FromInt(80),
+							TargetPort: intstr.FromInt32(80),
 						},
 						{
 							Name:       "port-2",
 							Protocol:   corev1.ProtocolTCP,
 							Port:       443,
-							TargetPort: intstr.FromInt(443),
+							TargetPort: intstr.FromInt32(443),
 						},
 					},
 					Selector: map[string]string{"svc": "fromfoo"},
@@ -416,22 +418,22 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolTCP,
 							Port:       80,
-							TargetPort: intstr.FromInt(80),
+							TargetPort: intstr.FromInt32(80),
 						},
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       8080,
-							TargetPort: intstr.FromInt(8080),
+							TargetPort: intstr.FromInt32(8080),
 						},
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       8081,
-							TargetPort: intstr.FromInt(8081),
+							TargetPort: intstr.FromInt32(8081),
 						},
 						{
 							Protocol:   corev1.ProtocolSCTP,
 							Port:       8082,
-							TargetPort: intstr.FromInt(8082),
+							TargetPort: intstr.FromInt32(8082),
 						},
 					},
 				},
@@ -445,25 +447,25 @@ func TestRunExposeService(t *testing.T) {
 							Name:       "port-1",
 							Protocol:   corev1.ProtocolTCP,
 							Port:       80,
-							TargetPort: intstr.FromInt(80),
+							TargetPort: intstr.FromInt32(80),
 						},
 						{
 							Name:       "port-2",
 							Protocol:   corev1.ProtocolUDP,
 							Port:       8080,
-							TargetPort: intstr.FromInt(8080),
+							TargetPort: intstr.FromInt32(8080),
 						},
 						{
 							Name:       "port-3",
 							Protocol:   corev1.ProtocolUDP,
 							Port:       8081,
-							TargetPort: intstr.FromInt(8081),
+							TargetPort: intstr.FromInt32(8081),
 						},
 						{
 							Name:       "port-4",
 							Protocol:   corev1.ProtocolSCTP,
 							Port:       8082,
-							TargetPort: intstr.FromInt(8082),
+							TargetPort: intstr.FromInt32(8082),
 						},
 					},
 					Selector: map[string]string{"svc": "fromfoo"},
@@ -494,7 +496,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolSCTP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector: map[string]string{"app": "go"},
@@ -525,7 +527,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolSCTP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector: map[string]string{"func": "stream"},
@@ -556,7 +558,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolSCTP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector:  map[string]string{"func": "stream"},
@@ -588,7 +590,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolSCTP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector:  map[string]string{"func": "stream"},
@@ -620,7 +622,7 @@ func TestRunExposeService(t *testing.T) {
 						{
 							Protocol:   corev1.ProtocolUDP,
 							Port:       14,
-							TargetPort: intstr.FromInt(14),
+							TargetPort: intstr.FromInt32(14),
 						},
 					},
 					Selector: map[string]string{"func": "stream"},
@@ -637,7 +639,7 @@ func TestRunExposeService(t *testing.T) {
 			tf := cmdtesting.NewTestFactory().WithNamespace(test.ns)
 			defer tf.Cleanup()
 
-			codec := scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
+			codec := runtime.NewCodec(scheme.DefaultJSONEncoder(), scheme.Codecs.UniversalDecoder(scheme.Scheme.PrioritizedVersionsAllGroups()...))
 			ns := scheme.Codecs.WithoutConversion()
 
 			tf.Client = &fake.RESTClient{
@@ -656,9 +658,10 @@ func TestRunExposeService(t *testing.T) {
 				}),
 			}
 
-			ioStreams, _, buf, _ := genericclioptions.NewTestIOStreams()
+			ioStreams, _, buf, _ := genericiooptions.NewTestIOStreams()
 			cmd := NewCmdExposeService(tf, ioStreams)
-			cmd.SetOutput(buf)
+			cmd.SetOut(buf)
+			cmd.SetErr(buf)
 			for flag, value := range test.flags {
 				cmd.Flags().Set(flag, value)
 			}
@@ -674,5 +677,1090 @@ func TestRunExposeService(t *testing.T) {
 				t.Errorf("%s: Unexpected output! Expected\n%s\ngot\n%s", test.name, test.expected, out)
 			}
 		})
+	}
+}
+
+func TestExposeOverride(t *testing.T) {
+	tests := []struct {
+		name         string
+		overrides    string
+		overrideType string
+		expected     string
+	}{
+		{
+			name:         "expose with merge override type should replace the entire spec",
+			overrides:    `{"spec": {"ports": [{"protocol": "TCP", "port": 1111, "targetPort": 2222}]}, "selector": {"app": "go"}}`,
+			overrideType: "merge",
+			expected: `apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    svc: test
+  name: foo
+  namespace: test
+spec:
+  ports:
+  - port: 1111
+    protocol: TCP
+    targetPort: 2222
+  selector:
+    app: go
+status:
+  loadBalancer: {}
+`,
+		},
+		{
+			name:         "expose with strategic override type should add port before existing port",
+			overrides:    `{"spec": {"ports": [{"protocol": "TCP", "port": 1111, "targetPort": 2222}]}}`,
+			overrideType: "strategic",
+			expected: `apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    svc: test
+  name: foo
+  namespace: test
+spec:
+  ports:
+  - port: 1111
+    protocol: TCP
+    targetPort: 2222
+  - port: 14
+    protocol: UDP
+    targetPort: 14
+  selector:
+    app: go
+status:
+  loadBalancer: {}
+`,
+		},
+		{
+			name: "expose with json override type should add port before existing port",
+			overrides: `[
+				{"op": "add", "path": "/spec/ports/0", "value": {"port": 1111, "protocol": "TCP", "targetPort": 2222}}
+			]`,
+			overrideType: "json",
+			expected: `apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    svc: test
+  name: foo
+  namespace: test
+spec:
+  ports:
+  - port: 1111
+    protocol: TCP
+    targetPort: 2222
+  - port: 14
+    protocol: UDP
+    targetPort: 14
+  selector:
+    app: go
+status:
+  loadBalancer: {}
+`,
+		},
+		{
+			name: "expose with json override type should add port after existing port",
+			overrides: `[
+				{"op": "add", "path": "/spec/ports/1", "value": {"port": 1111, "protocol": "TCP", "targetPort": 2222}}
+			]`,
+			overrideType: "json",
+			expected: `apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    svc: test
+  name: foo
+  namespace: test
+spec:
+  ports:
+  - port: 14
+    protocol: UDP
+    targetPort: 14
+  - port: 1111
+    protocol: TCP
+    targetPort: 2222
+  selector:
+    app: go
+status:
+  loadBalancer: {}
+`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tf := cmdtesting.NewTestFactory().WithNamespace("test")
+			defer tf.Cleanup()
+
+			codec := runtime.NewCodec(scheme.DefaultJSONEncoder(), scheme.Codecs.UniversalDecoder(scheme.Scheme.PrioritizedVersionsAllGroups()...))
+			ns := scheme.Codecs.WithoutConversion()
+
+			tf.Client = &fake.RESTClient{
+				GroupVersion:         schema.GroupVersion{Version: "v1"},
+				NegotiatedSerializer: ns,
+				Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+					switch p, m := req.URL.Path, req.Method; {
+					case p == "/namespaces/test/services/baz" && m == "GET":
+						return &http.Response{StatusCode: 200, Header: cmdtesting.DefaultHeader(), Body: cmdtesting.ObjBody(codec, &corev1.Service{
+							ObjectMeta: metav1.ObjectMeta{Name: "baz", Namespace: "test", ResourceVersion: "12"},
+							Spec: corev1.ServiceSpec{
+								Selector: map[string]string{"app": "go"},
+							},
+						})}, nil
+					case p == "/namespaces/test/services" && m == "POST":
+						return &http.Response{StatusCode: 200, Header: cmdtesting.DefaultHeader(), Body: cmdtesting.ObjBody(codec, &corev1.Service{
+							ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "", Labels: map[string]string{"svc": "test"}},
+							Spec: corev1.ServiceSpec{
+								Ports: []corev1.ServicePort{
+									{
+										Protocol:   corev1.ProtocolUDP,
+										Port:       14,
+										TargetPort: intstr.FromInt32(14),
+									},
+								},
+								Selector: map[string]string{"app": "go"},
+							},
+						})}, nil
+					default:
+						t.Fatalf("unexpected request: %#v\n%#v", req.URL, req)
+						return nil, nil
+					}
+				}),
+			}
+
+			ioStreams, _, buf, _ := genericiooptions.NewTestIOStreams()
+			cmd := NewCmdExposeService(tf, ioStreams)
+			cmd.SetOut(buf)
+			cmd.Flags().Set("protocol", "UDP")
+			cmd.Flags().Set("port", "14")
+			cmd.Flags().Set("name", "foo")
+			cmd.Flags().Set("labels", "svc=test")
+			cmd.Flags().Set("dry-run", "client")
+			cmd.Flags().Set("overrides", test.overrides)
+			cmd.Flags().Set("override-type", test.overrideType)
+			cmd.Flags().Set("output", "yaml")
+			cmd.Run(cmd, []string{"service", "baz"})
+
+			out := buf.String()
+
+			if test.expected == "" {
+				t.Errorf("%s: Invalid test case. Specify expected result.\n", test.name)
+			}
+
+			if !strings.Contains(out, test.expected) {
+				t.Errorf("%s: Unexpected output! Expected\n%s\ngot\n%s", test.name, test.expected, out)
+			}
+		})
+	}
+}
+
+func TestGenerateService(t *testing.T) {
+	tests := map[string]struct {
+		selector        string
+		name            string
+		port            string
+		protocol        string
+		protocols       string
+		targetPort      string
+		clusterIP       string
+		labels          string
+		externalIP      string
+		serviceType     string
+		sessionAffinity string
+		setup           func(t *testing.T, exposeServiceOptions *ExposeServiceOptions) func()
+
+		expected  *corev1.Service
+		expectErr string
+	}{
+		"test1": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "TCP",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "TCP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+				},
+			},
+		},
+		"test2": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "UDP",
+			targetPort: "foobar",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "UDP",
+							TargetPort: intstr.FromString("foobar"),
+						},
+					},
+				},
+			},
+		},
+		"test3": {
+			selector:   "foo=bar,baz=blah",
+			labels:     "key1=value1,key2=value2",
+			name:       "test",
+			port:       "80",
+			protocol:   "TCP",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+					Labels: map[string]string{
+						"key1": "value1",
+						"key2": "value2",
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "TCP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+				},
+			},
+		},
+		"test4": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "UDP",
+			externalIP: "1.2.3.4",
+			targetPort: "foobar",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "UDP",
+							TargetPort: intstr.FromString("foobar"),
+						},
+					},
+					ExternalIPs: []string{"1.2.3.4"},
+				},
+			},
+		},
+		"test5": {
+			selector:    "foo=bar,baz=blah",
+			name:        "test",
+			port:        "80",
+			protocol:    "UDP",
+			externalIP:  "1.2.3.4",
+			serviceType: "LoadBalancer",
+			targetPort:  "foobar",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "UDP",
+							TargetPort: intstr.FromString("foobar"),
+						},
+					},
+					Type:        corev1.ServiceTypeLoadBalancer,
+					ExternalIPs: []string{"1.2.3.4"},
+				},
+			},
+		},
+		"test6": {
+			selector:    "foo=bar,baz=blah",
+			name:        "test",
+			port:        "80",
+			protocol:    "UDP",
+			targetPort:  "foobar",
+			serviceType: string(corev1.ServiceTypeNodePort),
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "UDP",
+							TargetPort: intstr.FromString("foobar"),
+						},
+					},
+					Type: corev1.ServiceTypeNodePort,
+				},
+			},
+		},
+		"test7": {
+			selector:    "foo=bar,baz=blah",
+			name:        "test",
+			port:        "80",
+			protocol:    "UDP",
+			targetPort:  "foobar",
+			serviceType: string(corev1.ServiceTypeNodePort),
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "UDP",
+							TargetPort: intstr.FromString("foobar"),
+						},
+					},
+					Type: corev1.ServiceTypeNodePort,
+				},
+			},
+		},
+		"test8": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "TCP",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "TCP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+				},
+			},
+		},
+		"test9": {
+			selector:        "foo=bar,baz=blah",
+			name:            "test",
+			port:            "80",
+			protocol:        "TCP",
+			sessionAffinity: "ClientIP",
+			targetPort:      "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "TCP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+					SessionAffinity: corev1.ServiceAffinityClientIP,
+				},
+			},
+		},
+		"test10": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "TCP",
+			clusterIP:  "10.10.10.10",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+
+							Port:       80,
+							Protocol:   "TCP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+					ClusterIP: "10.10.10.10",
+				},
+			},
+		},
+		"test11": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "TCP",
+			clusterIP:  "None",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+
+							Port:       80,
+							Protocol:   "TCP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+					ClusterIP: corev1.ClusterIPNone,
+				},
+			},
+		},
+		"test12": {
+			selector:   "foo=bar",
+			name:       "test",
+			port:       "80,443",
+			protocol:   "TCP",
+			targetPort: "foobar",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1",
+							Port:       80,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("foobar"),
+						},
+						{
+							Name:       "port-2",
+							Port:       443,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromString("foobar"),
+						},
+					},
+				},
+			},
+		},
+		"test13": {
+			selector:   "foo=bar",
+			name:       "test",
+			port:       "80,443",
+			protocol:   "UDP",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1",
+							Port:       80,
+							Protocol:   corev1.ProtocolUDP,
+							TargetPort: intstr.FromInt32(1234),
+						},
+						{
+							Name:       "port-2",
+							Port:       443,
+							Protocol:   corev1.ProtocolUDP,
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+				},
+			},
+		},
+		"test14": {
+			selector: "foo=bar",
+			name:     "test",
+			port:     "80,443",
+			protocol: "TCP",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1",
+							Port:       80,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromInt32(80),
+						},
+						{
+							Name:       "port-2",
+							Port:       443,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromInt32(443),
+						},
+					},
+				},
+			},
+		},
+		"test15": {
+			selector:  "foo=bar",
+			name:      "test",
+			port:      "80,8080",
+			protocols: "8080/UDP",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1",
+							Port:       80,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromInt32(80),
+						},
+						{
+							Name:       "port-2",
+							Port:       8080,
+							Protocol:   corev1.ProtocolUDP,
+							TargetPort: intstr.FromInt32(8080),
+						},
+					},
+				},
+			},
+		},
+		"test16": {
+			selector:  "foo=bar",
+			name:      "test",
+			port:      "80,8080,8081",
+			protocols: "8080/UDP,8081/TCP",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1",
+							Port:       80,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromInt32(80),
+						},
+						{
+							Name:       "port-2",
+							Port:       8080,
+							Protocol:   corev1.ProtocolUDP,
+							TargetPort: intstr.FromInt32(8080),
+						},
+						{
+							Name:       "port-3",
+							Port:       8081,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromInt32(8081),
+						},
+					},
+				},
+			},
+		},
+		"test17": {
+			selector:  "foo=bar,baz=blah",
+			name:      "test",
+			protocol:  "TCP",
+			clusterIP: "None",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports:     []corev1.ServicePort{},
+					ClusterIP: corev1.ClusterIPNone,
+				},
+			},
+		},
+		"test18": {
+			selector:  "foo=bar",
+			name:      "test",
+			clusterIP: "None",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports:     []corev1.ServicePort{},
+					ClusterIP: corev1.ClusterIPNone,
+				},
+			},
+		},
+		"test19": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "SCTP",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+
+							Port:       80,
+							Protocol:   "SCTP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+				},
+			},
+		},
+		"test20": {
+			selector:   "foo=bar,baz=blah",
+			labels:     "key1=value1,key2=value2",
+			name:       "test",
+			port:       "80",
+			protocol:   "SCTP",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+					Labels: map[string]string{
+						"key1": "value1",
+						"key2": "value2",
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+
+							Port:       80,
+							Protocol:   "SCTP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+				},
+			},
+		},
+		"test21": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "SCTP",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+
+							Port:       80,
+							Protocol:   "SCTP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+				},
+			},
+		},
+		"test22": {
+			selector:        "foo=bar,baz=blah",
+			name:            "test",
+			port:            "80",
+			protocol:        "SCTP",
+			sessionAffinity: "ClientIP",
+			targetPort:      "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "SCTP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+					SessionAffinity: corev1.ServiceAffinityClientIP,
+				},
+			},
+		},
+		"test23": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "SCTP",
+			clusterIP:  "10.10.10.10",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							Protocol:   "SCTP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+					ClusterIP: "10.10.10.10",
+				},
+			},
+		},
+		"test24": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			port:       "80",
+			protocol:   "SCTP",
+			clusterIP:  "None",
+			targetPort: "1234",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+
+							Port:       80,
+							Protocol:   "SCTP",
+							TargetPort: intstr.FromInt32(1234),
+						},
+					},
+					ClusterIP: corev1.ClusterIPNone,
+				},
+			},
+		},
+		"test25": {
+			selector:   "foo=bar",
+			name:       "test",
+			port:       "80,443",
+			protocol:   "SCTP",
+			targetPort: "foobar",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1",
+							Port:       80,
+							Protocol:   corev1.ProtocolSCTP,
+							TargetPort: intstr.FromString("foobar"),
+						},
+						{
+							Name:       "port-2",
+							Port:       443,
+							Protocol:   corev1.ProtocolSCTP,
+							TargetPort: intstr.FromString("foobar"),
+						},
+					},
+				},
+			},
+		},
+		"test26": {
+			selector: "foo=bar",
+			name:     "test",
+			port:     "80,443",
+			protocol: "SCTP",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1",
+							Port:       80,
+							Protocol:   corev1.ProtocolSCTP,
+							TargetPort: intstr.FromInt32(80),
+						},
+						{
+							Name:       "port-2",
+							Port:       443,
+							Protocol:   corev1.ProtocolSCTP,
+							TargetPort: intstr.FromInt32(443),
+						},
+					},
+				},
+			},
+		},
+		"test27": {
+			selector:  "foo=bar",
+			name:      "test",
+			port:      "80,8080",
+			protocols: "8080/SCTP",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1",
+							Port:       80,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromInt32(80),
+						},
+						{
+							Name:       "port-2",
+							Port:       8080,
+							Protocol:   corev1.ProtocolSCTP,
+							TargetPort: intstr.FromInt32(8080),
+						},
+					},
+				},
+			},
+		},
+		"test28": {
+			selector:  "foo=bar",
+			name:      "test",
+			port:      "80,8080,8081,8082",
+			protocols: "8080/UDP,8081/TCP,8082/SCTP",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1",
+							Port:       80,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromInt32(80),
+						},
+						{
+							Name:       "port-2",
+							Port:       8080,
+							Protocol:   corev1.ProtocolUDP,
+							TargetPort: intstr.FromInt32(8080),
+						},
+						{
+							Name:       "port-3",
+							Port:       8081,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromInt32(8081),
+						},
+						{
+							Name:       "port-4",
+							Port:       8082,
+							Protocol:   corev1.ProtocolSCTP,
+							TargetPort: intstr.FromInt32(8082),
+						},
+					},
+				},
+			},
+		},
+		"test 29": {
+			selector:   "foo=bar,baz=blah",
+			name:       "test",
+			protocol:   "SCTP",
+			targetPort: "1234",
+			clusterIP:  "None",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports:     []corev1.ServicePort{},
+					ClusterIP: corev1.ClusterIPNone,
+				},
+			},
+		},
+		// Fixed #114402 kubectl expose fails for apps with same-port, different-protocol
+		"test #114402": {
+			selector:  "foo=bar,baz=blah",
+			name:      "test",
+			clusterIP: "None",
+			protocols: "53/TCP,53/UDP",
+			port:      "53",
+			expected: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{
+						"foo": "bar",
+						"baz": "blah",
+					},
+					Ports: []corev1.ServicePort{
+						{
+							Name:       "port-1-tcp",
+							Port:       53,
+							Protocol:   corev1.ProtocolTCP,
+							TargetPort: intstr.FromInt32(53),
+						},
+						{
+							Name:       "port-1-udp",
+							Port:       53,
+							Protocol:   corev1.ProtocolUDP,
+							TargetPort: intstr.FromInt32(53),
+						},
+					},
+					ClusterIP: corev1.ClusterIPNone,
+				},
+			},
+		},
+		"check selector": {
+			name:       "test",
+			protocol:   "SCTP",
+			targetPort: "1234",
+			clusterIP:  "None",
+			expectErr:  `selector must be specified`,
+		},
+		"check name": {
+			selector:   "foo=bar,baz=blah",
+			protocol:   "SCTP",
+			targetPort: "1234",
+			clusterIP:  "None",
+			expectErr:  `name must be specified`,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			exposeServiceOptions := ExposeServiceOptions{
+				Selector:        test.selector,
+				Name:            test.name,
+				Protocol:        test.protocol,
+				Protocols:       test.protocols,
+				Port:            test.port,
+				ClusterIP:       test.clusterIP,
+				TargetPort:      test.targetPort,
+				Labels:          test.labels,
+				ExternalIP:      test.externalIP,
+				Type:            test.serviceType,
+				SessionAffinity: test.sessionAffinity,
+			}
+
+			service, err := exposeServiceOptions.createService()
+			if test.expectErr == "" {
+				require.NoError(t, err)
+				if !apiequality.Semantic.DeepEqual(service, test.expected) {
+					t.Errorf("\nexpected:\n%#v\ngot:\n%#v", test.expected, service)
+				}
+			} else {
+				require.Error(t, err)
+				require.EqualError(t, err, test.expectErr)
+			}
+
+		})
+
 	}
 }

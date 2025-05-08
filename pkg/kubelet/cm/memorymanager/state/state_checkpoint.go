@@ -18,7 +18,7 @@ package state
 
 import (
 	"fmt"
-	"path"
+	"path/filepath"
 	"sync"
 
 	"k8s.io/klog/v2"
@@ -50,9 +50,9 @@ func NewCheckpointState(stateDir, checkpointName, policyName string) (State, err
 	}
 
 	if err := stateCheckpoint.restoreState(); err != nil {
-		//lint:ignore ST1005 user-facing error message
+		//nolint:staticcheck // ST1005 user-facing error message
 		return nil, fmt.Errorf("could not restore state from checkpoint: %v, please drain this node and delete the memory manager checkpoint file %q before restarting Kubelet",
-			err, path.Join(stateDir, checkpointName))
+			err, filepath.Join(stateDir, checkpointName))
 	}
 
 	return stateCheckpoint, nil
@@ -131,7 +131,7 @@ func (sc *stateCheckpoint) SetMachineState(memoryMap NUMANodeMap) {
 	sc.cache.SetMachineState(memoryMap)
 	err := sc.storeState()
 	if err != nil {
-		klog.InfoS("Store state to checkpoint error", "err", err)
+		klog.ErrorS(err, "Failed to store state to checkpoint")
 	}
 }
 
@@ -143,7 +143,7 @@ func (sc *stateCheckpoint) SetMemoryBlocks(podUID string, containerName string, 
 	sc.cache.SetMemoryBlocks(podUID, containerName, blocks)
 	err := sc.storeState()
 	if err != nil {
-		klog.InfoS("Store state to checkpoint error", "err", err)
+		klog.ErrorS(err, "Failed to store state to checkpoint", "podUID", podUID, "containerName", containerName)
 	}
 }
 
@@ -155,7 +155,7 @@ func (sc *stateCheckpoint) SetMemoryAssignments(assignments ContainerMemoryAssig
 	sc.cache.SetMemoryAssignments(assignments)
 	err := sc.storeState()
 	if err != nil {
-		klog.InfoS("Store state to checkpoint error", "err", err)
+		klog.ErrorS(err, "Failed to store state to checkpoint")
 	}
 }
 
@@ -167,7 +167,7 @@ func (sc *stateCheckpoint) Delete(podUID string, containerName string) {
 	sc.cache.Delete(podUID, containerName)
 	err := sc.storeState()
 	if err != nil {
-		klog.InfoS("Store state to checkpoint error", "err", err)
+		klog.ErrorS(err, "Failed to store state to checkpoint", "podUID", podUID, "containerName", containerName)
 	}
 }
 
@@ -179,6 +179,6 @@ func (sc *stateCheckpoint) ClearState() {
 	sc.cache.ClearState()
 	err := sc.storeState()
 	if err != nil {
-		klog.InfoS("Store state to checkpoint error", "err", err)
+		klog.ErrorS(err, "Failed to store state to checkpoint")
 	}
 }

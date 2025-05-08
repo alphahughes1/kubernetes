@@ -21,6 +21,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
+
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 )
 
@@ -34,9 +36,10 @@ type InitData interface {
 	Cfg() *kubeadmapi.InitConfiguration
 	DryRun() bool
 	SkipTokenPrint() bool
-	IgnorePreflightErrors() sets.String
+	IgnorePreflightErrors() sets.Set[string]
 	CertificateWriteDir() string
 	CertificateDir() string
+	KubeConfig() (*clientcmdapi.Config, error)
 	KubeConfigDir() string
 	KubeConfigPath() string
 	ManifestDir() string
@@ -44,6 +47,7 @@ type InitData interface {
 	ExternalCA() bool
 	OutputWriter() io.Writer
 	Client() (clientset.Interface, error)
+	ClientWithoutBootstrap() (clientset.Interface, error)
 	Tokens() []string
 	PatchesDir() string
 }

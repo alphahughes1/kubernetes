@@ -20,9 +20,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -109,7 +109,7 @@ func TestGetResourceRequest(t *testing.T) {
 	as := assert.New(t)
 	for idx, tc := range cases {
 		actual := GetResourceRequest(tc.pod, tc.resourceName)
-		as.Equal(actual, tc.expectedValue, "expected test case [%d] %v: to return %q; got %q instead", idx, tc.cName, tc.expectedValue, actual)
+		as.Equal(tc.expectedValue, actual, "expected test case [%d] %v: to return %q; got %q instead", idx, tc.cName, tc.expectedValue, actual)
 	}
 }
 
@@ -259,80 +259,10 @@ func TestExtractResourceValue(t *testing.T) {
 	for idx, tc := range cases {
 		actual, err := ExtractResourceValueByContainerName(tc.fs, tc.pod, tc.cName)
 		if tc.expectedError != nil {
-			as.Equal(tc.expectedError, err, "expected test case [%d] to fail with error %v; got %v", idx, tc.expectedError, err)
+			require.EqualError(t, err, tc.expectedError.Error(), "expected test case [%d] to fail with error %v; got %v", idx, tc.expectedError, err)
 		} else {
-			as.Nil(err, "expected test case [%d] to not return an error; got %v", idx, err)
+			require.NoError(t, err, "expected test case [%d] to not return an error; got %v", idx, err)
 			as.Equal(tc.expectedValue, actual, "expected test case [%d] to return %q; got %q instead", idx, tc.expectedValue, actual)
-		}
-	}
-}
-
-func TestPodRequestsAndLimits(t *testing.T) {
-	cases := []struct {
-		pod              *v1.Pod
-		cName            string
-		expectedRequests v1.ResourceList
-		expectedLimits   v1.ResourceList
-	}{
-		{
-			cName:            "just-limit-no-overhead",
-			pod:              getPod("foo", podResources{cpuLimit: "9"}),
-			expectedRequests: v1.ResourceList{},
-			expectedLimits: v1.ResourceList{
-				v1.ResourceName(v1.ResourceCPU): resource.MustParse("9"),
-			},
-		},
-		{
-			cName: "just-overhead",
-			pod:   getPod("foo", podResources{cpuOverhead: "5", memoryOverhead: "5"}),
-			expectedRequests: v1.ResourceList{
-				v1.ResourceName(v1.ResourceCPU):    resource.MustParse("5"),
-				v1.ResourceName(v1.ResourceMemory): resource.MustParse("5"),
-			},
-			expectedLimits: v1.ResourceList{},
-		},
-		{
-			cName: "req-and-overhead",
-			pod:   getPod("foo", podResources{cpuRequest: "1", memoryRequest: "10", cpuOverhead: "5", memoryOverhead: "5"}),
-			expectedRequests: v1.ResourceList{
-				v1.ResourceName(v1.ResourceCPU):    resource.MustParse("6"),
-				v1.ResourceName(v1.ResourceMemory): resource.MustParse("15"),
-			},
-			expectedLimits: v1.ResourceList{},
-		},
-		{
-			cName: "all-req-lim-and-overhead",
-			pod:   getPod("foo", podResources{cpuRequest: "1", cpuLimit: "2", memoryRequest: "10", memoryLimit: "12", cpuOverhead: "5", memoryOverhead: "5"}),
-			expectedRequests: v1.ResourceList{
-				v1.ResourceName(v1.ResourceCPU):    resource.MustParse("6"),
-				v1.ResourceName(v1.ResourceMemory): resource.MustParse("15"),
-			},
-			expectedLimits: v1.ResourceList{
-				v1.ResourceName(v1.ResourceCPU):    resource.MustParse("7"),
-				v1.ResourceName(v1.ResourceMemory): resource.MustParse("17"),
-			},
-		},
-		{
-			cName: "req-some-lim-and-overhead",
-			pod:   getPod("foo", podResources{cpuRequest: "1", cpuLimit: "2", memoryRequest: "10", cpuOverhead: "5", memoryOverhead: "5"}),
-			expectedRequests: v1.ResourceList{
-				v1.ResourceName(v1.ResourceCPU):    resource.MustParse("6"),
-				v1.ResourceName(v1.ResourceMemory): resource.MustParse("15"),
-			},
-			expectedLimits: v1.ResourceList{
-				v1.ResourceName(v1.ResourceCPU): resource.MustParse("7"),
-			},
-		},
-	}
-	for idx, tc := range cases {
-		resRequests, resLimits := PodRequestsAndLimits(tc.pod)
-
-		if !equality.Semantic.DeepEqual(tc.expectedRequests, resRequests) {
-			t.Errorf("test case failure[%d]: %v, requests:\n expected:\t%v\ngot\t\t%v", idx, tc.cName, tc.expectedRequests, resRequests)
-		}
-
-		if !equality.Semantic.DeepEqual(tc.expectedLimits, resLimits) {
-			t.Errorf("test case failure[%d]: %v, limits:\n expected:\t%v\ngot\t\t%v", idx, tc.cName, tc.expectedLimits, resLimits)
 		}
 	}
 }

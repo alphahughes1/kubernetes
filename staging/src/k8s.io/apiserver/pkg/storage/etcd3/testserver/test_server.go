@@ -22,10 +22,12 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/kubernetes"
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
@@ -49,12 +51,12 @@ func getAvailablePorts(count int) ([]int, error) {
 
 // NewTestConfig returns a configuration for an embedded etcd server.
 // The configuration is based on embed.NewConfig(), with the following adjustments:
-// * sets UnsafeNoFsync = true to improve test performance (only reasonable in a test-only
-//   single-member server we never intend to restart or keep data from)
-// * uses free ports for client and peer listeners
-// * cleans up the data directory on test termination
-// * silences server logs other than errors
-func NewTestConfig(t *testing.T) *embed.Config {
+//   - sets UnsafeNoFsync = true to improve test performance (only reasonable in a test-only
+//     single-member server we never intend to restart or keep data from)
+//   - uses free ports for client and peer listeners
+//   - cleans up the data directory on test termination
+//   - silences server logs other than errors
+func NewTestConfig(t testing.TB) *embed.Config {
 	cfg := embed.NewConfig()
 
 	cfg.UnsafeNoFsync = true
@@ -66,10 +68,10 @@ func NewTestConfig(t *testing.T) *embed.Config {
 	clientURL := url.URL{Scheme: "http", Host: net.JoinHostPort("localhost", strconv.Itoa(ports[0]))}
 	peerURL := url.URL{Scheme: "http", Host: net.JoinHostPort("localhost", strconv.Itoa(ports[1]))}
 
-	cfg.LPUrls = []url.URL{peerURL}
-	cfg.APUrls = []url.URL{peerURL}
-	cfg.LCUrls = []url.URL{clientURL}
-	cfg.ACUrls = []url.URL{clientURL}
+	cfg.ListenPeerUrls = []url.URL{peerURL}
+	cfg.AdvertisePeerUrls = []url.URL{peerURL}
+	cfg.ListenClientUrls = []url.URL{clientURL}
+	cfg.AdvertiseClientUrls = []url.URL{clientURL}
 	cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 
 	cfg.ZapLoggerBuilder = embed.NewZapLoggerBuilder(zaptest.NewLogger(t, zaptest.Level(zapcore.ErrorLevel)).Named("etcd-server"))
@@ -78,13 +80,18 @@ func NewTestConfig(t *testing.T) *embed.Config {
 	return cfg
 }
 
+var autoPortLock sync.Mutex
+
 // RunEtcd starts an embedded etcd server with the provided config
 // (or NewTestConfig(t) if nil), and returns a client connected to the server.
 // The server is terminated when the test ends.
-func RunEtcd(t *testing.T, cfg *embed.Config) *clientv3.Client {
+func RunEtcd(t testing.TB, cfg *embed.Config) *kubernetes.Client {
 	t.Helper()
 
 	if cfg == nil {
+		// if we have to autopick free ports, lock until we successfully start the server on the ports we chose
+		autoPortLock.Lock()
+		defer autoPortLock.Unlock()
 		cfg = NewTestConfig(t)
 	}
 
@@ -112,7 +119,7 @@ func RunEtcd(t *testing.T, cfg *embed.Config) *clientv3.Client {
 		t.Fatal(err)
 	}
 
-	client, err := clientv3.New(clientv3.Config{
+	client, err := kubernetes.New(clientv3.Config{
 		TLS:         tlsConfig,
 		Endpoints:   e.Server.Cluster().ClientURLs(),
 		DialTimeout: 10 * time.Second,

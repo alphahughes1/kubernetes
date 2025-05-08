@@ -21,24 +21,25 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
-source "${KUBE_ROOT}/hack/lib/init.sh"
-source "${KUBE_ROOT}/hack/lib/util.sh"
+KUBE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd -P)"
 
 # allow overriding docker cli, which should work fine for this script
 DOCKER="${DOCKER:-docker}"
 
 # required version for this script, if not installed on the host we will
 # use the official docker image instead. keep this in sync with SHELLCHECK_IMAGE
-SHELLCHECK_VERSION="0.7.1"
-# upstream shellcheck latest stable image as of October 23rd, 2019
-SHELLCHECK_IMAGE="docker.io/koalaman/shellcheck-alpine:v0.7.1@sha256:d6147f30864ddb7c9cf983fc277d345bc315e798e309ddf70062b194843ee252"
+SHELLCHECK_VERSION="0.9.0"
+SHELLCHECK_IMAGE="docker.io/koalaman/shellcheck:v0.9.0@sha256:f35e8987b02760d4e76fc99a68ad5c42cc10bb32f3dd2143a3cf92f1e5446a45"
 
 # disabled lints
 disabled=(
   # this lint disallows non-constant source, which we use extensively without
   # any known bugs
   1090
+  # this lint warns when shellcheck cannot find a sourced file
+  # this wouldn't be a bad idea to warn on, but it fails on lots of path
+  # dependent sourcing, so just disable enforcing it
+  1091
   # this lint prefers command -v to which, they are not the same
   2230
 )
@@ -54,23 +55,25 @@ readonly SHELLCHECK_DISABLED
 # ensure we're linting the k8s source tree
 cd "${KUBE_ROOT}"
 
-# Find all shell scripts excluding:
-# - Anything git-ignored - No need to lint untracked files.
-# - ./_* - No need to lint output directories.
-# - ./.git/* - Ignore anything in the git object store.
-# - ./vendor* - Vendored code should be fixed upstream instead.
-# - ./third_party/*, but re-include ./third_party/forked/*  - only code we
-#    forked should be linted and fixed.
-all_shell_scripts=()
-while IFS=$'\n' read -r script;
-  do git check-ignore -q "$script" || all_shell_scripts+=("$script");
-done < <(find . -name "*.sh" \
-  -not \( \
-    -path ./_\*      -o \
-    -path ./.git\*   -o \
-    -path ./vendor\* -o \
-    \( -path ./third_party\* -a -not -path ./third_party/forked\* \) \
-  \))
+scripts_to_check=("$@")
+if [[ "$#" == 0 ]]; then
+  # Find all shell scripts excluding:
+  # - Anything git-ignored - No need to lint untracked files.
+  # - ./_* - No need to lint output directories.
+  # - ./.git/* - Ignore anything in the git object store.
+  # - ./vendor* - Vendored code should be fixed upstream instead.
+  # - ./third_party/*, but re-include ./third_party/forked/*  - only code we
+  #    forked should be linted and fixed.
+  while IFS=$'\n' read -r script;
+    do git check-ignore -q "$script" || scripts_to_check+=("$script");
+  done < <(find . -name "*.sh" \
+    -not \( \
+      -path ./_\*      -o \
+      -path ./.git\*   -o \
+      -path ./vendor\* -o \
+      \( -path ./third_party\* -a -not -path ./third_party/forked\* \) \
+    \))
+fi
 
 # detect if the host machine has the required shellcheck version installed
 # if so, we will use that instead.
@@ -102,16 +105,18 @@ SHELLCHECK_OPTIONS=(
 )
 
 # tell the user which we've selected and lint all scripts
+# The shellcheck errors are printed to stdout by default, hence they need to be redirected
+# to stderr in order to be well parsed for Junit representation by juLog function
 res=0
 if ${HAVE_SHELLCHECK}; then
   echo "Using host shellcheck ${SHELLCHECK_VERSION} binary."
-  shellcheck "${SHELLCHECK_OPTIONS[@]}" "${all_shell_scripts[@]}" || res=$?
+  shellcheck "${SHELLCHECK_OPTIONS[@]}" "${scripts_to_check[@]}" >&2 || res=$?
 else
   echo "Using shellcheck ${SHELLCHECK_VERSION} docker image."
   "${DOCKER}" run \
     --rm -v "${KUBE_ROOT}:${KUBE_ROOT}" -w "${KUBE_ROOT}" \
     "${SHELLCHECK_IMAGE}" \
-  shellcheck "${SHELLCHECK_OPTIONS[@]}" "${all_shell_scripts[@]}" || res=$?
+    "${SHELLCHECK_OPTIONS[@]}" "${scripts_to_check[@]}" >&2 || res=$?
 fi
 
 # print a message based on the result

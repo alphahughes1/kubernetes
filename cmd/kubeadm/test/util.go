@@ -17,7 +17,6 @@ limitations under the License.
 package test
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,17 +27,6 @@ import (
 	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
 )
-
-// SetupTempDir is a utility function for kubeadm testing, that creates a temporary directory
-// NB. it is up to the caller to cleanup the folder at the end of the test with defer os.RemoveAll(tmpdir)
-func SetupTempDir(t *testing.T) string {
-	tmpdir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Couldn't create tmpdir")
-	}
-
-	return tmpdir
-}
 
 // SetupEmptyFiles is a utility function for kubeadm testing that creates one or more empty files (touch)
 func SetupEmptyFiles(t *testing.T, tmpdir string, fileNames ...string) {
@@ -68,7 +56,7 @@ func SetupPkiDirWithCertificateAuthority(t *testing.T, tmpdir string) string {
 // AssertFilesCount is a utility function for kubeadm testing that asserts if the given folder contains
 // count files.
 func AssertFilesCount(t *testing.T, dirName string, count int) {
-	files, err := ioutil.ReadDir(dirName)
+	files, err := os.ReadDir(dirName)
 	if err != nil {
 		t.Fatalf("Couldn't read files from tmpdir: %s", err)
 	}

@@ -1,5 +1,3 @@
-// +build !providerless
-
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -22,5 +20,4 @@ import (
 	// Initialize client auth plugins for cloud providers.
 	_ "k8s.io/client-go/plugin/pkg/client/auth/azure"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
-	_ "k8s.io/client-go/plugin/pkg/client/auth/openstack"
 )

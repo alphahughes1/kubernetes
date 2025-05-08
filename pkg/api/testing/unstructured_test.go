@@ -19,15 +19,14 @@ package testing
 import (
 	"math/rand"
 	"reflect"
-	"sort"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	fuzz "github.com/google/gofuzz"
-	jsoniter "github.com/json-iterator/go"
+	"sigs.k8s.io/randfill"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/apitesting/fuzzer"
+	"k8s.io/apimachinery/pkg/api/apitesting/roundtrip"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
 )
@@ -54,15 +54,15 @@ func doRoundTrip(t *testing.T, internalVersion schema.GroupVersion, externalVers
 		// because in this test we are simply doing json operations, in which
 		// those disappear.
 		Funcs(
-			func(s *api.PodSpec, c fuzz.Continue) {
-				c.FuzzNoCustom(s)
+			func(s *api.PodSpec, c randfill.Continue) {
+				c.FillNoCustom(s)
 				s.InitContainers = nil
 			},
-			func(s *api.PodStatus, c fuzz.Continue) {
-				c.FuzzNoCustom(s)
+			func(s *api.PodStatus, c randfill.Continue) {
+				c.FillNoCustom(s)
 				s.InitContainerStatuses = nil
 			},
-		).Fuzz(internalObj)
+		).Fill(internalObj)
 
 	item, err := legacyscheme.Scheme.New(externalVersion.WithKind(kind))
 	if err != nil {
@@ -134,6 +134,17 @@ func TestRoundTrip(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestRoundtripToUnstructured(t *testing.T) {
+	skipped := sets.New[schema.GroupVersionKind]()
+	for gvk := range legacyscheme.Scheme.AllKnownTypes() {
+		if nonRoundTrippableTypes.Has(gvk.Kind) {
+			skipped.Insert(gvk)
+		}
+	}
+
+	roundtrip.RoundtripToUnstructured(t, legacyscheme.Scheme, FuzzerFuncs, skipped, nil)
 }
 
 func TestRoundTripWithEmptyCreationTimestamp(t *testing.T) {
@@ -259,76 +270,4 @@ func BenchmarkFromUnstructuredViaJSON(b *testing.B) {
 		}
 	}
 	b.StopTimer()
-}
-
-func BenchmarkToUnstructuredViaJSONIter(b *testing.B) {
-	items := benchmarkItems(b)
-	size := len(items)
-	var keys []string
-	for k := range jsonIterConfig {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, name := range keys {
-		c := jsonIterConfig[name]
-		b.Run(name, func(b *testing.B) {
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				data, err := c.Marshal(&items[i%size])
-				if err != nil {
-					b.Fatalf("unexpected error: %v", err)
-				}
-				unstr := map[string]interface{}{}
-				if err := c.Unmarshal(data, &unstr); err != nil {
-					b.Fatalf("unexpected error: %v", err)
-				}
-			}
-			b.StopTimer()
-		})
-	}
-}
-
-var jsonIterConfig = map[string]jsoniter.API{
-	"default": jsoniter.ConfigDefault,
-	"fastest": jsoniter.ConfigFastest,
-	"compat":  jsoniter.ConfigCompatibleWithStandardLibrary,
-}
-
-func BenchmarkFromUnstructuredViaJSONIter(b *testing.B) {
-	items := benchmarkItems(b)
-	var unstr []map[string]interface{}
-	for i := range items {
-		data, err := jsoniter.Marshal(&items[i])
-		if err != nil {
-			b.Fatalf("unexpected error: %v", err)
-		}
-		item := map[string]interface{}{}
-		if err := json.Unmarshal(data, &item); err != nil {
-			b.Fatalf("unexpected error: %v", err)
-		}
-		unstr = append(unstr, item)
-	}
-	size := len(items)
-	var keys []string
-	for k := range jsonIterConfig {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, name := range keys {
-		c := jsonIterConfig[name]
-		b.Run(name, func(b *testing.B) {
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				item, err := c.Marshal(unstr[i%size])
-				if err != nil {
-					b.Fatalf("unexpected error: %v", err)
-				}
-				obj := v1.Pod{}
-				if err := c.Unmarshal(item, &obj); err != nil {
-					b.Fatalf("unexpected error: %v", err)
-				}
-			}
-			b.StopTimer()
-		})
-	}
 }

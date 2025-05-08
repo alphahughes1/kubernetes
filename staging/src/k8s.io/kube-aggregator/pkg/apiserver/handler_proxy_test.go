@@ -17,10 +17,12 @@ limitations under the License.
 package apiserver
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -32,20 +34,34 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"k8s.io/apiserver/pkg/server/dynamiccertificates"
-
+	"github.com/google/go-cmp/cmp"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/websocket"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/proxy"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/endpoints/filters"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	"k8s.io/apiserver/pkg/server/egressselector"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	utilflowcontrol "k8s.io/apiserver/pkg/util/flowcontrol"
+	apiserverproxyutil "k8s.io/apiserver/pkg/util/proxy"
+	"k8s.io/client-go/transport"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 	apiregistration "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 type targetHTTPHandler struct {
@@ -116,15 +132,18 @@ func TestProxyHandler(t *testing.T) {
 		expectedBody       string
 		expectedCalled     bool
 		expectedHeaders    map[string][]string
+
+		remoteRequestHeaderUIDFeature bool
 	}{
 		"no target": {
-			expectedStatusCode: http.StatusNotFound,
+			expectedStatusCode:            http.StatusNotFound,
+			remoteRequestHeaderUIDFeature: true,
 		},
 		"no user": {
 			apiService: &apiregistration.APIService{
 				ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
 				Spec: apiregistration.APIServiceSpec{
-					Service: &apiregistration.ServiceReference{Port: pointer.Int32Ptr(443)},
+					Service: &apiregistration.ServiceReference{Port: ptr.To[int32](443)},
 					Group:   "foo",
 					Version: "v1",
 				},
@@ -134,19 +153,21 @@ func TestProxyHandler(t *testing.T) {
 					},
 				},
 			},
-			expectedStatusCode: http.StatusInternalServerError,
-			expectedBody:       "missing user",
+			expectedStatusCode:            http.StatusInternalServerError,
+			expectedBody:                  "missing user",
+			remoteRequestHeaderUIDFeature: true,
 		},
-		"proxy with user, insecure": {
+		"[-RemoteRequestHeaderUID] proxy with user, insecure": {
 			user: &user.DefaultInfo{
 				Name:   "username",
+				UID:    "6b60d791-1af9-4513-92e5-e4252a1e0a78",
 				Groups: []string{"one", "two"},
 			},
 			path: "/request/path",
 			apiService: &apiregistration.APIService{
 				ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
 				Spec: apiregistration.APIServiceSpec{
-					Service:               &apiregistration.ServiceReference{Port: pointer.Int32Ptr(443)},
+					Service:               &apiregistration.ServiceReference{Port: ptr.To[int32](443)},
 					Group:                 "foo",
 					Version:               "v1",
 					InsecureSkipTLSVerify: true,
@@ -157,8 +178,78 @@ func TestProxyHandler(t *testing.T) {
 					},
 				},
 			},
-			expectedStatusCode: http.StatusOK,
-			expectedCalled:     true,
+			remoteRequestHeaderUIDFeature: false,
+			expectedStatusCode:            http.StatusOK,
+			expectedCalled:                true,
+			expectedHeaders: map[string][]string{
+				"X-Forwarded-Proto": {"https"},
+				"X-Forwarded-Uri":   {"/request/path"},
+				"X-Forwarded-For":   {"127.0.0.1"},
+				"X-Remote-User":     {"username"},
+				"User-Agent":        {"Go-http-client/1.1"},
+				"Accept-Encoding":   {"gzip"},
+				"X-Remote-Group":    {"one", "two"},
+			},
+		},
+		"proxy with user, insecure": {
+			user: &user.DefaultInfo{
+				Name:   "username",
+				UID:    "6b60d791-1af9-4513-92e5-e4252a1e0a78",
+				Groups: []string{"one", "two"},
+			},
+			path: "/request/path",
+			apiService: &apiregistration.APIService{
+				ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
+				Spec: apiregistration.APIServiceSpec{
+					Service:               &apiregistration.ServiceReference{Port: ptr.To[int32](443)},
+					Group:                 "foo",
+					Version:               "v1",
+					InsecureSkipTLSVerify: true,
+				},
+				Status: apiregistration.APIServiceStatus{
+					Conditions: []apiregistration.APIServiceCondition{
+						{Type: apiregistration.Available, Status: apiregistration.ConditionTrue},
+					},
+				},
+			},
+			remoteRequestHeaderUIDFeature: true,
+			expectedStatusCode:            http.StatusOK,
+			expectedCalled:                true,
+			expectedHeaders: map[string][]string{
+				"X-Forwarded-Proto": {"https"},
+				"X-Forwarded-Uri":   {"/request/path"},
+				"X-Forwarded-For":   {"127.0.0.1"},
+				"X-Remote-User":     {"username"},
+				"X-Remote-Uid":      {"6b60d791-1af9-4513-92e5-e4252a1e0a78"},
+				"User-Agent":        {"Go-http-client/1.1"},
+				"Accept-Encoding":   {"gzip"},
+				"X-Remote-Group":    {"one", "two"},
+			},
+		},
+		"[-RemoteRequestHeaderUID] proxy with user, cabundle": {
+			user: &user.DefaultInfo{
+				Name:   "username",
+				UID:    "6b60d791-1af9-4513-92e5-e4252a1e0a78",
+				Groups: []string{"one", "two"},
+			},
+			path: "/request/path",
+			apiService: &apiregistration.APIService{
+				ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
+				Spec: apiregistration.APIServiceSpec{
+					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: ptr.To[int32](443)},
+					Group:    "foo",
+					Version:  "v1",
+					CABundle: testCACrt,
+				},
+				Status: apiregistration.APIServiceStatus{
+					Conditions: []apiregistration.APIServiceCondition{
+						{Type: apiregistration.Available, Status: apiregistration.ConditionTrue},
+					},
+				},
+			},
+			remoteRequestHeaderUIDFeature: false,
+			expectedStatusCode:            http.StatusOK,
+			expectedCalled:                true,
 			expectedHeaders: map[string][]string{
 				"X-Forwarded-Proto": {"https"},
 				"X-Forwarded-Uri":   {"/request/path"},
@@ -172,13 +263,14 @@ func TestProxyHandler(t *testing.T) {
 		"proxy with user, cabundle": {
 			user: &user.DefaultInfo{
 				Name:   "username",
+				UID:    "6b60d791-1af9-4513-92e5-e4252a1e0a78",
 				Groups: []string{"one", "two"},
 			},
 			path: "/request/path",
 			apiService: &apiregistration.APIService{
 				ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
 				Spec: apiregistration.APIServiceSpec{
-					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: pointer.Int32Ptr(443)},
+					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: ptr.To[int32](443)},
 					Group:    "foo",
 					Version:  "v1",
 					CABundle: testCACrt,
@@ -189,13 +281,15 @@ func TestProxyHandler(t *testing.T) {
 					},
 				},
 			},
-			expectedStatusCode: http.StatusOK,
-			expectedCalled:     true,
+			remoteRequestHeaderUIDFeature: true,
+			expectedStatusCode:            http.StatusOK,
+			expectedCalled:                true,
 			expectedHeaders: map[string][]string{
 				"X-Forwarded-Proto": {"https"},
 				"X-Forwarded-Uri":   {"/request/path"},
 				"X-Forwarded-For":   {"127.0.0.1"},
 				"X-Remote-User":     {"username"},
+				"X-Remote-Uid":      {"6b60d791-1af9-4513-92e5-e4252a1e0a78"},
 				"User-Agent":        {"Go-http-client/1.1"},
 				"Accept-Encoding":   {"gzip"},
 				"X-Remote-Group":    {"one", "two"},
@@ -204,13 +298,14 @@ func TestProxyHandler(t *testing.T) {
 		"service unavailable": {
 			user: &user.DefaultInfo{
 				Name:   "username",
+				UID:    "6b60d791-1af9-4513-92e5-e4252a1e0a78",
 				Groups: []string{"one", "two"},
 			},
 			path: "/request/path",
 			apiService: &apiregistration.APIService{
 				ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
 				Spec: apiregistration.APIServiceSpec{
-					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: pointer.Int32Ptr(443)},
+					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: ptr.To[int32](443)},
 					Group:    "foo",
 					Version:  "v1",
 					CABundle: testCACrt,
@@ -221,11 +316,13 @@ func TestProxyHandler(t *testing.T) {
 					},
 				},
 			},
-			expectedStatusCode: http.StatusServiceUnavailable,
+			remoteRequestHeaderUIDFeature: true,
+			expectedStatusCode:            http.StatusServiceUnavailable,
 		},
 		"service unresolveable": {
 			user: &user.DefaultInfo{
 				Name:   "username",
+				UID:    "6b60d791-1af9-4513-92e5-e4252a1e0a78",
 				Groups: []string{"one", "two"},
 			},
 			path:            "/request/path",
@@ -233,7 +330,7 @@ func TestProxyHandler(t *testing.T) {
 			apiService: &apiregistration.APIService{
 				ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
 				Spec: apiregistration.APIServiceSpec{
-					Service:  &apiregistration.ServiceReference{Name: "bad-service", Namespace: "test-ns", Port: pointer.Int32Ptr(443)},
+					Service:  &apiregistration.ServiceReference{Name: "bad-service", Namespace: "test-ns", Port: ptr.To[int32](443)},
 					Group:    "foo",
 					Version:  "v1",
 					CABundle: testCACrt,
@@ -244,18 +341,20 @@ func TestProxyHandler(t *testing.T) {
 					},
 				},
 			},
-			expectedStatusCode: http.StatusServiceUnavailable,
+			remoteRequestHeaderUIDFeature: true,
+			expectedStatusCode:            http.StatusServiceUnavailable,
 		},
 		"fail on bad serving cert": {
 			user: &user.DefaultInfo{
 				Name:   "username",
+				UID:    "6b60d791-1af9-4513-92e5-e4252a1e0a78",
 				Groups: []string{"one", "two"},
 			},
 			path: "/request/path",
 			apiService: &apiregistration.APIService{
 				ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
 				Spec: apiregistration.APIServiceSpec{
-					Service: &apiregistration.ServiceReference{Port: pointer.Int32Ptr(443)},
+					Service: &apiregistration.ServiceReference{Port: ptr.To[int32](443)},
 					Group:   "foo",
 					Version: "v1",
 				},
@@ -265,18 +364,20 @@ func TestProxyHandler(t *testing.T) {
 					},
 				},
 			},
-			expectedStatusCode: http.StatusServiceUnavailable,
+			remoteRequestHeaderUIDFeature: true,
+			expectedStatusCode:            http.StatusServiceUnavailable,
 		},
 		"fail on bad serving cert w/o SAN and increase SAN error counter metrics": {
 			user: &user.DefaultInfo{
 				Name:   "username",
+				UID:    "6b60d791-1af9-4513-92e5-e4252a1e0a78",
 				Groups: []string{"one", "two"},
 			},
 			path: "/request/path",
 			apiService: &apiregistration.APIService{
 				ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
 				Spec: apiregistration.APIServiceSpec{
-					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: pointer.Int32Ptr(443)},
+					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: ptr.To[int32](443)},
 					Group:    "foo",
 					Version:  "v1",
 					CABundle: testCACrt,
@@ -287,17 +388,21 @@ func TestProxyHandler(t *testing.T) {
 					},
 				},
 			},
-			serviceCertOverride:    svcCrtNoSAN,
-			increaseSANWarnCounter: true,
-			expectedStatusCode:     http.StatusServiceUnavailable,
+			serviceCertOverride:           svcCrtNoSAN,
+			increaseSANWarnCounter:        true,
+			remoteRequestHeaderUIDFeature: true,
+			expectedStatusCode:            http.StatusServiceUnavailable,
 		},
 	}
 
 	target := &targetHTTPHandler{}
 	for name, tc := range tests {
 		target.Reset()
+		legacyregistry.Reset()
 
-		func() {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RemoteRequestHeaderUID, tc.remoteRequestHeaderUIDFeature)
+
 			targetServer := httptest.NewUnstartedServer(target)
 			serviceCert := tc.serviceCertOverride
 			if serviceCert == nil {
@@ -318,7 +423,6 @@ func TestProxyHandler(t *testing.T) {
 			handler := &proxyHandler{
 				localDelegate:              http.NewServeMux(),
 				serviceResolver:            serviceResolver,
-				proxyTransport:             &http.Transport{},
 				proxyCurrentCertKeyContent: func() ([]byte, []byte) { return emptyCert(), emptyCert() },
 			}
 			server := httptest.NewServer(contextHandler(handler, tc.user))
@@ -332,37 +436,37 @@ func TestProxyHandler(t *testing.T) {
 
 			resp, err := http.Get(server.URL + tc.path)
 			if err != nil {
-				t.Errorf("%s: %v", name, err)
+				t.Errorf("%v", err)
 				return
 			}
 			if e, a := tc.expectedStatusCode, resp.StatusCode; e != a {
 				body, _ := httputil.DumpResponse(resp, true)
-				t.Logf("%s: %v", name, string(body))
-				t.Errorf("%s: expected %v, got %v", name, e, a)
+				t.Logf("%v", string(body))
+				t.Errorf("expected %v, got %v", e, a)
 				return
 			}
-			bytes, err := ioutil.ReadAll(resp.Body)
+			bytes, err := io.ReadAll(resp.Body)
 			if err != nil {
-				t.Errorf("%s: %v", name, err)
+				t.Errorf("%v", err)
 				return
 			}
 			if !strings.Contains(string(bytes), tc.expectedBody) {
-				t.Errorf("%s: expected %q, got %q", name, tc.expectedBody, string(bytes))
+				t.Errorf("expected %q, got %q", tc.expectedBody, string(bytes))
 				return
 			}
 
 			if e, a := tc.expectedCalled, target.called; e != a {
-				t.Errorf("%s: expected %v, got %v", name, e, a)
+				t.Errorf("expected %v, got %v", e, a)
 				return
 			}
 			// this varies every test
 			delete(target.headers, "X-Forwarded-Host")
 			if e, a := tc.expectedHeaders, target.headers; !reflect.DeepEqual(e, a) {
-				t.Errorf("%s: expected %v, got %v", name, e, a)
+				t.Errorf("expected != got %v", cmp.Diff(e, a))
 				return
 			}
 			if e, a := targetServer.Listener.Addr().String(), target.host; tc.expectedCalled && !reflect.DeepEqual(e, a) {
-				t.Errorf("%s: expected %v, got %v", name, e, a)
+				t.Errorf("expected %v, got %v", e, a)
 				return
 			}
 
@@ -375,15 +479,50 @@ func TestProxyHandler(t *testing.T) {
 					t.Errorf("expected the x509_missing_san_total to be 1, but it's %d", errorCounter)
 				}
 			}
-		}()
+		})
 	}
 }
 
+type mockEgressDialer struct {
+	called int
+}
+
+func (m *mockEgressDialer) dial(ctx context.Context, net, addr string) (net.Conn, error) {
+	m.called++
+	return http.DefaultTransport.(*http.Transport).DialContext(ctx, net, addr)
+}
+
+func (m *mockEgressDialer) dialBroken(ctx context.Context, net, addr string) (net.Conn, error) {
+	m.called++
+	return nil, fmt.Errorf("Broken dialer")
+}
+
+func newDialerAndSelector() (*mockEgressDialer, *egressselector.EgressSelector) {
+	dialer := &mockEgressDialer{}
+	m := make(map[egressselector.EgressType]utilnet.DialFunc)
+	m[egressselector.Cluster] = dialer.dial
+	es := egressselector.NewEgressSelectorWithMap(m)
+	return dialer, es
+}
+
+func newBrokenDialerAndSelector() (*mockEgressDialer, *egressselector.EgressSelector) {
+	dialer := &mockEgressDialer{}
+	m := make(map[egressselector.EgressType]utilnet.DialFunc)
+	m[egressselector.Cluster] = dialer.dialBroken
+	es := egressselector.NewEgressSelectorWithMap(m)
+	return dialer, es
+}
+
 func TestProxyUpgrade(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RemoteRequestHeaderUID, true)
+
+	upgradeUser := "upgradeUser"
+	upgradeUID := "upgradeUser-UID"
 	testcases := map[string]struct {
-		APIService   *apiregistration.APIService
-		ExpectError  bool
-		ExpectCalled bool
+		APIService        *apiregistration.APIService
+		NewEgressSelector func() (*mockEgressDialer, *egressselector.EgressSelector)
+		ExpectError       bool
+		ExpectCalled      bool
 	}{
 		"valid hostname + CABundle": {
 			APIService: &apiregistration.APIService{
@@ -391,7 +530,7 @@ func TestProxyUpgrade(t *testing.T) {
 					CABundle: testCACrt,
 					Group:    "mygroup",
 					Version:  "v1",
-					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: pointer.Int32Ptr(443)},
+					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: ptr.To[int32](443)},
 				},
 				Status: apiregistration.APIServiceStatus{
 					Conditions: []apiregistration.APIServiceCondition{
@@ -408,7 +547,7 @@ func TestProxyUpgrade(t *testing.T) {
 					InsecureSkipTLSVerify: true,
 					Group:                 "mygroup",
 					Version:               "v1",
-					Service:               &apiregistration.ServiceReference{Name: "invalid-service", Namespace: "invalid-ns", Port: pointer.Int32Ptr(443)},
+					Service:               &apiregistration.ServiceReference{Name: "invalid-service", Namespace: "invalid-ns", Port: ptr.To[int32](443)},
 				},
 				Status: apiregistration.APIServiceStatus{
 					Conditions: []apiregistration.APIServiceCondition{
@@ -425,7 +564,7 @@ func TestProxyUpgrade(t *testing.T) {
 					CABundle: testCACrt,
 					Group:    "mygroup",
 					Version:  "v1",
-					Service:  &apiregistration.ServiceReference{Name: "invalid-service", Namespace: "invalid-ns", Port: pointer.Int32Ptr(443)},
+					Service:  &apiregistration.ServiceReference{Name: "invalid-service", Namespace: "invalid-ns", Port: ptr.To[int32](443)},
 				},
 				Status: apiregistration.APIServiceStatus{
 					Conditions: []apiregistration.APIServiceCondition{
@@ -436,18 +575,62 @@ func TestProxyUpgrade(t *testing.T) {
 			ExpectError:  true,
 			ExpectCalled: false,
 		},
+		"valid hostname + CABundle + egress selector": {
+			APIService: &apiregistration.APIService{
+				Spec: apiregistration.APIServiceSpec{
+					CABundle: testCACrt,
+					Group:    "mygroup",
+					Version:  "v1",
+					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: ptr.To[int32](443)},
+				},
+				Status: apiregistration.APIServiceStatus{
+					Conditions: []apiregistration.APIServiceCondition{
+						{Type: apiregistration.Available, Status: apiregistration.ConditionTrue},
+					},
+				},
+			},
+			NewEgressSelector: newDialerAndSelector,
+			ExpectError:       false,
+			ExpectCalled:      true,
+		},
+		"valid hostname + CABundle + egress selector non working": {
+			APIService: &apiregistration.APIService{
+				Spec: apiregistration.APIServiceSpec{
+					CABundle: testCACrt,
+					Group:    "mygroup",
+					Version:  "v1",
+					Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: ptr.To[int32](443)},
+				},
+				Status: apiregistration.APIServiceStatus{
+					Conditions: []apiregistration.APIServiceCondition{
+						{Type: apiregistration.Available, Status: apiregistration.ConditionTrue},
+					},
+				},
+			},
+			NewEgressSelector: newBrokenDialerAndSelector,
+			ExpectError:       true,
+			ExpectCalled:      false,
+		},
 	}
 
 	for k, tc := range testcases {
 		tcName := k
-		path := "/apis/" + tc.APIService.Spec.Group + "/" + tc.APIService.Spec.Version + "/foo"
-		timesCalled := int32(0)
-
-		func() { // Cleanup after each test case.
+		t.Run(tcName, func(t *testing.T) {
+			path := "/apis/" + tc.APIService.Spec.Group + "/" + tc.APIService.Spec.Version + "/foo"
+			timesCalled := int32(0)
 			backendHandler := http.NewServeMux()
 			backendHandler.Handle(path, websocket.Handler(func(ws *websocket.Conn) {
 				atomic.AddInt32(&timesCalled, 1)
 				defer ws.Close()
+				req := ws.Request()
+				user := req.Header.Get("X-Remote-User")
+				if user != upgradeUser {
+					t.Errorf("expected user %q, got %q", upgradeUser, user)
+				}
+				uid := req.Header.Get("X-Remote-Uid")
+				if uid != upgradeUID {
+					t.Errorf("expected UID %q, got %q", upgradeUID, uid)
+				}
 				body := make([]byte, 5)
 				ws.Read(body)
 				ws.Write([]byte("hello " + string(body)))
@@ -472,11 +655,25 @@ func TestProxyUpgrade(t *testing.T) {
 			serverURL, _ := url.Parse(backendServer.URL)
 			proxyHandler := &proxyHandler{
 				serviceResolver:            &mockedRouter{destinationHost: serverURL.Host},
-				proxyTransport:             &http.Transport{},
 				proxyCurrentCertKeyContent: func() ([]byte, []byte) { return emptyCert(), emptyCert() },
 			}
+
+			var dialer *mockEgressDialer
+			var selector *egressselector.EgressSelector
+			if tc.NewEgressSelector != nil {
+				dialer, selector = tc.NewEgressSelector()
+
+				egressDialer, err := selector.Lookup(egressselector.Cluster.AsNetworkContext())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if egressDialer != nil {
+					proxyHandler.proxyTransportDial = &transport.DialHolder{Dial: egressDialer}
+				}
+			}
+
 			proxyHandler.updateAPIService(tc.APIService)
-			aggregator := httptest.NewServer(contextHandler(proxyHandler, &user.DefaultInfo{Name: "username"}))
+			aggregator := httptest.NewServer(contextHandler(proxyHandler, &user.DefaultInfo{Name: upgradeUser, UID: upgradeUID}))
 			defer aggregator.Close()
 
 			ws, err := websocket.Dial("ws://"+aggregator.Listener.Addr().String()+path, "", "http://127.0.0.1/")
@@ -487,6 +684,12 @@ func TestProxyUpgrade(t *testing.T) {
 				return
 			}
 			defer ws.Close()
+
+			// if the egressselector is configured assume it has to be called
+			if dialer != nil && dialer.called != 1 {
+				t.Errorf("expect egress dialer gets called %d times, got %d", 1, dialer.called)
+			}
+
 			if tc.ExpectError {
 				t.Errorf("%s: expected websocket error, got none", tcName)
 				return
@@ -507,7 +710,7 @@ func TestProxyUpgrade(t *testing.T) {
 				t.Errorf("%s: expected '%#v', got '%#v'", tcName, e, a)
 				return
 			}
-		}()
+		})
 	}
 }
 
@@ -648,7 +851,7 @@ func TestGetContextForNewRequest(t *testing.T) {
 		location.Path = req.URL.Path
 
 		nestedReq := req.WithContext(genericapirequest.WithRequestInfo(req.Context(), &genericapirequest.RequestInfo{Path: req.URL.Path}))
-		newReq, cancelFn := newRequestForProxy(location, nestedReq)
+		newReq, cancelFn := apiserverproxyutil.NewRequestForProxy(location, nestedReq)
 		defer cancelFn()
 
 		theproxy := proxy.NewUpgradeAwareHandler(location, server.Client().Transport, true, false, &responder{w: w})
@@ -664,7 +867,7 @@ func TestGetContextForNewRequest(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Error(err)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,6 +875,116 @@ func TestGetContextForNewRequest(t *testing.T) {
 		t.Error(string(body))
 	}
 
+}
+
+func TestTracerProvider(t *testing.T) {
+	fakeRecorder := tracetest.NewSpanRecorder()
+	otelTracer := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(fakeRecorder))
+	target := &targetHTTPHandler{}
+	user := &user.DefaultInfo{
+		Name:   "username",
+		Groups: []string{"one", "two"},
+	}
+	path := "/request/path"
+	apiService := &apiregistration.APIService{
+		ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
+		Spec: apiregistration.APIServiceSpec{
+			Service:  &apiregistration.ServiceReference{Name: "test-service", Namespace: "test-ns", Port: ptr.To(int32(443))},
+			Group:    "foo",
+			Version:  "v1",
+			CABundle: testCACrt,
+		},
+		Status: apiregistration.APIServiceStatus{
+			Conditions: []apiregistration.APIServiceCondition{
+				{Type: apiregistration.Available, Status: apiregistration.ConditionTrue},
+			},
+		},
+	}
+	targetServer := httptest.NewUnstartedServer(target)
+	serviceCert := svcCrt
+	if cert, err := tls.X509KeyPair(serviceCert, svcKey); err != nil {
+		t.Fatalf("TestTracerProvider: failed to parse key pair: %v", err)
+	} else {
+		targetServer.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	}
+	targetServer.StartTLS()
+	defer targetServer.Close()
+
+	serviceResolver := &mockedRouter{destinationHost: targetServer.Listener.Addr().String()}
+	handler := &proxyHandler{
+		localDelegate:              http.NewServeMux(),
+		serviceResolver:            serviceResolver,
+		proxyCurrentCertKeyContent: func() ([]byte, []byte) { return emptyCert(), emptyCert() },
+		tracerProvider:             otelTracer,
+	}
+
+	server := httptest.NewServer(contextHandler(filters.WithTracing(handler, otelTracer), user))
+	defer server.Close()
+
+	handler.updateAPIService(apiService)
+	curr := handler.handlingInfo.Load().(proxyHandlingInfo)
+	handler.handlingInfo.Store(curr)
+	var propagator propagation.TraceContext
+	req, err := http.NewRequest(http.MethodGet, server.URL+path, nil)
+	if err != nil {
+		t.Errorf("expected new request: %v", err)
+		return
+	}
+
+	t.Logf("Sending request: %v", req)
+	_, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Errorf("http request failed: %v", err)
+		return
+	}
+
+	t.Log("Ensure the target server received the traceparent header")
+	id, ok := target.headers["Traceparent"]
+	if !ok {
+		t.Error("expected traceparent header")
+		return
+	}
+
+	t.Log("Get the span context from the traceparent header")
+	h := http.Header{
+		"Traceparent": id,
+	}
+	ctx := propagator.Extract(context.Background(), propagation.HeaderCarrier(h))
+	span := trace.SpanFromContext(ctx)
+
+	t.Log("Ensure that the span context is valid and remote")
+	if !span.SpanContext().IsValid() {
+		t.Error("expected valid span context")
+		return
+	}
+
+	if !span.SpanContext().IsRemote() {
+		t.Error("expected remote span context")
+		return
+	}
+
+	t.Log("Ensure that the span ID and trace ID match the expected values")
+	expectedSpanCtx := fakeRecorder.Ended()[0].SpanContext()
+	if expectedSpanCtx.TraceID() != span.SpanContext().TraceID() {
+		t.Errorf("expected trace id to match. expected: %v, but got %v", expectedSpanCtx.TraceID(), span.SpanContext().TraceID())
+		return
+	}
+
+	if expectedSpanCtx.SpanID() != span.SpanContext().SpanID() {
+		t.Errorf("expected span id to match. expected: %v, but got: %v", expectedSpanCtx.SpanID(), span.SpanContext().SpanID())
+		return
+	}
+
+	t.Log("Ensure that the expected spans were recorded when sending a request through the proxy")
+	expectedSpanNames := []string{"HTTP GET", "GET"}
+	spanNames := []string{}
+	for _, span := range fakeRecorder.Ended() {
+		spanNames = append(spanNames, span.Name())
+	}
+	if e, a := expectedSpanNames, spanNames; !reflect.DeepEqual(e, a) {
+		t.Errorf("expected span names %v, got %v", e, a)
+		return
+	}
 }
 
 func TestNewRequestForProxyWithAuditID(t *testing.T) {
@@ -698,10 +1011,12 @@ func TestNewRequestForProxyWithAuditID(t *testing.T) {
 
 			req = req.WithContext(genericapirequest.WithRequestInfo(req.Context(), &genericapirequest.RequestInfo{Path: req.URL.Path}))
 			if len(test.auditID) > 0 {
-				req = req.WithContext(genericapirequest.WithAuditID(req.Context(), types.UID(test.auditID)))
+				ctx := audit.WithAuditContext(req.Context())
+				audit.WithAuditID(ctx, types.UID(test.auditID))
+				req = req.WithContext(ctx)
 			}
 
-			newReq, _ := newRequestForProxy(req.URL, req)
+			newReq, _ := apiserverproxyutil.NewRequestForProxy(req.URL, req)
 			if newReq == nil {
 				t.Fatal("expected a non nil Request object")
 			}
@@ -755,7 +1070,8 @@ func TestProxyCertReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create dynamic certificates: %v", err)
 	}
-	err = certProvider.RunOnce()
+	ctx := context.TODO()
+	err = certProvider.RunOnce(ctx)
 	if err != nil {
 		t.Fatalf("Unable to load dynamic certificates: %v", err)
 	}
@@ -764,7 +1080,7 @@ func TestProxyCertReload(t *testing.T) {
 	apiService := &apiregistration.APIService{
 		ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
 		Spec: apiregistration.APIServiceSpec{
-			Service:  &apiregistration.ServiceReference{Name: "test-service2", Namespace: "test-ns", Port: pointer.Int32Ptr(443)},
+			Service:  &apiregistration.ServiceReference{Name: "test-service2", Namespace: "test-ns", Port: ptr.To[int32](443)},
 			Group:    "foo",
 			Version:  "v1",
 			CABundle: backendCaCertificate(), // used to validate backendCertificate()
@@ -794,7 +1110,7 @@ func TestProxyCertReload(t *testing.T) {
 	// STEP 3: swap the certificate used by the aggregator to auth against the backend server and verify the request passes
 	//         note that this step uses the certificate that can be validated by the backend server with clientCaCrt()
 	writeCerts(certFile, keyFile, clientCert(), clientKey(), t)
-	err = certProvider.RunOnce()
+	err = certProvider.RunOnce(ctx)
 	if err != nil {
 		t.Fatalf("Expected no error when refreshing dynamic certs, got %v", err)
 	}
@@ -809,8 +1125,143 @@ func TestProxyCertReload(t *testing.T) {
 	}
 }
 
+type fcInitSignal struct {
+	nSignals int32
+}
+
+func (s *fcInitSignal) SignalCount() int {
+	return int(atomic.SwapInt32(&s.nSignals, 0))
+}
+
+func (s *fcInitSignal) Signal() {
+	atomic.AddInt32(&s.nSignals, 1)
+}
+
+func (s *fcInitSignal) Wait() {
+}
+
+type hookedListener struct {
+	l        net.Listener
+	onAccept func()
+}
+
+func (wl *hookedListener) Accept() (net.Conn, error) {
+	conn, err := wl.l.Accept()
+	if err == nil {
+		wl.onAccept()
+	}
+	return conn, err
+}
+
+func (wl *hookedListener) Close() error {
+	return wl.l.Close()
+}
+
+func (wl *hookedListener) Addr() net.Addr {
+	return wl.l.Addr()
+}
+
+func TestFlowControlSignal(t *testing.T) {
+	for _, tc := range []struct {
+		Name           string
+		Local          bool
+		Available      bool
+		Request        http.Request
+		SignalExpected bool
+	}{
+		{
+			Name:           "local",
+			Local:          true,
+			SignalExpected: false,
+		},
+		{
+			Name:           "unavailable",
+			Local:          false,
+			Available:      false,
+			SignalExpected: false,
+		},
+		{
+			Name:           "request performed",
+			Local:          false,
+			Available:      true,
+			SignalExpected: true,
+		},
+		{
+			Name:      "upgrade request performed",
+			Local:     false,
+			Available: true,
+			Request: http.Request{
+				Header: http.Header{"Connection": []string{"Upgrade"}},
+			},
+			SignalExpected: true,
+		},
+	} {
+		t.Run(tc.Name, func(t *testing.T) {
+			okh := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+
+			var sig fcInitSignal
+
+			var signalCountOnAccept int32
+			backend := httptest.NewUnstartedServer(okh)
+			backend.Listener = &hookedListener{
+				l: backend.Listener,
+				onAccept: func() {
+					atomic.StoreInt32(&signalCountOnAccept, int32(sig.SignalCount()))
+				},
+			}
+			backend.Start()
+			defer backend.Close()
+
+			p := proxyHandler{
+				localDelegate:   okh,
+				serviceResolver: &mockedRouter{destinationHost: backend.Listener.Addr().String()},
+			}
+
+			server := httptest.NewServer(contextHandler(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					p.ServeHTTP(w, r.WithContext(utilflowcontrol.WithInitializationSignal(r.Context(), &sig)))
+				}),
+				&user.DefaultInfo{
+					Name:   "username",
+					Groups: []string{"one", "two"},
+				},
+			))
+			defer server.Close()
+
+			p.handlingInfo.Store(proxyHandlingInfo{
+				local:             tc.Local,
+				serviceAvailable:  tc.Available,
+				proxyRoundTripper: backend.Client().Transport,
+			})
+
+			surl, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			req := tc.Request
+			req.URL = surl
+			res, err := server.Client().Do(&req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if err := res.Body.Close(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if fired := (atomic.LoadInt32(&signalCountOnAccept) > 0); tc.SignalExpected && !fired {
+				t.Errorf("flow control signal expected but not fired")
+			} else if fired && !tc.SignalExpected {
+				t.Errorf("flow control signal fired but not expected")
+			}
+		})
+	}
+}
+
 func getCertAndKeyPaths(t *testing.T) (string, string, string) {
-	dir, err := ioutil.TempDir(os.TempDir(), "k8s-test-handler-proxy-cert")
+	dir, err := os.MkdirTemp(os.TempDir(), "k8s-test-handler-proxy-cert")
 	if err != nil {
 		t.Fatalf("Unable to create the test directory %q: %v", dir, err)
 	}
@@ -820,10 +1271,10 @@ func getCertAndKeyPaths(t *testing.T) (string, string, string) {
 }
 
 func writeCerts(certFile, keyFile string, certContent, keyContent []byte, t *testing.T) {
-	if err := ioutil.WriteFile(certFile, certContent, 0600); err != nil {
+	if err := os.WriteFile(certFile, certContent, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", certFile, err)
 	}
-	if err := ioutil.WriteFile(keyFile, keyContent, 0600); err != nil {
+	if err := os.WriteFile(keyFile, keyContent, 0600); err != nil {
 		t.Fatalf("Unable to create the file %q: %v", keyFile, err)
 	}
 }
@@ -850,7 +1301,7 @@ func getSingleCounterValueFromRegistry(t *testing.T, r metrics.Gatherer, name st
 }
 
 func readTestFile(filename string) []byte {
-	data, err := ioutil.ReadFile("testdata/" + filename)
+	data, err := os.ReadFile("testdata/" + filename)
 	if err != nil {
 		panic(err)
 	}

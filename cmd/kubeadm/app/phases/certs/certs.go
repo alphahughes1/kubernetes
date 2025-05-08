@@ -25,12 +25,14 @@ import (
 	"sync"
 
 	"github.com/pkg/errors"
+
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/util/keyutil"
 	"k8s.io/klog/v2"
-	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	pkiutil "k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
 
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
 )
 
 var (
@@ -67,12 +69,12 @@ func CreatePKIAssets(cfg *kubeadmapi.InitConfiguration) error {
 	fmt.Printf("[certs] Valid certificates and keys now exist in %q\n", cfg.CertificatesDir)
 
 	// Service accounts are not x509 certs, so handled separately
-	return CreateServiceAccountKeyAndPublicKeyFiles(cfg.CertificatesDir, cfg.ClusterConfiguration.PublicKeyAlgorithm())
+	return CreateServiceAccountKeyAndPublicKeyFiles(cfg.CertificatesDir, cfg.ClusterConfiguration.EncryptionAlgorithmType())
 }
 
 // CreateServiceAccountKeyAndPublicKeyFiles creates new public/private key files for signing service account users.
 // If the sa public/private key files already exist in the target folder, they are used only if evaluated equals; otherwise an error is returned.
-func CreateServiceAccountKeyAndPublicKeyFiles(certsDir string, keyType x509.PublicKeyAlgorithm) error {
+func CreateServiceAccountKeyAndPublicKeyFiles(certsDir string, keyType kubeadmapi.EncryptionAlgorithmType) error {
 	klog.V(1).Infoln("creating new public/private key files for signing service account users")
 	_, err := keyutil.PrivateKeyFromFile(filepath.Join(certsDir, kubeadmconstants.ServiceAccountPrivateKeyName))
 	if err == nil {
@@ -125,25 +127,6 @@ func CreateCACertAndKeyFiles(certSpec *KubeadmCert, cfg *kubeadmapi.InitConfigur
 		caCert,
 		caKey,
 	)
-}
-
-// NewCSR will generate a new CSR and accompanying key
-func NewCSR(certSpec *KubeadmCert, cfg *kubeadmapi.InitConfiguration) (*x509.CertificateRequest, crypto.Signer, error) {
-	certConfig, err := certSpec.GetConfig(cfg)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to retrieve cert configuration")
-	}
-
-	return pkiutil.NewCSRAndKey(certConfig)
-}
-
-// CreateCSR creates a certificate signing request
-func CreateCSR(certSpec *KubeadmCert, cfg *kubeadmapi.InitConfiguration, path string) error {
-	csr, key, err := NewCSR(certSpec, cfg)
-	if err != nil {
-		return err
-	}
-	return writeCSRFilesIfNotExist(path, certSpec.BaseName, csr, key)
 }
 
 // CreateCertAndKeyFilesWithCA loads the given certificate authority from disk, then generates and writes out the given certificate and key.
@@ -269,33 +252,6 @@ func writeCertificateFilesIfNotExist(pkiDir string, baseName string, signingCert
 	return nil
 }
 
-// writeCSRFilesIfNotExist writes a new CSR to the given path.
-// If there already is a CSR file at the given path; kubeadm tries to load it and check if it's a valid certificate.
-// otherwise this function returns an error.
-func writeCSRFilesIfNotExist(csrDir string, baseName string, csr *x509.CertificateRequest, key crypto.Signer) error {
-	if pkiutil.CSROrKeyExist(csrDir, baseName) {
-		_, _, err := pkiutil.TryLoadCSRAndKeyFromDisk(csrDir, baseName)
-		if err != nil {
-			return errors.Wrapf(err, "%s CSR existed but it could not be loaded properly", baseName)
-		}
-
-		fmt.Printf("[certs] Using the existing %q CSR\n", baseName)
-	} else {
-		// Write .key and .csr files to disk
-		fmt.Printf("[certs] Generating %q key and CSR\n", baseName)
-
-		if err := pkiutil.WriteKey(csrDir, baseName, key); err != nil {
-			return errors.Wrapf(err, "failure while saving %s key", baseName)
-		}
-
-		if err := pkiutil.WriteCSR(csrDir, baseName, csr); err != nil {
-			return errors.Wrapf(err, "failure while saving %s CSR", baseName)
-		}
-	}
-
-	return nil
-}
-
 type certKeyLocation struct {
 	pkiDir     string
 	caBaseName string
@@ -303,30 +259,32 @@ type certKeyLocation struct {
 	uxName     string
 }
 
-// SharedCertificateExists verifies if the shared certificates - the certificates that must be
-// equal across control-plane nodes: ca.key, ca.crt, sa.key, sa.pub + etcd/ca.key, etcd/ca.crt if local/stacked etcd
-// Missing keys are non-fatal and produce warnings.
+// SharedCertificateExists verifies if the shared certificates exist and are still valid - the certificates must be
+// equal across control-plane nodes: ca.key, ca.crt, sa.key, sa.pub, front-proxy-ca.key, front-proxy-ca.crt and etcd/ca.key, etcd/ca.crt if local/stacked etcd
+// Missing private keys of CA are non-fatal and produce warnings.
 func SharedCertificateExists(cfg *kubeadmapi.ClusterConfiguration) (bool, error) {
-
+	var errs []error
 	if err := validateCACertAndKey(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.CACertAndKeyBaseName, "", "CA"}); err != nil {
-		return false, err
+		errs = append(errs, err)
 	}
 
 	if err := validatePrivatePublicKey(certKeyLocation{cfg.CertificatesDir, "", kubeadmconstants.ServiceAccountKeyBaseName, "service account"}); err != nil {
-		return false, err
+		errs = append(errs, err)
 	}
 
 	if err := validateCACertAndKey(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.FrontProxyCACertAndKeyBaseName, "", "front-proxy CA"}); err != nil {
-		return false, err
+		errs = append(errs, err)
 	}
 
 	// in case of local/stacked etcd
 	if cfg.Etcd.External == nil {
 		if err := validateCACertAndKey(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.EtcdCACertAndKeyBaseName, "", "etcd CA"}); err != nil {
-			return false, err
+			errs = append(errs, err)
 		}
 	}
-
+	if len(errs) != 0 {
+		return false, utilerrors.NewAggregate(errs)
+	}
 	return true, nil
 }
 
@@ -371,6 +329,38 @@ func UsingExternalFrontProxyCA(cfg *kubeadmapi.ClusterConfiguration) (bool, erro
 	}
 
 	if err := validateSignedCert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.FrontProxyCACertAndKeyBaseName, kubeadmconstants.FrontProxyClientCertAndKeyBaseName, "front-proxy client"}); err != nil {
+		return true, err
+	}
+
+	return true, nil
+}
+
+// UsingExternalEtcdCA determines whether the user is relying on an external etcd CA. We currently implicitly determine this is the case
+// when the etcd CA Cert is present but the etcd CA Key is not.
+// In case we are using an external etcd CA, the function validates the certificates signed by etcd CA that should be provided by the user.
+func UsingExternalEtcdCA(cfg *kubeadmapi.ClusterConfiguration) (bool, error) {
+	if err := validateCACert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.EtcdCACertAndKeyBaseName, "", "etcd CA"}); err != nil {
+		return false, err
+	}
+
+	path := filepath.Join(cfg.CertificatesDir, kubeadmconstants.EtcdCAKeyName)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		return false, nil
+	}
+
+	if err := validateSignedCert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.EtcdCACertAndKeyBaseName, kubeadmconstants.APIServerEtcdClientCertAndKeyBaseName, "apiserver etcd client"}); err != nil {
+		return true, err
+	}
+
+	if err := validateSignedCert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.EtcdCACertAndKeyBaseName, kubeadmconstants.EtcdServerCertAndKeyBaseName, "etcd server"}); err != nil {
+		return true, err
+	}
+
+	if err := validateSignedCert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.EtcdCACertAndKeyBaseName, kubeadmconstants.EtcdPeerCertAndKeyBaseName, "etcd peer"}); err != nil {
+		return true, err
+	}
+
+	if err := validateSignedCert(certKeyLocation{cfg.CertificatesDir, kubeadmconstants.EtcdCACertAndKeyBaseName, kubeadmconstants.EtcdHealthcheckClientCertAndKeyBaseName, "etcd health-check client"}); err != nil {
 		return true, err
 	}
 
@@ -450,10 +440,7 @@ func validateSignedCertWithCA(l certKeyLocation, caCert *x509.Certificate) error
 func validatePrivatePublicKey(l certKeyLocation) error {
 	// Try to load key
 	_, _, err := pkiutil.TryLoadPrivatePublicKeyFromDisk(l.pkiDir, l.baseName)
-	if err != nil {
-		return errors.Wrapf(err, "failure loading key for %s", l.uxName)
-	}
-	return nil
+	return errors.Wrapf(err, "failure loading key for %s", l.uxName)
 }
 
 // validateCertificateWithConfig makes sure that a given certificate is valid at

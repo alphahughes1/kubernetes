@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -22,6 +23,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 // OpenRCInitSystem defines openrc
@@ -86,7 +89,7 @@ func (sysd SystemdInitSystem) EnableCommand(service string) string {
 // reloadSystemd reloads the systemd daemon
 func (sysd SystemdInitSystem) reloadSystemd() error {
 	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
-		return fmt.Errorf("failed to reload systemd: %v", err)
+		return errors.Wrap(err, "failed to reload systemd")
 	}
 	return nil
 }
@@ -122,7 +125,7 @@ func (sysd SystemdInitSystem) ServiceExists(service string) bool {
 	args := []string{"status", service}
 	outBytes, _ := exec.Command("systemctl", args...).Output()
 	output := string(outBytes)
-	return !strings.Contains(output, "Loaded: not-found")
+	return !strings.Contains(output, "Loaded: not-found") && !strings.Contains(output, "could not be found")
 }
 
 // ServiceIsEnabled ensures the service is enabled to start on each boot.
@@ -157,8 +160,15 @@ func GetInitSystem() (InitSystem, error) {
 	}
 	_, err = exec.LookPath("openrc")
 	if err == nil {
+		binaries := []string{"rc-service", "rc-update"}
+		for _, binary := range binaries {
+			_, err = exec.LookPath(binary)
+			if err != nil {
+				return nil, errors.Wrapf(err, "openrc detected, but missing required binary: %s", binary)
+			}
+		}
 		return &OpenRCInitSystem{}, nil
 	}
 
-	return nil, fmt.Errorf("no supported init system detected, skipping checking for services")
+	return nil, errors.New("no supported init system detected, skipping checking for services")
 }

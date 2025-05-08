@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
@@ -60,6 +61,15 @@ func TestDefaultNormalizeScore(t *testing.T) {
 			reverse:        true,
 			scores:         []int64{0, 1, 1, 1},
 			expectedScores: []int64{100, 0, 0, 0},
+		},
+		{
+			scores:         []int64{0, 0, 0, 0},
+			expectedScores: []int64{0, 0, 0, 0},
+		},
+		{
+			reverse:        true,
+			scores:         []int64{0, 0, 0, 0},
+			expectedScores: []int64{100, 100, 100, 100},
 		},
 	}
 
